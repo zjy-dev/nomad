@@ -1,0 +1,218 @@
+{
+  "schema": "nomad.connector.openapi-types.v1",
+  "source": "OpenCode v1.18.16 (commit a3647eb025c7615159d417dcc49fc39fdaeba65b)",
+  "generatedAt": "2026-08-17",
+  "notes": "Extracted from types.gen.ts in the OpenCode source tree at the pinned commit. Only fields consumed by the Nomad adapter are listed here. The full upstream type definitions live in the OpenCode repo.",
+  "types": {
+    "Session": {
+      "kind": "object",
+      "fields": {
+        "id":          "string",
+        "projectID":   "string | null",
+        "directory":   "string",
+        "title":       "string",
+        "version":     "string",
+        "time":        "string (ISO-8601)",
+        "summary":     "string | null",
+        "status":      "SessionStatus",
+        "lastMessage": "string | null"
+      }
+    },
+    "SessionStatus": {
+      "kind": "enum",
+      "values": ["idle", "running", "aborted", "completed"]
+    },
+    "Message": {
+      "kind": "union",
+      "discriminator": "role",
+      "variants": {
+        "user":      "UserMessage",
+        "assistant": "AssistantMessage"
+      }
+    },
+    "UserMessage": {
+      "kind": "object",
+      "fields": {
+        "id":        "string",
+        "role":      "'user'",
+        "sessionID": "string",
+        "parts":     "Part[]",
+        "time":      "string (ISO-8601)"
+      }
+    },
+    "AssistantMessage": {
+      "kind": "object",
+      "fields": {
+        "id":        "string",
+        "role":      "'assistant'",
+        "sessionID": "string",
+        "parts":     "Part[]",
+        "time":      "string (ISO-8601)"
+      }
+    },
+    "Part": {
+      "kind": "union",
+      "discriminator": "type",
+      "variants": {
+        "text":         "TextPart",
+        "tool":         "ToolPart",
+        "step-start":   "StepStartPart",
+        "step-finish":  "StepFinishPart",
+        "snapshot":     "SnapshotPart",
+        "patch":        "PatchPart",
+        "thinking":     "ThinkingPart",
+        "redacted":     "RedactedPart",
+        "error":        "ErrorPart",
+        "abort":        "AbortPart",
+        "input-token":  "InputTokenPart",
+        "output-token": "OutputTokenPart",
+        "cost":         "CostPart"
+      }
+    },
+    "TextPart": {
+      "kind": "object",
+      "fields": {
+        "type": "'text'",
+        "text": "string"
+      }
+    },
+    "ToolPart": {
+      "kind": "object",
+      "fields": {
+        "type":     "'tool'",
+        "toolName": "string",
+        "state":    "ToolState",
+        "input":    "string | null",
+        "output":   "string | null",
+        "error":    "string | null",
+        "startTime": "string | null",
+        "endTime":   "string | null"
+      }
+    },
+    "ToolState": {
+      "kind": "enum",
+      "values": ["pending", "running", "completed", "error"]
+    },
+    "StepStartPart": {
+      "kind": "object",
+      "fields": {
+        "type":     "'step-start'",
+        "stepName": "string",
+        "snapshot": "Snapshot | null"
+      }
+    },
+    "StepFinishPart": {
+      "kind": "object",
+      "fields": {
+        "type":      "'step-finish'",
+        "stepName":  "string",
+        "snapshot":  "Snapshot | null",
+        "exitCode":  "number | null"
+      }
+    },
+    "SnapshotPart": {
+      "kind": "object",
+      "fields": {
+        "type":    "'snapshot'",
+        "snapshot": "Snapshot"
+      }
+    },
+    "Snapshot": {
+      "kind": "object",
+      "fields": {
+        "files":   "FileEntry[]",
+        "stdin":   "string | null",
+        "stdout":  "string | null",
+        "stderr":  "string | null",
+        "prompt":  "string | null"
+      }
+    },
+    "FileEntry": {
+      "kind": "object",
+      "fields": {
+        "path":      "string",
+        "content":   "string",
+        "language":  "string | null"
+      }
+    },
+    "PatchPart": {
+      "kind": "object",
+      "fields": {
+        "type":      "'patch'",
+        "filePath":  "string",
+        "patch":     "string"
+      }
+    },
+    "Permission": {
+      "kind": "object",
+      "fields": {
+        "id":          "string",
+        "type":        "PermissionType",
+        "pattern":     "string",
+        "sessionID":   "string",
+        "messageID":   "string | null",
+        "title":       "string | null",
+        "metadata":    "Record<string, unknown> | null",
+        "status":      "PermissionStatus"
+      }
+    },
+    "PermissionType": {
+      "kind": "enum",
+      "values": ["allow", "deny"]
+    },
+    "PermissionStatus": {
+      "kind": "enum",
+      "values": ["pending", "allowed", "denied", "expired"]
+    },
+    "FileDiff": {
+      "kind": "object",
+      "fields": {
+        "file":      "string",
+        "before":    "string | null",
+        "after":     "string | null",
+        "additions": "number",
+        "deletions": "number",
+        "patch":     "string | null"
+      }
+    },
+    "AbortResponse": {
+      "kind": "object",
+      "fields": {
+        "aborted": "boolean",
+        "reason":  "string | null"
+      }
+    },
+    "SSEEvent": {
+      "kind": "object",
+      "fields": {
+        "type":     "string",
+        "sessionID": "string | null",
+        "data":     "Record<string, unknown>"
+      },
+      "knownTypes": [
+        "session.created",
+        "session.updated",
+        "session.deleted",
+        "session.status",
+        "session.idle",
+        "session.compacted",
+        "session.error",
+        "session.diff",
+        "message.updated",
+        "message.removed",
+        "message.part.updated",
+        "message.part.removed",
+        "permission.updated",
+        "permission.replied",
+        "tool.started",
+        "tool.completed",
+        "tool.error",
+        "tool.updated",
+        "file.edited",
+        "file.watcher.updated",
+        "todo.updated",
+        "command.executed"
+      ]
+    }
+  }
+}

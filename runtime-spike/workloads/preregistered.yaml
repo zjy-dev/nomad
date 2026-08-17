@@ -1,0 +1,109 @@
+# RT-001 preregistered workloads.
+# Frozen before any runtime implementation. Do not add or remove workloads
+# without filing a replacement preregistration and invalidating this hash.
+version: 1
+preregistered_at: "2026-08-17T00:00:00Z"
+preregistered_by: "RT-001"
+
+# OpenCode baseline to compare against. Must be a published tag, not a
+# local source build. Fixing the reference is part of preregistration so
+# that the runtime cannot cherry-pick a different upstream.
+baseline:
+  opencode_release: "v1.18.16"
+  # The baseline is measured with the same SQLite PRAGMA as the runtime.
+  # Changing durability between runs invalidates the comparison.
+  sqlite_pragma:
+    journal_mode: WAL
+    synchronous: NORMAL
+    wal_autocheckpoint: 1000
+    cache_size: -2000
+    mmap_size: 268435456
+    foreign_keys: "ON"
+    auto_vacuum: INCREMENTAL
+    temp_store: MEMORY
+    busy_timeout: 5000
+
+# Preregistered workload set.
+#
+# These are engineering priorities frozen before results exist. Weights
+# reflect how much each workload affects the runtime's credibility as a
+# session owner — they are not claims about real-world frequency.
+#
+# 1. Weighted cold start (0.30):
+#    The runtime must beat the baseline on startup before any other gate
+#    matters. A slow cold start on every CLI invocation kills the value
+#    proposition.
+# 2. 100k-event recovery (0.25):
+#    Recovery is the single strongest discriminator between an append-only
+#    runtime and a dynamic-language interpreter loop.
+# 3. Durable append throughput (0.20):
+#    The hot loop of every session owner — insert latency and WAL sync cost.
+# 4. Long-session RSS (0.15):
+#    Dominant reason a Rust runtime is being considered. If RSS does not
+#    contract, the spike fails on value.
+# 5. Sidecar IPC (0.10):
+#    Wall-clock overhead of runtime<->companion IPC per command round-trip.
+
+workloads:
+  - id: ws-cold-start
+    name: "Weighted cold start"
+    weight: 0.30
+    description: "Process startup until first durable event is committed. Includes allocator warm-up, schema check, and WAL open."
+    measurement: "wall-clock milliseconds from spawn to first committed event"
+    pass: "p50 <= 150 ms AND p95 <= 300 ms"
+    gate: "no regression; budget +20%"
+    notes: |
+      Cold-start is the dominant path for short CLI tasks. Weighted at 30%
+      because the runtime must not be materially slower on every invocation.
+
+  - id: ws-recovery-100k
+    name: "100k-event recovery"
+    weight: 0.25
+    description: "Replay and reconcile 100,000 durable events from snapshot boundary until Live state is reachable. Includes query-path p95 for last-1k events and cursor resume."
+    measurement: "wall-clock seconds; peak RSS during replay; query p95 for last-1k and cursor resume"
+    pass: "p50 <= 5 s; peak RSS <= 512 MiB; query p95 <= 2 ms (last-1k) / 20 ms (cursor resume)"
+    gate: "runtime must beat baseline by 2x OR reduce peak RSS by 40%"
+    notes: |
+      Recovery is the benchmark that a session owner is built for. Query
+      latency is measured here because the read path is on the critical
+      path of resume.
+
+  - id: ws-append-durable
+    name: "Durable append throughput"
+    weight: 0.20
+    description: "Sustained append of durable events under steady fanout. Measures insert latency and WAL sync cost."
+    measurement: "events per second (throughput); append p95 latency"
+    pass: "throughput >= 5000 events/s; p95 <= 1 ms"
+    gate: "no regression; budget +10%"
+    notes: |
+      Durable append is the hot loop of every session owner.
+
+  - id: ws-long-session-rss
+    name: "Long-session RSS"
+    weight: 0.15
+    description: "RSS drift over an 8-hour workload with 500 turns and 5000 tool events."
+    measurement: "peak RSS; RSS at hour 0, 1, 2, 4, 8; resident vs virtual delta"
+    pass: "peak RSS <= 384 MiB at hour 8; no net growth from hour 4 to 8"
+    gate: "runtime must reduce peak RSS by 40% vs baseline"
+    notes: |
+      Long-session memory is the primary reason a Rust runtime is being
+      considered. If RSS does not contract, the spike fails on value even
+      if cold-start wins.
+
+  - id: ws-sidecar-ipc
+    name: "Sidecar IPC"
+    weight: 0.10
+    description: "Wall-clock overhead of runtime<->companion sidecar IPC per command round-trip, including ACK."
+    measurement: "median and p95 additional latency vs loopback reference"
+    pass: "IPC overhead < 5% of end-to-end command latency"
+    gate: "strict nonregression; any degradation must be explained"
+    notes: |
+      IPC is measured only against a sidecar mock, not against a full
+      Companion. The full-companion IPC budget is tracked in RT-005.
+
+# Out of scope for RT-001 (explicitly excluded, per task card).
+out_of_scope:
+  - "Source-build comparison against release binaries"
+  - "Manually dropping high-weight workloads after measurement"
+  - "Selecting a different OpenCode release post-hoc"
+  - "Combining cold-start and recovery into one number"

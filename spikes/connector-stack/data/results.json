@@ -1,0 +1,108 @@
+{
+  "meta": {
+    "date": "2026-08-17",
+    "platform": "macOS-26.5.2-arm64-arm-64bit",
+    "machine": "arm64",
+    "python_version": "3.9.6",
+    "n_cold_start": 20,
+    "n_idle_samples": 5,
+    "n_sqlite_tx": 5000,
+    "n_sse_events": 5000
+  },
+  "cold_start": {
+    "rust": {
+      "label": "rust",
+      "n": 20,
+      "min_ms": 3.3852500000000063,
+      "p50_ms": 3.8135829999999538,
+      "p95_ms": 4.094207999999988,
+      "max_ms": 18.760583000000025,
+      "mean_ms": 4.55768115
+    },
+    "go": {
+      "label": "go",
+      "n": 20,
+      "min_ms": 5.065625000014506,
+      "p50_ms": 5.589374999999563,
+      "p95_ms": 5.988292000012052,
+      "max_ms": 17.718416999997544,
+      "mean_ms": 6.187991549995786
+    }
+  },
+  "idle_rss": {
+    "rust": {
+      "label": "rust",
+      "samples": 5,
+      "mean_kb": 1776.0,
+      "p95_kb": 1776.0,
+      "min_kb": 1776.0,
+      "max_kb": 1776.0
+    },
+    "go": {
+      "label": "go",
+      "samples": 5,
+      "mean_kb": 11254.4,
+      "p95_kb": 11408.0,
+      "min_kb": 11152.0,
+      "max_kb": 11408.0
+    }
+  },
+  "sqlite_wal": {
+    "rust": {
+      "n": 5000,
+      "total_ms": 3.499,
+      "p50_ms": 0.0005,
+      "p95_ms": 0.000625,
+      "max_ms": 0.008208,
+      "label": "rust"
+    },
+    "go": {
+      "n": 5000,
+      "total_ms": 4.388,
+      "p50_ms": 0.0,
+      "p95_ms": 0.001,
+      "max_ms": 0.014,
+      "label": "go"
+    }
+  },
+  "sse": {
+    "rust": {
+      "label": "rust",
+      "n": 5000,
+      "p50_ms": 0.1921249999838892,
+      "p95_ms": 0.21433300000239797,
+      "max_ms": 0.6494579999980488,
+      "min_ms": 0.1706670000203303,
+      "server_rss_kb_start": 3008,
+      "server_rss_kb_end": 3440
+    },
+    "go": {
+      "label": "go",
+      "n": 5000,
+      "p50_ms": 0.19162499995672988,
+      "p95_ms": 0.2184589999956188,
+      "max_ms": 3.1718329999534944,
+      "min_ms": 0.16725000000405998,
+      "server_rss_kb_start": 12192,
+      "server_rss_kb_end": 17200
+    }
+  },
+  "binary_meta": {
+    "rust": {
+      "label": "rust",
+      "size_bytes": 2163192,
+      "size_mb": 2.06,
+      "file_output": "/Users/bytedance/projects/personal/nomad/feat-code-agent/spikes/connector-stack/rust/target/release/spike: Mach-O 64-bit executable arm64",
+      "dynamic_lib_deps": 3,
+      "signed": true
+    },
+    "go": {
+      "label": "go",
+      "size_bytes": 13634754,
+      "size_mb": 13.0,
+      "file_output": "/Users/bytedance/projects/personal/nomad/feat-code-agent/spikes/connector-stack/go/bin/spike: Mach-O 64-bit executable arm64",
+      "dynamic_lib_deps": 5,
+      "signed": true
+    }
+  }
+}

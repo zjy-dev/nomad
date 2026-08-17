@@ -1,0 +1,61 @@
+{
+  "_comment": "RT-001 synthetic fixture manifest. Hashes are sha256 of file contents at generation time.",
+  "version": 1,
+  "generated_at": "2026-08-17T07:38:52Z",
+  "fixtures": [
+    {
+      "file": "cold-start.json",
+      "sha256": "363fbbf096f0fb2f1737df155231bfbe62e59afc85d5d927de4db7d4c569ca05",
+      "source": "scripts/gen_fixtures.py (function: scripts/gen_fixtures.py (gen_cold_start))",
+      "used_by": [
+        "ws-cold-start"
+      ],
+      "note": "Minimal startup fixture: 1 init event, used for spawn-to-first-commit measurement."
+    },
+    {
+      "file": "recovery-100k.json",
+      "sha256": "ff690630ec067aad828c48c78d6cbcd697cb17d3bdb3fc999bd96e0927b11905",
+      "source": "scripts/gen_fixtures.py (function: scripts/gen_fixtures.py (gen_recovery_100k))",
+      "used_by": [
+        "ws-recovery-100k"
+      ],
+      "note": "100k durable events, 500 turns, 20 snapshots. Covers replay, gap detection, snapshot seek."
+    },
+    {
+      "file": "append-burst.json",
+      "sha256": "57305c7efc6bd9253687682935d2bf0690ab7815637679fe34f8b348fc6dc446",
+      "source": "scripts/gen_fixtures.py (function: scripts/gen_fixtures.py (gen_append_burst))",
+      "used_by": [
+        "ws-append-durable"
+      ],
+      "note": "50k sustained append batch with 10 concurrent readers. Measures insert throughput."
+    },
+    {
+      "file": "long-session-8h.json",
+      "sha256": "1fa282f333d755c292ec4b37604205ba96ecb652319d3f0af64688027faaea93",
+      "source": "scripts/gen_fixtures.py (function: scripts/gen_fixtures.py (gen_long_session))",
+      "used_by": [
+        "ws-long-session-rss"
+      ],
+      "note": "8-hour workload: 500 turns, 5000 tool events. Used for RSS drift measurement."
+    },
+    {
+      "file": "ipc-roundtrip.json",
+      "sha256": "00c8cdb492e26031f05b9ea5dc32d04f202e7cf9725859595c0bfa1ecbae86ae",
+      "source": "scripts/gen_fixtures.py (function: scripts/gen_fixtures.py (gen_ipc_roundtrip))",
+      "used_by": [
+        "ws-sidecar-ipc"
+      ],
+      "note": "Command/reply ACK frames for IPC round-trip measurement."
+    },
+    {
+      "file": "query-resume.json",
+      "sha256": "22aa1e3c9507c3c431b7f5f0382bd8ac8c8aeb2af41bceaaf78c3757364c3aea",
+      "source": "scripts/gen_fixtures.py (function: scripts/gen_fixtures.py (gen_query_resume))",
+      "used_by": [
+        "ws-recovery-100k"
+      ],
+      "note": "Query and cursor-resume payloads for read-path p95 measurement."
+    }
+  ]
+}

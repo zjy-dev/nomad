@@ -1,0 +1,29 @@
+{
+  "session_id": "sess_normal_001",
+  "snapshot_seq": 8,
+  "digest": "sha256:4fb346fe6f74d1757fe55d3526004f2e5d1683b152dcbc9f72d74e81b7aae59f",
+  "last_applied_seq": 8,
+  "turn_state": "Completed",
+  "turn_id": "turn_001",
+  "host_connectivity": "Online",
+  "client_freshness": "Live",
+  "state_summary": {
+    "session_status": "active",
+    "active_turn": null,
+    "active_permission": null,
+    "diff_file_count": 3,
+    "test_status": null,
+    "tool_states": [
+      {
+        "tool_name": "grep",
+        "status": "Completed"
+      },
+      {
+        "tool_name": "edit",
+        "status": "Completed"
+      }
+    ]
+  },
+  "created_at": "2026-08-17T10:00:10Z",
+  "version": "1.0.0"
+}

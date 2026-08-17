@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "preregistered_at": "2026-08-17T00:00:00Z",
+  "preregistered_by": "RT-001",
+  "workload_set_hash": "6db92ade8a8da4d4ddc49d404ffd0176f27869363205f704f75fdaea19120503",
+  "workloads": [
+    {
+      "id": "ws-cold-start",
+      "weight": 0.3,
+      "pass": "p50 <= 150 ms AND p95 <= 300 ms",
+      "gate": "no regression; budget +20%"
+    },
+    {
+      "id": "ws-recovery-100k",
+      "weight": 0.25,
+      "pass": "p50 <= 5 s; peak RSS <= 512 MiB; query p95 <= 2 ms (last-1k) / 20 ms (cursor resume)",
+      "gate": "runtime must beat baseline by 2x OR reduce peak RSS by 40%"
+    },
+    {
+      "id": "ws-append-durable",
+      "weight": 0.2,
+      "pass": "throughput >= 5000 events/s; p95 <= 1 ms",
+      "gate": "no regression; budget +10%"
+    },
+    {
+      "id": "ws-long-session-rss",
+      "weight": 0.15,
+      "pass": "peak RSS <= 384 MiB at hour 8; no net growth from hour 4 to 8",
+      "gate": "runtime must reduce peak RSS by 40% vs baseline"
+    },
+    {
+      "id": "ws-sidecar-ipc",
+      "weight": 0.1,
+      "pass": "IPC overhead < 5% of end-to-end command latency",
+      "gate": "strict nonregression; any degradation must be explained"
+    }
+  ],
+  "baseline": {
+    "opencode_release": "v1.18.16",
+    "sqlite_pragma": {
+      "journal_mode": "WAL",
+      "synchronous": "NORMAL",
+      "wal_autocheckpoint": 1000,
+      "cache_size": -2000,
+      "mmap_size": 268435456,
+      "foreign_keys": "ON",
+      "auto_vacuum": "INCREMENTAL",
+      "temp_store": "MEMORY",
+      "busy_timeout": 5000
+    }
+  },
+  "out_of_scope": [
+    "Source-build comparison against release binaries",
+    "Manually dropping high-weight workloads after measurement",
+    "Selecting a different OpenCode release post-hoc",
+    "Combining cold-start and recovery into one number"
+  ],
+  "generated_at": "2026-08-17T07:43:42Z",
+  "generated_by": "scripts/compute_hashes.py",
+  "preregistered_yaml_sha256": "8980ce93046089b0b0de3595048e29a964301748be469cb9235422893e561fd1"
+}

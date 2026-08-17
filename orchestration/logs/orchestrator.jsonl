@@ -1,0 +1,7 @@
+{"ts":"2026-08-17T00:00:00+08:00","source":"orchestrator","level":"info","event":"iteration_started","detail":"W1 contract and evidence workers scheduled."}
+{"ts":"2026-08-17T00:15:00+08:00","source":"orchestrator","level":"warn","event":"workers_stalled","detail":"No worker files after repeated checks and one nudge; interrupted all five."}
+{"ts":"2026-08-17T00:15:01+08:00","source":"orchestrator","level":"decision","event":"fresh_session_pivot","detail":"Use no-history workers and bounded task prompts for iteration 2."}
+{"ts":"2026-08-17T00:30:00+08:00","source":"orchestrator","level":"warn","event":"fresh_workers_stalled","detail":"Second worker set produced no files; all interrupted cleanly."}
+{"ts":"2026-08-17T00:30:01+08:00","source":"orchestrator","level":"decision","event":"model_pivot","detail":"Use explicit Seed-Code workers as final scheduler recovery attempt."}
+{"ts":"2026-08-17T17:30:00+08:00","source":"product_manager","level":"warn","event":"round1_reject","detail":"Component tests are not a product loop; real Host Relay Mobile process integration required."}
+{"ts":"2026-08-17T18:10:00+08:00","source":"product_manager","level":"info","event":"stage1_accept","detail":"Round 2 and final no-regression ACCEPT after real process loop and 8-stage validation passed."}

@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nomad/contract/events/v1",
+  "title": "Nomad Event Contract",
+  "version": "1.0.0",
+  "description": "Durable and ephemeral event definitions. No encryption fields. Source: CON-002, PRD 6.2, SP-01, SP-06.",
+  "type": "object",
+  "required": ["event_type", "session_id", "event_id", "seq", "timestamp", "durable"],
+  "properties": {
+    "event_type": {
+      "type": "string",
+      "enum": [
+        "session.created",
+        "session.updated",
+        "turn.started",
+        "message.accepted",
+        "message.completed",
+        "tool.started",
+        "tool.completed",
+        "tool.failed",
+        "permission.requested",
+        "permission.resolved",
+        "diff.updated",
+        "turn.stopping",
+        "turn.completed",
+        "turn.cancelled",
+        "turn.failed",
+        "turn.outcome_unknown",
+        "session.compacted"
+      ]
+    },
+    "session_id": {
+      "type": "string",
+      "maxLength": 64
+    },
+    "turn_id": {
+      "type": ["string", "null"],
+      "maxLength": 64
+    },
+    "event_id": {
+      "type": "string",
+      "maxLength": 128,
+      "description": "Globally unique event identifier. Format: <session_id>:<seq> or opaque. MUST be unique within the system."
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Monotonically increasing sequence number within a Session. Gap detection: any missing seq [last_ack+1, current_seq] indicates a gap."
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "durable": {
+      "type": "boolean",
+      "const": true,
+      "description": "This schema covers durable events only. All events MUST have durable=true. Ephemeral events (delta, typing, presence) are not part of this contract and MUST NOT be used for recovery."
+    },
+    "payload": {
+      "type": "object",
+      "description": "Event payload. Minimal for durable events. Encryption envelope is out of scope for CON-002.",
+      "properties": {
+        "summary": { "type": ["string", "null"] },
+        "state_change": { "type": ["string", "null"] },
+        "tool_name": { "type": ["string", "null"] },
+        "permission_id": { "type": ["string", "null"] },
+        "action": { "type": ["string", "null"] },
+        "reason": { "type": ["string", "null"] }
+      }
+    },
+    "chunk_ref": {
+      "type": ["object", "null"],
+      "description": "Reference to bounded payload stored separately (for large tool output, diff chunks).",
+      "properties": {
+        "ref_id": { "type": "string" },
+        "size_bytes": { "type": "integer", "minimum": 0 },
+        "encoding": { "type": "string" }
+      },
+      "required": ["ref_id", "size_bytes", "encoding"]
+    }
+  },
+  "durable_event_catalog": [
+    "session.created",
+    "session.updated",
+    "turn.started",
+    "message.accepted",
+    "message.completed",
+    "tool.started",
+    "tool.completed",
+    "tool.failed",
+    "permission.requested",
+    "permission.resolved",
+    "diff.updated",
+    "turn.stopping",
+    "turn.completed",
+    "turn.cancelled",
+    "turn.failed",
+    "turn.outcome_unknown",
+    "session.compacted"
+  ],
+  "ephemeral_categories": [
+    "text_delta",
+    "tool_output_delta",
+    "typing",
+    "presence",
+    "citation"
+  ],
+  "invariants": [
+    {
+      "id": "INV-002-1",
+      "severity": "MUST",
+      "rule": "seq MUST be strictly monotonically increasing for a given session_id. No gaps are allowed in the durable event stream; gaps mean lost events."
+    },
+    {
+      "id": "INV-002-2",
+      "severity": "MUST",
+      "rule": "event_id MUST be unique across all Sessions. Same event_id means same event; duplicates are idempotent."
+    },
+    {
+      "id": "INV-002-3",
+      "severity": "MUST",
+      "rule": "durable MUST be true for all events in this contract. Ephemeral events are NOT part of this contract and MUST NOT be used for recovery."
+    },
+    {
+      "id": "INV-002-4",
+      "severity": "MUST",
+      "rule": "If payload exceeds the bounded size limit, the event MUST set chunk_ref and payload must be null or minimal."
+    },
+    {
+      "id": "INV-002-5",
+      "severity": "MUST",
+      "rule": "Receivers MUST NOT auto-persist unknown event types. Unknown event_type values are treated as protocol version mismatch and fail closed."
+    },
+    {
+      "id": "INV-002-6",
+      "severity": "MUST",
+      "rule": "A delta (ephemeral) loss MUST still allow the consumer to reconstruct the final state from durable events alone."
+    }
+  ],
+  "unknown_event_strategy": "Unknown event types fail closed. The receiver records the unknown type as a protocol mismatch and does not auto-persist or forward it."
+}

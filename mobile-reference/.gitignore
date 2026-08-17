@@ -1,0 +1,9 @@
+node_modules
+dist
+.DS_Store
+*.log
+coverage
+tsconfig.tsbuildinfo
+src/**/*.js
+src/**/*.js.map
+process-bridge/dist

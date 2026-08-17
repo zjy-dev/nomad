@@ -1,0 +1,20 @@
+{
+  "session_id": "sess_ver_007",
+  "snapshot_seq": 2,
+  "digest": "sha256:9daf098764db7769a3b42e057e2f9a50a86c0e7cb14880553497a7b18e2d18b1",
+  "last_applied_seq": 2,
+  "turn_state": "Running",
+  "turn_id": "turn_001",
+  "host_connectivity": "Online",
+  "client_freshness": "Stale",
+  "state_summary": {
+    "session_status": "active",
+    "active_turn": "turn_001",
+    "active_permission": null,
+    "diff_file_count": 0,
+    "test_status": null,
+    "tool_states": []
+  },
+  "created_at": "2026-08-17T16:00:01Z",
+  "version": "1.0.0"
+}

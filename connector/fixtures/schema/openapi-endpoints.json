@@ -1,0 +1,58 @@
+{
+  "schema": "nomad.connector.openapi-endpoints.v1",
+  "source": "OpenCode v1.18.16 (commit a3647eb025c7615159d417dcc49fc39fdaeba65b)",
+  "baseURL": "http://127.0.0.1:4096",
+  "docs": "/doc",
+  "generatedAt": "2026-08-17",
+  "endpoints": {
+    "session": [
+      { "method": "GET",  "path": "/session",                         "purpose": "List sessions" },
+      { "method": "POST", "path": "/session",                         "purpose": "Create session" },
+      { "method": "GET",  "path": "/session/:id",                     "purpose": "Get session by ID" },
+      { "method": "DELETE","path": "/session/:id",                   "purpose": "Delete session" },
+      { "method": "PATCH","path": "/session/:id",                     "purpose": "Update session metadata" },
+      { "method": "GET",  "path": "/session/:id/children",            "purpose": "List child sessions" },
+      { "method": "GET",  "path": "/session/:id/todo",                "purpose": "List session todos" },
+      { "method": "POST", "path": "/session/:id/init",                "purpose": "Initialize session" },
+      { "method": "POST", "path": "/session/:id/fork",                "purpose": "Fork session" },
+      { "method": "POST", "path": "/session/:id/abort",               "purpose": "Abort session" },
+      { "method": "POST", "path": "/session/:id/share",               "purpose": "Share session" },
+      { "method": "DELETE","path": "/session/:id/share",              "purpose": "Unshare session" },
+      { "method": "GET",  "path": "/session/:id/diff",                "purpose": "Get session diff" },
+      { "method": "POST", "path": "/session/:id/summarize",           "purpose": "Summarize session" },
+      { "method": "POST", "path": "/session/:id/revert",              "purpose": "Revert session" },
+      { "method": "POST", "path": "/session/:id/unrevert",            "purpose": "Unrevert session" },
+      { "method": "POST", "path": "/session/:id/permissions/:permissionID", "purpose": "Reply to a permission" }
+    ],
+    "messages": [
+      { "method": "GET",  "path": "/session/:id/message",             "purpose": "List messages" },
+      { "method": "POST", "path": "/session/:id/message",             "purpose": "Create message" },
+      { "method": "GET",  "path": "/session/:id/message/:messageID",  "purpose": "Get message" },
+      { "method": "POST", "path": "/session/:id/prompt_async",       "purpose": "Send prompt async" },
+      { "method": "POST", "path": "/session/:id/command",            "purpose": "Send command" },
+      { "method": "POST", "path": "/session/:id/shell",              "purpose": "Send shell" }
+    ],
+    "tools": [
+      { "method": "GET",  "path": "/experimental/tool/ids",          "purpose": "List tool IDs (experimental)" },
+      { "method": "GET",  "path": "/experimental/tool",              "purpose": "List tools (experimental)" }
+    ],
+    "events": [
+      { "method": "GET",  "path": "/event",                          "purpose": "SSE stream (per-session)" },
+      { "method": "GET",  "path": "/global/event",                   "purpose": "SSE stream (global)" }
+    ],
+    "global": [
+      { "method": "GET",  "path": "/global/health",                  "purpose": "Health check" }
+    ],
+    "config": [
+      { "method": "GET",  "path": "/config",                         "purpose": "Get config" },
+      { "method": "PATCH","path": "/config",                         "purpose": "Update config" },
+      { "method": "GET",  "path": "/config/providers",               "purpose": "List providers" }
+    ],
+    "diff": [
+      { "method": "GET",  "path": "/session/:id/diff",               "purpose": "Get diff (optional ?messageID=)" }
+    ],
+    "abort": [
+      { "method": "POST", "path": "/session/:id/abort",              "purpose": "Abort session" }
+    ]
+  }
+}

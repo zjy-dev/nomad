@@ -1,0 +1,19 @@
+{
+  "kind": "cold-start",
+  "workload_id": "ws-cold-start",
+  "description": "Spawn-to-first-commit measurement fixture",
+  "session": {
+    "session_id": "sess-cold-start-001",
+    "seq_start": 0,
+    "events": [
+      {
+        "seq": 1,
+        "type": "session.init",
+        "turn_id": null,
+        "ts_offset_ms": 0,
+        "payload_size_bytes": 256
+      }
+    ]
+  },
+  "read_ops": []
+}

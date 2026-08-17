@@ -1,0 +1,9 @@
+{"iteration":1,"phase":"W1-contract-and-evidence","status":"started","detail":"Starting independent workers with directory ownership."}
+{"iteration":1,"phase":"W1-contract-and-evidence","status":"stalled","detail":"Five full-context workers remained running without file output across repeated monitoring windows; all interrupted without changes."}
+{"iteration":2,"phase":"W1-contract-and-evidence","status":"started","detail":"Restarting with fork_turns=none, bounded reads, and minimal-first deliverables."}
+{"iteration":2,"phase":"W1-contract-and-evidence","status":"stalled","detail":"Fresh default workers also produced no files across the bounded window; interrupted without changes."}
+{"iteration":3,"phase":"W1-contract-and-evidence","status":"started","detail":"Final recovery attempt with explicit code-model workers and no history."}
+{"iteration":3,"phase":"W1-contract-and-evidence","status":"completed","detail":"Contracts 9 traces/5 tests accepted after digest repair; SEC-001 accepted after three audits; HC-001, QA-001 and RT-001 validators pass."}
+{"iteration":4,"phase":"W2-W3-runnable-vertical-slice","status":"started","detail":"Building synthetic/disposable vertical slice; allow-once remains disabled pending adapter and security gates."}
+{"iteration":4,"phase":"W2-W3-runnable-vertical-slice","status":"product_rejected","detail":"Round 1 rejected component-only evidence because no real Host Relay Mobile process loop existed."}
+{"iteration":5,"phase":"stage1-accepted","status":"completed","detail":"Real three-process loop added; all 8 validation stages and browser smoke passed; Product Manager Round 2 and final no-regression signoff ACCEPT."}

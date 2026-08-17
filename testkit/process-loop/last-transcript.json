@@ -1,0 +1,117 @@
+{
+  "version": "1.0.0",
+  "started_at": "2026-08-17T10:29:55.814Z",
+  "completed_at": "2026-08-17T10:29:57.775Z",
+  "steps": [
+    {
+      "step": "init",
+      "direction": "mobile→relay",
+      "timestamp": "2026-08-17T10:29:55.815Z",
+      "detail": {
+        "channel": "nomad-process-loop"
+      }
+    },
+    {
+      "step": "pair.request",
+      "direction": "mobile→relay",
+      "timestamp": "2026-08-17T10:29:55.831Z",
+      "detail": {
+        "message_id": "674a1dc3-41e1-48eb-9e22-a4430ff3173c",
+        "comparison_code": "278272",
+        "message_id_relay": 1
+      }
+    },
+    {
+      "step": "pair.confirmed",
+      "direction": "relay→mobile",
+      "timestamp": "2026-08-17T10:29:56.238Z",
+      "detail": {
+        "comparison_code": "278272",
+        "verified": true,
+        "message_id": "pair.confirmed:674a1dc3-41e1-48eb-9e22-a4430ff3173c",
+        "acked": true
+      }
+    },
+    {
+      "step": "session.checkpoint",
+      "direction": "relay→mobile",
+      "timestamp": "2026-08-17T10:29:56.240Z",
+      "detail": {
+        "state": "NeedsPermission",
+        "diff_file_count": 3,
+        "diff_files": [
+          "src/main.py",
+          "src/utils.py",
+          "config.yaml"
+        ],
+        "acked": true
+      }
+    },
+    {
+      "step": "command.deny",
+      "direction": "mobile→relay",
+      "timestamp": "2026-08-17T10:29:56.241Z",
+      "detail": {
+        "message_id": "b20ddd83-e191-4a64-9a86-d0d4d19dd03b",
+        "relay_id": 4
+      }
+    },
+    {
+      "step": "command.result.deny",
+      "direction": "relay→mobile",
+      "timestamp": "2026-08-17T10:29:56.750Z",
+      "detail": {
+        "status": "HostAccepted",
+        "error_code": "OK",
+        "relay_received_was": "not_host_accepted",
+        "acked": true
+      }
+    },
+    {
+      "step": "command.stop",
+      "direction": "mobile→relay",
+      "timestamp": "2026-08-17T10:29:56.752Z",
+      "detail": {
+        "message_id": "25ac9605-16ab-4213-8566-d0058073ce1b",
+        "relay_id": 6
+      }
+    },
+    {
+      "step": "command.result.stop",
+      "direction": "relay→mobile",
+      "timestamp": "2026-08-17T10:29:57.263Z",
+      "detail": {
+        "status": "HostAccepted",
+        "acked": true
+      }
+    },
+    {
+      "step": "command.allow_once",
+      "direction": "mobile→relay",
+      "timestamp": "2026-08-17T10:29:57.265Z",
+      "detail": {
+        "message_id": "63406af8-190c-470d-bdf6-1acf0fb59cc7",
+        "relay_id": 8
+      }
+    },
+    {
+      "step": "command.allow_once",
+      "direction": "relay→mobile",
+      "timestamp": "2026-08-17T10:29:57.773Z",
+      "detail": {
+        "status": "Rejected",
+        "error_code": "ERR_SAFETY_BLOCKED",
+        "allowed": false,
+        "acked": true
+      }
+    },
+    {
+      "step": "done",
+      "direction": "mobile→host",
+      "timestamp": "2026-08-17T10:29:57.774Z",
+      "detail": {
+        "result": "process-loop-completed"
+      }
+    }
+  ]
+}

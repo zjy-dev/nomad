@@ -1,0 +1,104 @@
+{
+  "fixture": "synthetic",
+  "target": "snapshot",
+  "label": "synthetic",
+  "generatedAt": "2026-08-17",
+  "source": {
+    "type": "schema-derived",
+    "upstream": "OpenCode v1.18.16",
+    "commit": "a3647eb025c7615159d417dcc49fc39fdaeba65b",
+    "reason": "Payloads constructed from the published OpenCode TypeScript type definitions and endpoint table. No live v1.18.16 server was available at fixture time. These payloads must pass schema conformance checks but are NOT live-captured.",
+    "captureCommand": null
+  },
+  "cases": [
+    {
+      "id": "snapshot.file.basic",
+      "description": "Snapshot with a single file",
+      "snapshot": {
+        "files": [
+          {
+            "path": "src/main.py",
+            "content": "def main():\n    return 0\n",
+            "language": "python"
+          }
+        ],
+        "stdin": null,
+        "stdout": null,
+        "stderr": null,
+        "prompt": null
+      }
+    },
+    {
+      "id": "snapshot.with.io",
+      "description": "Snapshot with stdin/stdout/stderr from a Bash tool execution",
+      "snapshot": {
+        "files": [
+          {
+            "path": "src/main.py",
+            "content": "def main():\n    print('hello')\n",
+            "language": "python"
+          }
+        ],
+        "stdin": "python src/main.py\n",
+        "stdout": "hello\n",
+        "stderr": null,
+        "prompt": null
+      }
+    },
+    {
+      "id": "snapshot.empty",
+      "description": "Empty snapshot (no files, no IO)",
+      "snapshot": {
+        "files": [],
+        "stdin": null,
+        "stdout": null,
+        "stderr": null,
+        "prompt": null
+      }
+    },
+    {
+      "id": "snapshot.multi.file",
+      "description": "Snapshot with multiple files",
+      "snapshot": {
+        "files": [
+          {
+            "path": "src/app.py",
+            "content": "from flask import Flask\napp = Flask(__name__)\n",
+            "language": "python"
+          },
+          {
+            "path": "src/config.py",
+            "content": "DEBUG = true\n",
+            "language": "python"
+          },
+          {
+            "path": "src/utils.js",
+            "content": "export function helper() { return 42; }\n",
+            "language": "javascript"
+          }
+        ],
+        "stdin": null,
+        "stdout": null,
+        "stderr": null,
+        "prompt": null
+      }
+    },
+    {
+      "id": "snapshot.with.prompt",
+      "description": "Snapshot that includes the user prompt",
+      "snapshot": {
+        "files": [
+          {
+            "path": "src/main.py",
+            "content": "print('before')\n",
+            "language": "python"
+          }
+        ],
+        "stdin": null,
+        "stdout": null,
+        "stderr": null,
+        "prompt": "Add a new function after main"
+      }
+    }
+  ]
+}

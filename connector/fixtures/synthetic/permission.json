@@ -1,0 +1,107 @@
+{
+  "fixture": "synthetic",
+  "target": "permission",
+  "label": "synthetic",
+  "generatedAt": "2026-08-17",
+  "source": {
+    "type": "schema-derived",
+    "upstream": "OpenCode v1.18.16",
+    "commit": "a3647eb025c7615159d417dcc49fc39fdaeba65b",
+    "reason": "Payloads constructed from the published OpenCode TypeScript type definitions and endpoint table. No live v1.18.16 server was available at fixture time. These payloads must pass schema conformance checks but are NOT live-captured.",
+    "captureCommand": null
+  },
+  "cases": [
+    {
+      "id": "permission.race",
+      "description": "Two concurrent replies to the same permission ID — first one wins",
+      "request1": {
+        "method": "POST",
+        "path": "/session/sess_synthetic_001/permissions/perm_race_001",
+        "body": { "allow": true }
+      },
+      "response1": { "status": 200, "body": { "id": "perm_race_001", "status": "allowed" } },
+      "request2": {
+        "method": "POST",
+        "path": "/session/sess_synthetic_001/permissions/perm_race_001",
+        "body": { "allow": false }
+      },
+      "response2": { "status": 409, "body": { "error": "permission already resolved" } }
+    },
+    {
+      "id": "permission.expired.reply",
+      "description": "Reply to an already-expired permission",
+      "request": {
+        "method": "POST",
+        "path": "/session/sess_synthetic_001/permissions/perm_expired_001",
+        "body": { "allow": true }
+      },
+      "response": { "status": 410, "body": { "error": "permission expired" } }
+    },
+    {
+      "id": "permission.deleted.session",
+      "description": "Permission on a deleted session",
+      "request": {
+        "method": "POST",
+        "path": "/session/sess_deleted_001/permissions/perm_deleted_001",
+        "body": { "allow": true }
+      },
+      "response": { "status": 404, "body": { "error": "session not found" } }
+    },
+    {
+      "id": "permission.allow",
+      "description": "Allow a pending permission (Bash tool execution)",
+      "permission": {
+        "id": "perm_allow_001",
+        "type": "allow",
+        "pattern": "Bash",
+        "sessionID": "sess_synthetic_001",
+        "messageID": "msg_003",
+        "title": null,
+        "metadata": null,
+        "status": "pending"
+      }
+    },
+    {
+      "id": "permission.deny",
+      "description": "Deny a pending permission (FileWrite tool)",
+      "permission": {
+        "id": "perm_deny_001",
+        "type": "deny",
+        "pattern": "FileWrite",
+        "sessionID": "sess_synthetic_001",
+        "messageID": "msg_005",
+        "title": null,
+        "metadata": null,
+        "status": "pending"
+      }
+    },
+    {
+      "id": "permission.allowed.status",
+      "description": "Permission status transitions to allowed after reply",
+      "permission": {
+        "id": "perm_allowed_001",
+        "type": "allow",
+        "pattern": "Edit",
+        "sessionID": "sess_synthetic_001",
+        "messageID": "msg_007",
+        "title": "Allow edit on src/main.py",
+        "metadata": { "filePath": "src/main.py" },
+        "status": "allowed"
+      }
+    },
+    {
+      "id": "permission.denied.status",
+      "description": "Permission status transitions to denied after reply",
+      "permission": {
+        "id": "perm_denied_001",
+        "type": "deny",
+        "pattern": "WebFetch",
+        "sessionID": "sess_synthetic_001",
+        "messageID": "msg_009",
+        "title": null,
+        "metadata": null,
+        "status": "denied"
+      }
+    }
+  ]
+}

@@ -1,0 +1,64 @@
+{
+  "fixture": "synthetic",
+  "target": "sse-trace",
+  "label": "synthetic",
+  "generatedAt": "2026-08-17",
+  "source": {
+    "type": "schema-derived",
+    "upstream": "OpenCode v1.18.16",
+    "commit": "a3647eb025c7615159d417dcc49fc39fdaeba65b",
+    "reason": "Payloads constructed from the published OpenCode TypeScript type definitions and endpoint table. No live v1.18.16 server was available at fixture time. These payloads must pass schema conformance checks but are NOT live-captured. SSE trace is a disposable record/replay fixture used by connector tests.",
+    "captureCommand": null
+  },
+  "cases": [
+    {
+      "id": "sse.normal.completion",
+      "description": "SSE event sequence for a normal session lifecycle",
+      "events": [
+        { "type": "session.created", "sessionID": "sess_sse_001", "data": { "id": "sess_sse_001", "title": "sse-test", "status": "idle" } },
+        { "type": "session.updated", "sessionID": "sess_sse_001", "data": { "status": "running" } },
+        { "type": "message.updated", "sessionID": "sess_sse_001", "data": { "id": "msg_001", "role": "assistant", "parts": [{ "type": "text", "text": "Running bash..." }] } },
+        { "type": "tool.started", "sessionID": "sess_sse_001", "data": { "toolName": "Bash", "state": "running" } },
+        { "type": "file.edited", "sessionID": "sess_sse_001", "data": { "filePath": "src/main.py" } },
+        { "type": "tool.completed", "sessionID": "sess_sse_001", "data": { "toolName": "Bash", "state": "completed" } },
+        { "type": "message.part.updated", "sessionID": "sess_sse_001", "data": { "messageID": "msg_001", "partIndex": 0 } },
+        { "type": "session.idle", "sessionID": "sess_sse_001", "data": { "status": "idle" } }
+      ]
+    },
+    {
+      "id": "sse.permission.flow",
+      "description": "SSE event sequence showing a permission prompt and reply",
+      "events": [
+        { "type": "session.updated", "sessionID": "sess_sse_002", "data": { "status": "running" } },
+        { "type": "message.updated", "sessionID": "sess_sse_002", "data": { "id": "msg_003", "role": "assistant", "parts": [{ "type": "text", "text": "Need to run a Bash command" }] } },
+        { "type": "permission.updated", "sessionID": "sess_sse_002", "data": { "id": "perm_sse_001", "status": "pending" } },
+        { "type": "permission.replied", "sessionID": "sess_sse_002", "data": { "id": "perm_sse_001", "status": "allowed" } },
+        { "type": "tool.started", "sessionID": "sess_sse_002", "data": { "toolName": "Bash", "state": "running" } },
+        { "type": "tool.completed", "sessionID": "sess_sse_002", "data": { "toolName": "Bash", "state": "completed" } },
+        { "type": "session.idle", "sessionID": "sess_sse_002", "data": { "status": "idle" } }
+      ]
+    },
+    {
+      "id": "sse.error.flow",
+      "description": "SSE event sequence showing a tool error",
+      "events": [
+        { "type": "session.updated", "sessionID": "sess_sse_003", "data": { "status": "running" } },
+        { "type": "tool.started", "sessionID": "sess_sse_003", "data": { "toolName": "WebFetch", "state": "running" } },
+        { "type": "tool.error", "sessionID": "sess_sse_003", "data": { "toolName": "WebFetch", "state": "error", "error": "timeout after 30s" } },
+        { "type": "message.updated", "sessionID": "sess_sse_003", "data": { "id": "msg_005", "role": "assistant", "parts": [{ "type": "error", "error": "tool failed" }] } },
+        { "type": "session.error", "sessionID": "sess_sse_003", "data": { "error": "tool execution failed" } },
+        { "type": "session.idle", "sessionID": "sess_sse_003", "data": { "status": "idle" } }
+      ]
+    },
+    {
+      "id": "sse.abort.flow",
+      "description": "SSE event sequence showing a user abort",
+      "events": [
+        { "type": "session.updated", "sessionID": "sess_sse_004", "data": { "status": "running" } },
+        { "type": "message.updated", "sessionID": "sess_sse_004", "data": { "id": "msg_007", "role": "assistant", "parts": [{ "type": "text", "text": "Working..." }] } },
+        { "type": "session.updated", "sessionID": "sess_sse_004", "data": { "status": "aborted" } },
+        { "type": "session.idle", "sessionID": "sess_sse_004", "data": { "status": "idle" } }
+      ]
+    }
+  ]
+}

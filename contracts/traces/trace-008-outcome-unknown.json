@@ -1,0 +1,93 @@
+{
+  "trace_id": "trace-008-outcome-unknown",
+  "scenario": "outcome_unknown",
+  "description": "Host crashes after tool execution but before durable event write. On restart, tool state is OutcomeUnknown. No auto-retry.",
+  "contract_version": "1.0.0",
+  "session_id": "sess_unknown_008",
+  "events": [
+    {
+      "event_type": "session.created",
+      "session_id": "sess_unknown_008",
+      "turn_id": null,
+      "event_id": "sess_unknown_008:1",
+      "seq": 1,
+      "timestamp": "2026-08-17T17:00:00Z",
+      "durable": true,
+      "payload": { "state_change": "session created" }
+    },
+    {
+      "event_type": "turn.started",
+      "session_id": "sess_unknown_008",
+      "turn_id": "turn_001",
+      "event_id": "sess_unknown_008:2",
+      "seq": 2,
+      "timestamp": "2026-08-17T17:00:01Z",
+      "durable": true,
+      "payload": { "state_change": "turn started" }
+    },
+    {
+      "event_type": "tool.started",
+      "session_id": "sess_unknown_008",
+      "turn_id": "turn_001",
+      "event_id": "sess_unknown_008:3",
+      "seq": 3,
+      "timestamp": "2026-08-17T17:00:02Z",
+      "durable": true,
+      "payload": { "tool_name": "edit", "state_change": "tool started (writable)" }
+    },
+    {
+      "event_type": "tool.completed",
+      "session_id": "sess_unknown_008",
+      "turn_id": "turn_001",
+      "event_id": "sess_unknown_008:4",
+      "seq": 4,
+      "timestamp": "2026-08-17T17:00:03Z",
+      "durable": true,
+      "payload": { "tool_name": "edit", "state_change": "tool completed" }
+    },
+    {
+      "event_type": "diff.updated",
+      "session_id": "sess_unknown_008",
+      "turn_id": "turn_001",
+      "event_id": "sess_unknown_008:5",
+      "seq": 5,
+      "timestamp": "2026-08-17T17:00:04Z",
+      "durable": true,
+      "payload": { "summary": "file created", "state_change": "diff updated" }
+    },
+    {
+      "event_type": "tool.started",
+      "session_id": "sess_unknown_008",
+      "turn_id": "turn_001",
+      "event_id": "sess_unknown_008:6",
+      "seq": 6,
+      "timestamp": "2026-08-17T17:00:05Z",
+      "durable": true,
+      "payload": { "tool_name": "run_tests", "state_change": "tool started (writable, crash window)" }
+    },
+    {
+      "event_type": "turn.outcome_unknown",
+      "session_id": "sess_unknown_008",
+      "turn_id": "turn_001",
+      "event_id": "sess_unknown_008:7",
+      "seq": 7,
+      "timestamp": "2026-08-17T17:00:30Z",
+      "durable": true,
+      "payload": {
+        "tool_name": "run_tests",
+        "state_change": "tool completed but result not durably recorded",
+        "reason": "host crashed in crash window; tool may have produced side effects"
+      }
+    }
+  ],
+  "crash_recovery": {
+    "description": "Host restart after crash during writable tool execution.",
+    "crashed_at_seq": 6,
+    "recovered_state": "OutcomeUnknown",
+    "auto_retry_attempted": false,
+    "user_notified": true,
+    "notes": "INV-003-4: Auto-retry is FORBIDDEN. The tool may have modified the filesystem but the Host could not confirm. turn.outcome_unknown is emitted with reason explaining the crash window. User must manually inspect and decide next action."
+  },
+  "expected_snapshot_ref": "snapshot-008-outcome-unknown.json",
+  "notes": "INV-001-6: OutcomeUnknown->Running would mean a new user-initiated turn, NOT a retry of the original side effect. No auto-retry on OutcomeUnknown."
+}

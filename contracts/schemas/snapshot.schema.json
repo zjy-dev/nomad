@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nomad/contract/snapshot/v1",
+  "title": "Nomad Snapshot, Cursor and Recovery Protocol",
+  "version": "1.0.0",
+  "description": "Snapshot schema, digest, last_applied_seq, resume request/result, gap and compaction boundary rules. No encryption fields. Source: CON-004, PRD SP-02, Validation 6.2.",
+  "type": "object",
+  "required": ["session_id", "snapshot_seq", "digest", "last_applied_seq", "turn_state", "host_connectivity", "client_freshness", "created_at"],
+  "properties": {
+    "session_id": {
+      "type": "string",
+      "maxLength": 64
+    },
+    "snapshot_seq": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Seq number up to which this snapshot is valid. All durable events with seq <= snapshot_seq are included in the snapshot."
+    },
+    "digest": {
+      "type": "string",
+      "description": "Cryptographic digest (SHA-256) of the serialized snapshot content. Used to verify reducer consistency.",
+      "digest_spec": {
+        "algorithm": "SHA-256",
+        "scope": "Entire snapshot object excluding the digest field and any non-schema metadata (e.g. notes).",
+        "canonical_encoding": {
+          "json_serialization": "json.dumps(obj, sort_keys=True, separators=(',', ':'), ensure_ascii=False)",
+          "byte_encoding": "UTF-8",
+          "hash": "hashlib.sha256(canonical_json_bytes).hexdigest()",
+          "format": "sha256:<hex_digest>"
+        },
+        "example": {
+          "pseudo_code": [
+            "snapshot_without_digest = {k: v for k, v in snapshot.items() if k != 'digest'}",
+            "canonical = json.dumps(snapshot_without_digest, sort_keys=True, separators=(',', ':'), ensure_ascii=False)",
+            "digest = 'sha256:' + hashlib.sha256(canonical.encode('utf-8')).hexdigest()"
+          ]
+        }
+      }
+    },
+    "last_applied_seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Last seq applied by the producing reducer. MUST equal snapshot_seq for a complete snapshot."
+    },
+    "turn_state": {
+      "type": "string",
+      "enum": ["None", "Running", "NeedsInput", "NeedsPermission", "Stopping", "Completed", "Cancelled", "Failed", "OutcomeUnknown"]
+    },
+    "turn_id": {
+      "type": ["string", "null"],
+      "maxLength": 64
+    },
+    "host_connectivity": {
+      "type": "string",
+      "enum": ["Online", "Offline"]
+    },
+    "client_freshness": {
+      "type": "string",
+      "enum": ["Live", "Reconnecting", "Stale"]
+    },
+    "state_summary": {
+      "type": "object",
+      "description": "Reduced state derived from all durable events up to snapshot_seq.",
+      "properties": {
+        "session_status": { "type": "string" },
+        "active_turn": { "type": ["string", "null"] },
+        "active_permission": { "type": ["string", "null"] },
+        "diff_file_count": { "type": "integer", "minimum": 0 },
+        "test_status": { "type": ["string", "null"] },
+        "tool_states": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "tool_name": { "type": "string" },
+              "status": { "type": "string", "enum": ["NotStarted", "Running", "Completed", "Failed"] }
+            }
+          }
+        }
+      }
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+      "description": "Contract version used to produce this snapshot."
+    }
+  },
+  "resume_request": {
+    "type": "object",
+    "required": ["session_id", "last_applied_seq", "client_version"],
+    "properties": {
+      "session_id": { "type": "string", "maxLength": 64 },
+      "last_applied_seq": { "type": "integer", "minimum": 0 },
+      "client_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+      "known_snapshot_seq": { "type": ["integer", "null"] },
+      "known_snapshot_digest": { "type": ["string", "null"] }
+    }
+  },
+  "resume_result": {
+    "type": "object",
+    "required": ["result_code", "session_id"],
+    "properties": {
+      "result_code": {
+        "type": "string",
+        "enum": ["OK", "ERR_GAP_DETECTED", "ERR_SNAPSHOT_MISMATCH", "ERR_RETENTION_EXCEEDED", "ERR_VERSION_INCOMPATIBLE", "ERR_NO_SESSION"]
+      },
+      "session_id": { "type": "string" },
+      "snapshot": { "$ref": "#" },
+      "events": {
+        "type": "array",
+        "items": { "type": "object" }
+      },
+      "gap_from_seq": { "type": ["integer", "null"] },
+      "gap_to_seq": { "type": ["integer", "null"] },
+      "compaction_boundary_seq": { "type": ["integer", "null"] },
+      "error_message": { "type": ["string", "null"] }
+    }
+  },
+  "invariants": [
+    {
+      "id": "INV-004-1",
+      "severity": "MUST",
+      "rule": "Only when the reducer output (digest, state_summary) matches the snapshot MAY the client transition to client_freshness=Live."
+    },
+    {
+      "id": "INV-004-2",
+      "severity": "MUST",
+      "rule": "Snapshot replacement: a newer snapshot (higher snapshot_seq) replaces an older one. The digest MUST differ. Receivers MUST reject snapshot_seq rollback."
+    },
+    {
+      "id": "INV-004-3",
+      "severity": "MUST",
+      "rule": "Gap handling: if events [last_applied_seq+1, gap_to_seq] are missing, the client is informed via ERR_GAP_DETECTED and the snapshot. Manual recovery or explicit degradation is required; auto-filling gaps is FORBIDDEN."
+    },
+    {
+      "id": "INV-004-4",
+      "severity": "MUST",
+      "rule": "Compaction boundary: events with seq < compaction_boundary_seq are no longer available. The snapshot at compaction_boundary_seq is the authoritative state. Receivers MUST accept snapshot-based recovery without full event replay."
+    },
+    {
+      "id": "INV-004-5",
+      "severity": "MUST",
+      "rule": "Version incompatibility: if client_version != snapshot version, ERR_VERSION_INCOMPATIBLE. The client goes read-only or blocks safe operations until upgraded."
+    },
+    {
+      "id": "INV-004-6",
+      "severity": "MUST",
+      "rule": "Retention exceeded: if the client's last_applied_seq < compaction_boundary_seq - retention_window, ERR_RETENTION_EXCEEDED. Recovery is not possible; the client must start a new session."
+    },
+    {
+      "id": "INV-004-7",
+      "severity": "MUST",
+      "rule": "Snapshot digest MUST cover all state_summary fields. Any tampering with state_summary changes the digest and is detected."
+    }
+  ],
+  "compaction_rules": {
+    "description": "Compaction removes old events but preserves the latest snapshot at the compaction boundary.",
+    "trigger": "When total event count exceeds retention threshold OR age exceeds retention window.",
+    "preserved": [
+      "Latest snapshot at compaction_boundary_seq",
+      "All events with seq >= compaction_boundary_seq",
+      "Metadata needed to verify the snapshot digest"
+    ],
+    "removed": [
+      "Events with seq < compaction_boundary_seq (except the snapshot)"
+    ]
+  }
+}

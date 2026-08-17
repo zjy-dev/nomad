@@ -1,0 +1,170 @@
+{
+  "fixture": "synthetic",
+  "target": "tool",
+  "label": "synthetic",
+  "generatedAt": "2026-08-17",
+  "source": {
+    "type": "schema-derived",
+    "upstream": "OpenCode v1.18.16",
+    "commit": "a3647eb025c7615159d417dcc49fc39fdaeba65b",
+    "reason": "Payloads constructed from the published OpenCode TypeScript type definitions and endpoint table. No live v1.18.16 server was available at fixture time.",
+    "captureCommand": null
+  },
+  "cases": [
+    {
+      "id": "tool.list.ids",
+      "description": "GET /experimental/tool/ids - list all available tool IDs",
+      "request": {
+        "method": "GET",
+        "path": "/experimental/tool/ids"
+      },
+      "response": {
+        "status": 200,
+        "body": [
+          "Read",
+          "Write",
+          "Edit",
+          "MultiEdit",
+          "Glob",
+          "Grep",
+          "Bash",
+          "Kill",
+          "Sleep"
+        ]
+      }
+    },
+    {
+      "id": "tool.list.detail",
+      "description": "GET /experimental/tool - list tools with details",
+      "request": {
+        "method": "GET",
+        "path": "/experimental/tool"
+      },
+      "response": {
+        "status": 200,
+        "body": [
+          {
+            "id": "Read",
+            "name": "Read",
+            "description": "Read file contents",
+            "inputSchema": { "type": "object", "properties": { "filePath": { "type": "string" } } }
+          },
+          {
+            "id": "Write",
+            "name": "Write",
+            "description": "Write file contents",
+            "inputSchema": { "type": "object", "properties": { "filePath": { "type": "string" }, "content": { "type": "string" } } }
+          },
+          {
+            "id": "Edit",
+            "name": "Edit",
+            "description": "Edit a file with replacements",
+            "inputSchema": { "type": "object", "properties": { "filePath": { "type": "string" }, "replacements": { "type": "array" } } }
+          },
+          {
+            "id": "Bash",
+            "name": "Bash",
+            "description": "Execute shell command",
+            "inputSchema": { "type": "object", "properties": { "command": { "type": "string" } } }
+          }
+        ]
+      }
+    },
+    {
+      "id": "tool.lifecycle.pending",
+      "description": "Tool part state: pending",
+      "part": {
+        "type": "tool",
+        "toolName": "Bash",
+        "state": "pending",
+        "input": null,
+        "output": null,
+        "error": null,
+        "startTime": null,
+        "endTime": null
+      }
+    },
+    {
+      "id": "tool.lifecycle.running",
+      "description": "Tool part state: running",
+      "part": {
+        "type": "tool",
+        "toolName": "Bash",
+        "state": "running",
+        "input": "{\"command\":\"pwd\"}",
+        "output": null,
+        "error": null,
+        "startTime": "2026-08-17T10:00:22Z",
+        "endTime": null
+      }
+    },
+    {
+      "id": "tool.lifecycle.completed",
+      "description": "Tool part state: completed",
+      "part": {
+        "type": "tool",
+        "toolName": "Bash",
+        "state": "completed",
+        "input": "{\"command\":\"pwd\"}",
+        "output": "/tmp/nomad-fixture\n",
+        "error": null,
+        "startTime": "2026-08-17T10:00:22Z",
+        "endTime": "2026-08-17T10:00:23Z"
+      }
+    },
+    {
+      "id": "tool.lifecycle.error",
+      "description": "Tool part state: error",
+      "part": {
+        "type": "tool",
+        "toolName": "Bash",
+        "state": "error",
+        "input": "{\"command\":\"nonexistent\"}",
+        "output": null,
+        "error": "command not found",
+        "startTime": "2026-08-17T10:00:22Z",
+        "endTime": "2026-08-17T10:00:23Z"
+      }
+    },
+    {
+      "id": "tool.unknown",
+      "description": "Unknown tool ID referenced in a message part",
+      "part": {
+        "type": "tool",
+        "toolName": "UnknownTool",
+        "state": "error",
+        "input": "{}",
+        "output": null,
+        "error": "tool not found",
+        "startTime": "2026-08-17T10:00:00Z",
+        "endTime": "2026-08-17T10:00:00Z"
+      }
+    },
+    {
+      "id": "tool.timeout",
+      "description": "Tool that timed out",
+      "part": {
+        "type": "tool",
+        "toolName": "Bash",
+        "state": "error",
+        "input": "{\"command\":\"sleep 9999\"}",
+        "output": null,
+        "error": "tool timed out after 30000ms",
+        "startTime": "2026-08-17T10:00:00Z",
+        "endTime": "2026-08-17T10:00:30Z"
+      }
+    },
+    {
+      "id": "tool.list.empty",
+      "description": "GET /experimental/tool/ids - empty tool list",
+      "request": { "method": "GET", "path": "/experimental/tool/ids" },
+      "response": { "status": 200, "body": [] }
+    },
+    {
+      "id": "tool.list.error",
+      "description": "GET /experimental/tool - server error",
+      "request": { "method": "GET", "path": "/experimental/tool" },
+      "response": { "status": 500, "body": { "error": "internal server error" } }
+    }
+  ]
+}

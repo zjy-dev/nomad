@@ -1,0 +1,25 @@
+{
+  "session_id": "sess_perm_004",
+  "snapshot_seq": 8,
+  "digest": "sha256:8f24069204370ce3575ea15ef30d33f32f9eaa24e297980fd7181a34458c5820",
+  "last_applied_seq": 8,
+  "turn_state": "Completed",
+  "turn_id": "turn_001",
+  "host_connectivity": "Online",
+  "client_freshness": "Live",
+  "state_summary": {
+    "session_status": "active",
+    "active_turn": null,
+    "active_permission": null,
+    "diff_file_count": 1,
+    "test_status": null,
+    "tool_states": [
+      {
+        "tool_name": "edit",
+        "status": "Completed"
+      }
+    ]
+  },
+  "created_at": "2026-08-17T13:00:08Z",
+  "version": "1.0.0"
+}

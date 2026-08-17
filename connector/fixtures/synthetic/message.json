@@ -1,0 +1,325 @@
+{
+  "fixture": "synthetic",
+  "target": "message",
+  "label": "synthetic",
+  "generatedAt": "2026-08-17",
+  "source": {
+    "type": "schema-derived",
+    "upstream": "OpenCode v1.18.16",
+    "commit": "a3647eb025c7615159d417dcc49fc39fdaeba65b",
+    "reason": "Payloads constructed from the published OpenCode TypeScript type definitions and endpoint table. No live v1.18.16 server was available at fixture time. These payloads must pass schema conformance checks but are NOT live-captured.",
+    "captureCommand": null
+  },
+  "cases": [
+    {
+      "id": "message.user.text",
+      "description": "POST /session/:id/message - user message with text part",
+      "request": {
+        "method": "POST",
+        "path": "/session/sess_001/message",
+        "body": {
+          "role": "user",
+          "parts": [
+            { "type": "text", "text": "Hello, do the thing." }
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "id": "msg_user_001",
+          "role": "user",
+          "sessionID": "sess_001",
+          "parts": [
+            { "type": "text", "text": "Hello, do the thing." }
+          ],
+          "time": "2026-08-17T10:00:20Z"
+        }
+      }
+    },
+    {
+      "id": "message.assistant.text",
+      "description": "Assistant message with text part (list messages)",
+      "request": {
+        "method": "GET",
+        "path": "/session/sess_001/message"
+      },
+      "response": {
+        "status": 200,
+        "body": [
+          {
+            "id": "msg_user_001",
+            "role": "user",
+            "sessionID": "sess_001",
+            "parts": [
+              { "type": "text", "text": "Hello, do the thing." }
+            ],
+            "time": "2026-08-17T10:00:20Z"
+          },
+          {
+            "id": "msg_assistant_001",
+            "role": "assistant",
+            "sessionID": "sess_001",
+            "parts": [
+              { "type": "text", "text": "I will perform the action." }
+            ],
+            "time": "2026-08-17T10:00:22Z"
+          }
+        ]
+      }
+    },
+    {
+      "id": "message.tool.inline",
+      "description": "Assistant message containing a tool call part (tool completed)",
+      "request": {
+        "method": "GET",
+        "path": "/session/sess_001/message/msg_assistant_001"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "id": "msg_assistant_001",
+          "role": "assistant",
+          "sessionID": "sess_001",
+          "parts": [
+            { "type": "text", "text": "I will perform the action." },
+            {
+              "type": "tool",
+              "toolName": "Read",
+              "state": "completed",
+              "input": "{\"filePath\":\"/tmp/nomad-fixture/test.txt\"}",
+              "output": "file contents",
+              "error": null,
+              "startTime": "2026-08-17T10:00:22Z",
+              "endTime": "2026-08-17T10:00:23Z"
+            }
+          ],
+          "time": "2026-08-17T10:00:23Z"
+        }
+      }
+    },
+    {
+      "id": "message.step.start",
+      "description": "Assistant message with a step-start part (includes snapshot)",
+      "request": {
+        "method": "GET",
+        "path": "/session/sess_001/message/msg_assistant_002"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "id": "msg_assistant_002",
+          "role": "assistant",
+          "sessionID": "sess_001",
+          "parts": [
+            {
+              "type": "step-start",
+              "stepName": "Plan",
+              "snapshot": {
+                "files": [
+                  { "path": "/tmp/nomad-fixture/main.py", "content": "print('hello')", "language": "python" }
+                ],
+                "stdin": null,
+                "stdout": null,
+                "stderr": null,
+                "prompt": "Plan the task."
+              }
+            }
+          ],
+          "time": "2026-08-17T10:00:24Z"
+        }
+      }
+    },
+    {
+      "id": "message.step.finish",
+      "description": "Assistant message with a step-finish part",
+      "request": {
+        "method": "GET",
+        "path": "/session/sess_001/message/msg_assistant_003"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "id": "msg_assistant_003",
+          "role": "assistant",
+          "sessionID": "sess_001",
+          "parts": [
+            {
+              "type": "step-finish",
+              "stepName": "Plan",
+              "snapshot": null,
+              "exitCode": 0
+            }
+          ],
+          "time": "2026-08-17T10:00:30Z"
+        }
+      }
+    },
+    {
+      "id": "message.patch",
+      "description": "Assistant message with a patch part",
+      "request": {
+        "method": "GET",
+        "path": "/session/sess_001/message/msg_assistant_004"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "id": "msg_assistant_004",
+          "role": "assistant",
+          "sessionID": "sess_001",
+          "parts": [
+            {
+              "type": "patch",
+              "filePath": "/tmp/nomad-fixture/main.py",
+              "patch": "--- a/main.py\n+++ b/main.py\n@@ -1 +1 @@\n-print('hello')\n+print('hello world')\n"
+            }
+          ],
+          "time": "2026-08-17T10:00:35Z"
+        }
+      }
+    },
+    {
+      "id": "message.prompt_async",
+      "description": "POST /session/:id/prompt_async - send prompt asynchronously",
+      "request": {
+        "method": "POST",
+        "path": "/session/sess_001/prompt_async",
+        "body": {
+          "prompt": "Please refactor the code.",
+          "stream": true
+        }
+      },
+      "response": {
+        "status": 202,
+        "body": {
+          "accepted": true,
+          "sessionID": "sess_001"
+        }
+      }
+    },
+    {
+      "id": "message.command",
+      "description": "POST /session/:id/command - send a command",
+      "request": {
+        "method": "POST",
+        "path": "/session/sess_001/command",
+        "body": {
+          "command": "ls -la"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "id": "msg_cmd_001",
+          "role": "user",
+          "sessionID": "sess_001",
+          "parts": [
+            { "type": "text", "text": "/command ls -la" }
+          ],
+          "time": "2026-08-17T10:00:40Z"
+        }
+      }
+    },
+    {
+      "id": "message.multipart",
+      "description": "User message with text + thinking parts",
+      "request": {
+        "method": "POST",
+        "path": "/session/sess_001/message",
+        "body": {
+          "role": "user",
+          "parts": [
+            { "type": "text", "text": "Do the refactor." },
+            { "type": "thinking", "text": "Need to understand the code first." }
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "id": "msg_multi_001",
+          "role": "user",
+          "sessionID": "sess_001",
+          "parts": [
+            { "type": "text", "text": "Do the refactor." },
+            { "type": "thinking", "text": "Need to understand the code first." }
+          ],
+          "time": "2026-08-17T10:00:00Z"
+        }
+      }
+    },
+    {
+      "id": "message.tool.error",
+      "description": "Assistant message with a failed tool call and error part",
+      "request": { "method": "GET", "path": "/session/sess_001/message/msg_err_001" },
+      "response": {
+        "status": 200,
+        "body": {
+          "id": "msg_err_001",
+          "role": "assistant",
+          "sessionID": "sess_001",
+          "parts": [
+            { "type": "text", "text": "I will read the file." },
+            {
+              "type": "tool",
+              "toolName": "Read",
+              "state": "error",
+              "input": "{\"filePath\":\"/nonexistent.txt\"}",
+              "output": null,
+              "error": "file not found",
+              "startTime": "2026-08-17T10:00:01Z",
+              "endTime": "2026-08-17T10:00:01Z"
+            },
+            { "type": "error", "text": "Tool execution failed: file not found" }
+          ],
+          "time": "2026-08-17T10:00:01Z"
+        }
+      }
+    },
+    {
+      "id": "message.abort.part",
+      "description": "Assistant message with an abort part (user cancelled)",
+      "request": { "method": "GET", "path": "/session/sess_001/message/msg_abort_001" },
+      "response": {
+        "status": 200,
+        "body": {
+          "id": "msg_abort_001",
+          "role": "assistant",
+          "sessionID": "sess_001",
+          "parts": [
+            { "type": "text", "text": "Working on it..." },
+            { "type": "abort", "reason": "User cancelled" }
+          ],
+          "time": "2026-08-17T10:00:02Z"
+        }
+      }
+    },
+    {
+      "id": "message.notfound",
+      "description": "GET non-existent message (error path)",
+      "request": { "method": "GET", "path": "/session/sess_001/message/nonexistent" },
+      "response": { "status": 404, "body": { "error": "message not found" } }
+    },
+    {
+      "id": "message.invalid.role",
+      "description": "POST message with invalid role (error path)",
+      "request": {
+        "method": "POST",
+        "path": "/session/sess_001/message",
+        "body": { "role": "invalid", "parts": [{ "type": "text", "text": "hi" }] }
+      },
+      "response": { "status": 400, "body": { "error": "invalid role" } }
+    },
+    {
+      "id": "message.empty.parts",
+      "description": "POST message with empty parts (error path)",
+      "request": {
+        "method": "POST",
+        "path": "/session/sess_001/message",
+        "body": { "role": "user", "parts": [] }
+      },
+      "response": { "status": 400, "body": { "error": "at least one part is required" } }
+    }
+  ]
+}

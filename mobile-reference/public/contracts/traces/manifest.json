@@ -1,0 +1,123 @@
+{
+  "corpus_version": "1.0.0",
+  "generated_at": "2026-08-17T00:00:00Z",
+  "contract_version": "1.0.0",
+  "traces": [
+    {
+      "id": "trace-001-normal-completion",
+      "title": "Normal task completion",
+      "description": "Session started, turn runs, tool calls succeed, turn completes normally.",
+      "scenario": "normal_completion",
+      "file": "trace-001-normal-completion.json",
+      "expected_snapshot": "snapshot-001-normal-completion.json",
+      "covered_requirements": [
+        "HC-02",
+        "SP-01"
+      ]
+    },
+    {
+      "id": "trace-002-reply",
+      "title": "Mobile reply to agent question",
+      "description": "Agent asks for input, user replies from mobile, message accepted and completed.",
+      "scenario": "reply",
+      "file": "trace-002-reply.json",
+      "expected_snapshot": "snapshot-002-reply.json",
+      "covered_requirements": [
+        "HC-02",
+        "MB-05",
+        "SP-03"
+      ]
+    },
+    {
+      "id": "trace-003-stop",
+      "title": "Stop a running turn",
+      "description": "User sends Stop while turn is Running. Host accepts, turn transitions Stopping->Cancelled.",
+      "scenario": "stop",
+      "file": "trace-003-stop.json",
+      "expected_snapshot": "snapshot-003-stop.json",
+      "covered_requirements": [
+        "HC-02",
+        "HC-04",
+        "MB-05",
+        "SP-03"
+      ]
+    },
+    {
+      "id": "trace-004-permission-competition",
+      "title": "Permission request with competing decisions",
+      "description": "Permission requested, two mobile decisions arrive. First valid decision wins, second is rejected as stale.",
+      "scenario": "permission_competition",
+      "file": "trace-004-permission-competition.json",
+      "expected_snapshot": "snapshot-004-permission-competition.json",
+      "covered_requirements": [
+        "HC-04",
+        "MB-03",
+        "SP-03"
+      ]
+    },
+    {
+      "id": "trace-005-reconnect",
+      "title": "Reconnect after network interruption",
+      "description": "Client disconnects, reconnects with last_applied_seq, receives missing events, converges to Live.",
+      "scenario": "reconnect",
+      "file": "trace-005-reconnect.json",
+      "expected_snapshot": "snapshot-005-reconnect.json",
+      "covered_requirements": [
+        "HC-02",
+        "SP-02"
+      ]
+    },
+    {
+      "id": "trace-006-compaction",
+      "title": "Recovery after compaction boundary",
+      "description": "Old events compacted away. Client recovers from snapshot at compaction boundary without full event replay.",
+      "scenario": "compaction",
+      "file": "trace-006-compaction.json",
+      "expected_snapshot": "snapshot-006-compaction.json",
+      "covered_requirements": [
+        "SP-02",
+        "INV-004-4"
+      ]
+    },
+    {
+      "id": "trace-007-version-mismatch",
+      "title": "Protocol version incompatibility",
+      "description": "Older client attempts recovery with newer Host. ERR_VERSION_INCOMPATIBLE returned. Safe operations blocked.",
+      "scenario": "version_mismatch",
+      "file": "trace-007-version-mismatch.json",
+      "expected_snapshot": "snapshot-007-version-mismatch.json",
+      "covered_requirements": [
+        "SP-07",
+        "INV-004-5"
+      ]
+    },
+    {
+      "id": "trace-008-outcome-unknown",
+      "title": "OutcomeUnknown after crash during writable tool",
+      "description": "Host crashes after tool execution but before durable event write. On restart, tool state is OutcomeUnknown. No auto-retry.",
+      "scenario": "outcome_unknown",
+      "file": "trace-008-outcome-unknown.json",
+      "expected_snapshot": "snapshot-008-outcome-unknown.json",
+      "covered_requirements": [
+        "HC-02",
+        "HC-04",
+        "INV-003-4"
+      ]
+    },
+    {
+      "id": "trace-009-interrupt-and-send",
+      "title": "Interrupt and send new message",
+      "description": "User sends interrupt_and_send: old turn goes Stopping->Cancelled, then new message accepted and new turn started.",
+      "scenario": "interrupt_and_send",
+      "file": "trace-009-interrupt-and-send.json",
+      "expected_snapshot": "snapshot-009-interrupt-and-send.json",
+      "covered_requirements": [
+        "HC-02",
+        "HC-04",
+        "MB-05",
+        "SP-03",
+        "INV-003-6"
+      ]
+    }
+  ]
+}

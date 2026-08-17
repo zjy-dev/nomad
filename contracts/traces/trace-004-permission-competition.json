@@ -1,0 +1,132 @@
+{
+  "trace_id": "trace-004-permission-competition",
+  "scenario": "permission_competition",
+  "description": "Permission requested, two mobile decisions arrive. First valid decision wins, second is rejected as stale.",
+  "contract_version": "1.0.0",
+  "session_id": "sess_perm_004",
+  "events": [
+    {
+      "event_type": "session.created",
+      "session_id": "sess_perm_004",
+      "turn_id": null,
+      "event_id": "sess_perm_004:1",
+      "seq": 1,
+      "timestamp": "2026-08-17T13:00:00Z",
+      "durable": true,
+      "payload": { "state_change": "session created" }
+    },
+    {
+      "event_type": "turn.started",
+      "session_id": "sess_perm_004",
+      "turn_id": "turn_001",
+      "event_id": "sess_perm_004:2",
+      "seq": 2,
+      "timestamp": "2026-08-17T13:00:01Z",
+      "durable": true,
+      "payload": { "state_change": "turn started" }
+    },
+    {
+      "event_type": "permission.requested",
+      "session_id": "sess_perm_004",
+      "turn_id": "turn_001",
+      "event_id": "sess_perm_004:3",
+      "seq": 3,
+      "timestamp": "2026-08-17T13:00:02Z",
+      "durable": true,
+      "payload": {
+        "permission_id": "perm_001",
+        "action": "edit /src/main.py",
+        "state_change": "permission requested"
+      }
+    },
+    {
+      "event_type": "permission.resolved",
+      "session_id": "sess_perm_004",
+      "turn_id": "turn_001",
+      "event_id": "sess_perm_004:4",
+      "seq": 4,
+      "timestamp": "2026-08-17T13:00:03Z",
+      "durable": true,
+      "payload": {
+        "permission_id": "perm_001",
+        "action": "allow_once",
+        "state_change": "permission resolved by device_A"
+      }
+    },
+    {
+      "event_type": "tool.started",
+      "session_id": "sess_perm_004",
+      "turn_id": "turn_001",
+      "event_id": "sess_perm_004:5",
+      "seq": 5,
+      "timestamp": "2026-08-17T13:00:04Z",
+      "durable": true,
+      "payload": { "tool_name": "edit", "state_change": "tool started after permission allow" }
+    },
+    {
+      "event_type": "tool.completed",
+      "session_id": "sess_perm_004",
+      "turn_id": "turn_001",
+      "event_id": "sess_perm_004:6",
+      "seq": 6,
+      "timestamp": "2026-08-17T13:00:06Z",
+      "durable": true,
+      "payload": { "tool_name": "edit", "state_change": "tool completed" }
+    },
+    {
+      "event_type": "diff.updated",
+      "session_id": "sess_perm_004",
+      "turn_id": "turn_001",
+      "event_id": "sess_perm_004:7",
+      "seq": 7,
+      "timestamp": "2026-08-17T13:00:07Z",
+      "durable": true,
+      "payload": { "summary": "1 file changed", "state_change": "diff updated" }
+    },
+    {
+      "event_type": "turn.completed",
+      "session_id": "sess_perm_004",
+      "turn_id": "turn_001",
+      "event_id": "sess_perm_004:8",
+      "seq": 8,
+      "timestamp": "2026-08-17T13:00:08Z",
+      "durable": true,
+      "payload": { "state_change": "turn completed" }
+    }
+  ],
+  "command_exchanges": [
+    {
+      "command_type": "permission_decision",
+      "request_id": "req_perm_allow_A",
+      "session_id": "sess_perm_004",
+      "seq": 3,
+      "permission_id": "perm_001",
+      "decision": "allow_once",
+      "action_hash": "sha256:abc123",
+      "status": "Completed",
+      "result": {
+        "resolved_at_seq": 4,
+        "event_id": "sess_perm_004:4",
+        "error_code": "OK"
+      }
+    },
+    {
+      "command_type": "permission_decision",
+      "request_id": "req_perm_allow_B",
+      "session_id": "sess_perm_004",
+      "seq": 3,
+      "permission_id": "perm_001",
+      "decision": "deny",
+      "action_hash": "sha256:abc123",
+      "status": "Stale",
+      "result": {
+        "resolved_at_seq": null,
+        "event_id": null,
+        "error_code": "ERR_REQUEST_STALE",
+        "error_message": "Permission already resolved by another device"
+      }
+    }
+  ],
+  "expected_snapshot_ref": "snapshot-004-permission-competition.json",
+  "notes": "Second permission_decision (req_perm_allow_B) is a Stale rejection. The Host only resolved once (seq 4), demonstrating INV-003-1 (same permission_id resolved only once). The command exchange shows the rejection result explicitly."
+}

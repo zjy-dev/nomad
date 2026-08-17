@@ -1,0 +1,198 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nomad/contract/commands/v1",
+  "title": "Nomad Command and Approval Lifecycle",
+  "version": "1.0.0",
+  "description": "Client command, Relay receipt, Host acceptance and final result schemas. No encryption fields. Source: CON-003, PRD SP-03, MB-05.",
+  "definitions": {
+    "command_status": {
+      "type": "string",
+      "enum": [
+        "RelayReceived",
+        "HostAccepted",
+        "Executing",
+        "Completed",
+        "Rejected",
+        "Expired",
+        "Stale",
+        "Incompatible",
+        "Revoked",
+        "OutcomeUnknown"
+      ]
+    },
+    "error_code": {
+      "type": "string",
+      "enum": [
+        "OK",
+        "ERR_REQUEST_EXPIRED",
+        "ERR_REQUEST_STALE",
+        "ERR_INCOMPATIBLE_VERSION",
+        "ERR_REQUEST_REVOKED",
+        "ERR_DUPLICATE_REQUEST",
+        "ERR_HOST_OFFLINE",
+        "ERR_SAFETY_BLOCKED",
+        "ERR_PERMISSION_DENIED",
+        "ERR_OUTCOME_UNKNOWN"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "title": "Reply command",
+      "type": "object",
+      "required": ["command_type", "request_id", "session_id", "seq", "content"],
+      "additionalProperties": false,
+      "properties": {
+        "command_type": { "const": "reply" },
+        "request_id": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Client-generated idempotency key. Same request_id MUST NOT produce more than one Host acceptance."
+        },
+        "session_id": { "type": "string", "maxLength": 64 },
+        "seq": { "type": "integer", "minimum": 1 },
+        "turn_id": { "type": ["string", "null"], "maxLength": 64 },
+        "content": { "type": "string", "maxLength": 65536 },
+        "status": { "$ref": "#/definitions/command_status" },
+        "result": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "accepted_at_seq": { "type": ["integer", "null"] },
+            "event_id": { "type": ["string", "null"] },
+            "error_code": { "$ref": "#/definitions/error_code" },
+            "error_message": { "type": ["string", "null"] }
+          }
+        }
+      }
+    },
+    {
+      "title": "Stop command",
+      "type": "object",
+      "required": ["command_type", "request_id", "session_id", "seq", "target_turn_id"],
+      "additionalProperties": false,
+      "properties": {
+        "command_type": { "const": "stop" },
+        "request_id": { "type": "string", "maxLength": 128 },
+        "session_id": { "type": "string", "maxLength": 64 },
+        "seq": { "type": "integer", "minimum": 1 },
+        "target_turn_id": { "type": "string", "maxLength": 64 },
+        "status": { "$ref": "#/definitions/command_status" },
+        "result": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "accepted_at_seq": { "type": ["integer", "null"] },
+            "event_id": { "type": ["string", "null"] },
+            "error_code": { "$ref": "#/definitions/error_code" },
+            "error_message": { "type": ["string", "null"] }
+          }
+        }
+      }
+    },
+    {
+      "title": "Interrupt-and-send command",
+      "type": "object",
+      "required": ["command_type", "request_id", "session_id", "seq", "interrupt_turn_id", "new_content"],
+      "additionalProperties": false,
+      "properties": {
+        "command_type": { "const": "interrupt_and_send" },
+        "request_id": { "type": "string", "maxLength": 128 },
+        "session_id": { "type": "string", "maxLength": 64 },
+        "seq": { "type": "integer", "minimum": 1 },
+        "interrupt_turn_id": { "type": "string", "maxLength": 64 },
+        "new_content": { "type": "string", "maxLength": 65536 },
+        "status": { "$ref": "#/definitions/command_status" },
+        "result": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "stopped_at_seq": { "type": ["integer", "null"] },
+            "new_event_id": { "type": ["string", "null"] },
+            "error_code": { "$ref": "#/definitions/error_code" },
+            "error_message": { "type": ["string", "null"] }
+          }
+        }
+      }
+    },
+    {
+      "title": "Permission decision command",
+      "type": "object",
+      "required": ["command_type", "request_id", "session_id", "seq", "permission_id", "decision", "action_hash", "expires_at"],
+      "additionalProperties": false,
+      "properties": {
+        "command_type": { "const": "permission_decision" },
+        "request_id": { "type": "string", "maxLength": 128 },
+        "session_id": { "type": "string", "maxLength": 64 },
+        "seq": { "type": "integer", "minimum": 1 },
+        "permission_id": { "type": "string", "maxLength": 128 },
+        "decision": { "type": "string", "enum": ["allow_once", "deny"] },
+        "action_hash": { "type": "string", "maxLength": 128 },
+        "expires_at": { "type": "string", "format": "date-time" },
+        "status": { "$ref": "#/definitions/command_status" },
+        "result": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "resolved_at_seq": { "type": ["integer", "null"] },
+            "event_id": { "type": ["string", "null"] },
+            "error_code": { "$ref": "#/definitions/error_code" },
+            "error_message": { "type": ["string", "null"] }
+          }
+        }
+      }
+    }
+  ],
+  "invariants": [
+    {
+      "id": "INV-003-1",
+      "severity": "MUST",
+      "rule": "Same request_id MUST NOT produce more than one HostAccepted. Duplicate request_id returns the stable prior result without re-triggering Host execution."
+    },
+    {
+      "id": "INV-003-2",
+      "severity": "MUST",
+      "rule": "RelayReceived MUST NOT be interpreted as HostAccepted. Relay ACK means only that the Relay received the message, not that the Host acted on it."
+    },
+    {
+      "id": "INV-003-3",
+      "severity": "MUST",
+      "rule": "Every command type MUST have a defined rejection result: Expired, Stale, Incompatible, or Revoked. Unknown-side-effect commands are explicitly prohibited from auto-retry."
+    },
+    {
+      "id": "INV-003-4",
+      "severity": "MUST",
+      "rule": "OutcomeUnknown: when a writable tool's external side effect may have succeeded but the Host could not reliably record the result, the command status MUST be OutcomeUnknown. Auto-retry is FORBIDDEN."
+    },
+    {
+      "id": "INV-003-5",
+      "severity": "MUST",
+      "rule": "permission_decision MUST bind: permission_id, action_hash, expires_at, session_id and seq. Mismatch on any of these returns ERR_REQUEST_STALE or ERR_REQUEST_REVOKED."
+    },
+    {
+      "id": "INV-003-6",
+      "severity": "MUST",
+      "rule": "interrupt_and_send MUST NOT allow old turn and new turn to both modify files concurrently. The interrupt is confirmed (turn.stopping/turn.cancelled) before the new message is accepted."
+    }
+  ],
+  "state_machine": {
+    "description": "Command lifecycle state transitions. A command progresses through Client->Relay->Host->Result.",
+    "transitions": {
+      "RelayReceived": ["HostAccepted", "Expired", "Stale", "Incompatible", "Revoked"],
+      "HostAccepted":  ["Executing", "Expired", "Stale"],
+      "Executing":     ["Completed", "OutcomeUnknown", "Stale"],
+      "Completed":     [],
+      "OutcomeUnknown": [],
+      "Rejected":      [],
+      "Expired":       [],
+      "Stale":         [],
+      "Incompatible":  [],
+      "Revoked":       []
+    },
+    "crash_window": {
+      "description": "Window between Host receiving the command and the result being durably recorded. During this window, the Host MUST mark the tool as OutcomeUnknown on restart and MUST NOT auto-retry.",
+      "detection": "On Host restart, scan for commands in HostAccepted or Executing state without a corresponding durable event. Mark as OutcomeUnknown.",
+      "recovery": "Surface OutcomeUnknown to the user. Do NOT automatically re-execute."
+    }
+  }
+}

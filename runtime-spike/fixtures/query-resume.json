@@ -1,0 +1,48 @@
+{
+  "kind": "query-resume",
+  "workload_id": "ws-recovery-100k",
+  "description": "Read-path query and cursor-resume payloads",
+  "queries": [
+    {
+      "query_type": "last-1k",
+      "params": {
+        "from_seq": 0,
+        "to_seq": 100000,
+        "limit": 1000
+      }
+    },
+    {
+      "query_type": "last-1k",
+      "params": {
+        "from_seq": 0,
+        "to_seq": 100000,
+        "limit": 1000
+      }
+    },
+    {
+      "query_type": "cursor-resume",
+      "params": {
+        "from_seq": 0,
+        "to_seq": 100000,
+        "limit": 100
+      }
+    },
+    {
+      "query_type": "cursor-resume",
+      "params": {
+        "from_seq": 0,
+        "to_seq": 100000,
+        "limit": 100
+      }
+    },
+    {
+      "query_type": "last-100",
+      "params": {
+        "from_seq": 0,
+        "to_seq": 100000,
+        "limit": 100
+      }
+    }
+  ],
+  "repeats_per_query": 100
+}

@@ -1,0 +1,42 @@
+{
+  "schema": "nomad.connector.provenance.v1",
+  "upstream": {
+    "name": "OpenCode",
+    "version": "1.18.16",
+    "tag": "v1.18.16",
+    "commit": "a3647eb025c7615159d417dcc49fc39fdaeba65b",
+    "repository": "https://github.com/anomalyco/opencode",
+    "license": "MIT",
+    "publishedAt": "2026-08-10",
+    "fetchedAt": "2026-08-17",
+    "fetchedBy": "HC-001 fixture pin"
+  },
+  "checksums": {
+    "sourceTarball": {
+      "url": "https://github.com/anomalyco/opencode/archive/refs/tags/v1.18.16.tar.gz",
+      "sha256": null,
+      "note": "GitHub release assets for this tag require authentication; checksum was not fetched from the release page. Re-run tools/pin_version.py with authenticated access to populate."
+    },
+    "sourceZipball": {
+      "url": "https://github.com/anomalyco/opencode/archive/refs/tags/v1.18.16.zip",
+      "sha256": null,
+      "note": "Same as sourceTarball."
+    },
+    "binary": {
+      "url": null,
+      "sha256": null,
+      "note": "OpenCode does not publish signed binary artifacts on the release page for this version. The adapter consumes the source distribution and runs via deno/npm."
+    }
+  },
+  "upstreamAPISummary": {
+    "baseURL": "http://127.0.0.1:4096",
+    "defaultHostname": "127.0.0.1",
+    "defaultPort": 4096,
+    "docsPath": "/doc",
+    "discovery": "Loopback only. Connector MUST reject any non-loopback address (HC-003 gate)."
+  },
+  "changePolicy": {
+    "onVersionChange": "Update this manifest, regenerate fixtures, and re-run validator before merging. Version pin is a merge-blocking gate.",
+    "onSchemaChange": "Regenerate schema/ snapshots and verify all fixtures still validate. Breaking schema changes require a task-level review."
+  }
+}

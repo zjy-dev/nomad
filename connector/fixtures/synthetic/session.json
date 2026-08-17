@@ -1,0 +1,298 @@
+{
+  "fixture": "synthetic",
+  "target": "session",
+  "label": "synthetic",
+  "generatedAt": "2026-08-17",
+  "source": {
+    "type": "schema-derived",
+    "upstream": "OpenCode v1.18.16",
+    "commit": "a3647eb025c7615159d417dcc49fc39fdaeba65b",
+    "reason": "Payloads constructed from the published OpenCode TypeScript type definitions and endpoint table. No live v1.18.16 server was available at fixture time. These payloads must pass schema conformance checks but are NOT live-captured.",
+    "captureCommand": null
+  },
+  "cases": [
+    {
+      "id": "session.create",
+      "description": "POST /session - create a new session",
+      "request": {
+        "method": "POST",
+        "path": "/session",
+        "body": {
+          "directory": "/tmp/nomad-fixture",
+          "title": "fixture-session",
+          "version": "1.18.16"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "id": "sess_001",
+          "projectID": null,
+          "directory": "/tmp/nomad-fixture",
+          "title": "fixture-session",
+          "version": "1.18.16",
+          "time": "2026-08-17T10:00:00Z",
+          "summary": null,
+          "status": "idle",
+          "lastMessage": null
+        }
+      }
+    },
+    {
+      "id": "session.get",
+      "description": "GET /session/:id - fetch session by ID",
+      "request": {
+        "method": "GET",
+        "path": "/session/sess_001"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "id": "sess_001",
+          "projectID": null,
+          "directory": "/tmp/nomad-fixture",
+          "title": "fixture-session",
+          "version": "1.18.16",
+          "time": "2026-08-17T10:00:00Z",
+          "summary": null,
+          "status": "idle",
+          "lastMessage": null
+        }
+      }
+    },
+    {
+      "id": "session.update",
+      "description": "PATCH /session/:id - update session metadata",
+      "request": {
+        "method": "PATCH",
+        "path": "/session/sess_001",
+        "body": {
+          "title": "fixture-session-updated"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "id": "sess_001",
+          "projectID": null,
+          "directory": "/tmp/nomad-fixture",
+          "title": "fixture-session-updated",
+          "version": "1.18.16",
+          "time": "2026-08-17T10:00:05Z",
+          "summary": null,
+          "status": "idle",
+          "lastMessage": null
+        }
+      }
+    },
+    {
+      "id": "session.delete",
+      "description": "DELETE /session/:id - delete a session",
+      "request": {
+        "method": "DELETE",
+        "path": "/session/sess_001"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "deleted": true,
+          "id": "sess_001"
+        }
+      }
+    },
+    {
+      "id": "session.list",
+      "description": "GET /session - list all sessions",
+      "request": {
+        "method": "GET",
+        "path": "/session"
+      },
+      "response": {
+        "status": 200,
+        "body": [
+          {
+            "id": "sess_001",
+            "projectID": null,
+            "directory": "/tmp/nomad-fixture",
+            "title": "fixture-session",
+            "version": "1.18.16",
+            "time": "2026-08-17T10:00:00Z",
+            "summary": null,
+            "status": "idle",
+            "lastMessage": null
+          }
+        ]
+      }
+    },
+    {
+      "id": "session.init",
+      "description": "POST /session/:id/init - initialize session",
+      "request": {
+        "method": "POST",
+        "path": "/session/sess_001/init",
+        "body": {
+          "prompt": "Initialize session"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "id": "sess_001",
+          "status": "running"
+        }
+      }
+    },
+    {
+      "id": "session.fork",
+      "description": "POST /session/:id/fork - fork session",
+      "request": {
+        "method": "POST",
+        "path": "/session/sess_001/fork",
+        "body": {
+          "messageID": null
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "id": "sess_fork_001",
+          "projectID": null,
+          "directory": "/tmp/nomad-fixture",
+          "title": "fixture-session-fork",
+          "version": "1.18.16",
+          "time": "2026-08-17T10:00:10Z",
+          "summary": null,
+          "status": "idle",
+          "lastMessage": null
+        }
+      }
+    },
+    {
+      "id": "session.share",
+      "description": "POST /session/:id/share - share session",
+      "request": {
+        "method": "POST",
+        "path": "/session/sess_001/share",
+        "body": {}
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "shareID": "share_001",
+          "shareURL": "http://127.0.0.1:4096/share/share_001"
+        }
+      }
+    },
+    {
+      "id": "session.summarize",
+      "description": "POST /session/:id/summarize - summarize session",
+      "request": {
+        "method": "POST",
+        "path": "/session/sess_001/summarize",
+        "body": {}
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "id": "sess_001",
+          "summary": "Session summary text."
+        }
+      }
+    },
+    {
+      "id": "session.revert",
+      "description": "POST /session/:id/revert - revert session to snapshot",
+      "request": {
+        "method": "POST",
+        "path": "/session/sess_001/revert",
+        "body": {
+          "messageID": null
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "id": "sess_001",
+          "reverted": true
+        }
+      }
+    },
+    {
+      "id": "session.children",
+      "description": "GET /session/:id/children - list child sessions",
+      "request": {
+        "method": "GET",
+        "path": "/session/sess_parent_001/children"
+      },
+      "response": {
+        "status": 200,
+        "body": [
+          {
+            "id": "sess_child_001",
+            "projectID": null,
+            "directory": "/tmp/child1",
+            "title": "Child 1",
+            "version": "1.18.16",
+            "time": "2026-08-17T10:00:00Z",
+            "summary": null,
+            "status": "idle",
+            "lastMessage": null
+          }
+        ]
+      }
+    },
+    {
+      "id": "session.todo",
+      "description": "GET /session/:id/todo - list todos for a session",
+      "request": {
+        "method": "GET",
+        "path": "/session/sess_001/todo"
+      },
+      "response": {
+        "status": 200,
+        "body": [
+          { "id": "todo_001", "content": "Write tests", "done": false },
+          { "id": "todo_002", "content": "Review code", "done": true }
+        ]
+      }
+    },
+    {
+      "id": "session.empty-dir",
+      "description": "Create session with empty directory (error path)",
+      "request": {
+        "method": "POST",
+        "path": "/session",
+        "body": { "directory": "", "title": "empty-dir" }
+      },
+      "response": {
+        "status": 400,
+        "body": { "error": "directory is required" }
+      }
+    },
+    {
+      "id": "session.create.invalid-version",
+      "description": "Create session with mismatched version (error path)",
+      "request": {
+        "method": "POST",
+        "path": "/session",
+        "body": { "directory": "/tmp", "title": "bad-version", "version": "0.0.1" }
+      },
+      "response": {
+        "status": 400,
+        "body": { "error": "version mismatch" }
+      }
+    },
+    {
+      "id": "session.get.notfound",
+      "description": "GET non-existent session (error path)",
+      "request": { "method": "GET", "path": "/session/nonexistent_id" },
+      "response": { "status": 404, "body": { "error": "session not found" } }
+    },
+    {
+      "id": "session.list.empty",
+      "description": "List sessions when repo has none",
+      "request": { "method": "GET", "path": "/session" },
+      "response": { "status": 200, "body": [] }
+    }
+  ]
+}

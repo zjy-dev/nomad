@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nomad/contract/session/v1",
+  "title": "Nomad Session Semantics",
+  "version": "1.0.0",
+  "language": "en",
+  "description": "Language-neutral core model for Session, Turn, connection and freshness semantics. No encryption fields. Source: docs/technical/tasks/01-contract-security.md CON-001, PRD 6.",
+  "type": "object",
+  "required": ["session_id", "semantics_version", "turn_state", "host_connectivity", "client_freshness", "updated_at"],
+  "properties": {
+    "session_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+$",
+      "maxLength": 64,
+      "description": "Opaque session identifier. Stable for the Session lifetime."
+    },
+    "semantics_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+      "description": "Semantic version of this contract. Compatibility is negotiated via capability negotiation at connection time, not via exact string equality. A Host declaring 1.x is compatible with a Mobile declaring 1.y where x >= minimum_supported_version for that major version."
+    },
+    "turn_id": {
+      "type": ["string", "null"],
+      "maxLength": 64,
+      "description": "Current active turn identifier. Null when turn_state is None."
+    },
+    "turn_state": {
+      "type": "string",
+      "enum": [
+        "None",
+        "Running",
+        "NeedsInput",
+        "NeedsPermission",
+        "Stopping",
+        "Completed",
+        "Cancelled",
+        "Failed",
+        "OutcomeUnknown"
+      ],
+      "description": "Current turn lifecycle state. Completed/Cancelled/Failed/OutcomeUnknown are Turn outcomes, NOT Session terminal states."
+    },
+    "host_connectivity": {
+      "type": "string",
+      "enum": ["Online", "Offline"],
+      "description": "Host heartbeat presence within the valid window."
+    },
+    "client_freshness": {
+      "type": "string",
+      "enum": ["Live", "Reconnecting", "Stale"],
+      "description": "Whether the client has completed event gap and snapshot validation."
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 timestamp of last state update."
+    }
+  },
+  "invariants": [
+    {
+      "id": "INV-001-1",
+      "severity": "MUST",
+      "rule": "If turn_state is None, turn_id MUST be null."
+    },
+    {
+      "id": "INV-001-2",
+      "severity": "MUST",
+      "rule": "If turn_state is not None, turn_id MUST be a non-empty string."
+    },
+    {
+      "id": "INV-001-3",
+      "severity": "MUST",
+      "rule": "A Session with turn_state=Completed/Cancelled/Failed/OutcomeUnknown MUST still be able to produce new Turns. Completed is not a Session terminal state."
+    },
+    {
+      "id": "INV-001-4",
+      "severity": "MUST",
+      "rule": "Approval and Stop submissions MUST be rejected unless host_connectivity=Online AND client_freshness=Live."
+    },
+    {
+      "id": "INV-001-5",
+      "severity": "MUST",
+      "rule": "turn_state and host_connectivity and client_freshness are ORTHOGONAL dimensions. No dimension may be inferred from or collapsed into another."
+    },
+    {
+      "id": "INV-001-6",
+      "severity": "MUST",
+      "rule": "OutcomeUnknown -> Running MUST represent a new Turn started by the user, NOT a retry or resume of the original side effect. The original side effect remains in OutcomeUnknown and is never automatically re-executed."
+    }
+  ],
+  "state_transitions": {
+    "turn_state": {
+      "None":       ["Running"],
+      "Running":    ["NeedsInput", "NeedsPermission", "Stopping", "Completed", "Cancelled", "Failed", "OutcomeUnknown"],
+      "NeedsInput": ["Running", "Cancelled", "Failed"],
+      "NeedsPermission": ["Running", "Cancelled", "Failed"],
+      "Stopping":   ["Cancelled", "Completed", "Failed"],
+      "Completed":  ["Running"],
+      "Cancelled":  ["Running"],
+      "Failed":     ["Running"],
+      "OutcomeUnknown": ["Running", "Failed"]
+    },
+    "host_connectivity": {
+      "Online":  ["Offline"],
+      "Offline": ["Online"]
+    },
+    "client_freshness": {
+      "Live":        ["Reconnecting", "Stale"],
+      "Reconnecting":["Live", "Stale"],
+      "Stale":       ["Reconnecting", "Live"]
+    }
+  },
+  "unknown_state_strategy": "Unknown or unrecognized states MUST fail closed: the receiver treats the field as protocol incompatibility and prevents safe operations (Approval, Stop).",
+  "excluded": ["event payload", "encryption fields", "transport frame", "language-specific types"]
+}

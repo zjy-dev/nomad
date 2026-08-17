@@ -1,0 +1,6 @@
+[
+  "W1 iteration 1: workers inherited full conversation context and stalled before writes",
+  "W1 iteration 2: fresh no-history default workers also stalled before writes",
+  "W1 iteration 3: fresh explicit code-model workers as final scheduler recovery attempt",
+  "W2-W3 iteration 4: parallel Rust Host, opaque Relay, Mobile reference reducer, security design, and fault-test vertical slice"
+]

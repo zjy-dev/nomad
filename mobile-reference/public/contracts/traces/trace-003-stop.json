@@ -1,0 +1,91 @@
+{
+  "trace_id": "trace-003-stop",
+  "scenario": "stop",
+  "description": "User sends Stop while turn is Running. Host accepts, turn transitions Stopping->Cancelled.",
+  "contract_version": "1.0.0",
+  "session_id": "sess_stop_003",
+  "events": [
+    {
+      "event_type": "session.created",
+      "session_id": "sess_stop_003",
+      "turn_id": null,
+      "event_id": "sess_stop_003:1",
+      "seq": 1,
+      "timestamp": "2026-08-17T12:00:00Z",
+      "durable": true,
+      "payload": { "state_change": "session created" }
+    },
+    {
+      "event_type": "turn.started",
+      "session_id": "sess_stop_003",
+      "turn_id": "turn_001",
+      "event_id": "sess_stop_003:2",
+      "seq": 2,
+      "timestamp": "2026-08-17T12:00:01Z",
+      "durable": true,
+      "payload": { "state_change": "turn started" }
+    },
+    {
+      "event_type": "tool.started",
+      "session_id": "sess_stop_003",
+      "turn_id": "turn_001",
+      "event_id": "sess_stop_003:3",
+      "seq": 3,
+      "timestamp": "2026-08-17T12:00:02Z",
+      "durable": true,
+      "payload": { "tool_name": "grep", "state_change": "tool started" }
+    },
+    {
+      "event_type": "tool.completed",
+      "session_id": "sess_stop_003",
+      "turn_id": "turn_001",
+      "event_id": "sess_stop_003:4",
+      "seq": 4,
+      "timestamp": "2026-08-17T12:00:03Z",
+      "durable": true,
+      "payload": { "tool_name": "grep", "state_change": "tool completed" }
+    },
+    {
+      "event_type": "tool.started",
+      "session_id": "sess_stop_003",
+      "turn_id": "turn_001",
+      "event_id": "sess_stop_003:5",
+      "seq": 5,
+      "timestamp": "2026-08-17T12:00:04Z",
+      "durable": true,
+      "payload": { "tool_name": "edit", "state_change": "tool started" }
+    },
+    {
+      "event_type": "turn.stopping",
+      "session_id": "sess_stop_003",
+      "turn_id": "turn_001",
+      "event_id": "sess_stop_003:6",
+      "seq": 6,
+      "timestamp": "2026-08-17T12:00:05Z",
+      "durable": true,
+      "payload": { "state_change": "stop command accepted" }
+    },
+    {
+      "event_type": "tool.failed",
+      "session_id": "sess_stop_003",
+      "turn_id": "turn_001",
+      "event_id": "sess_stop_003:7",
+      "seq": 7,
+      "timestamp": "2026-08-17T12:00:06Z",
+      "durable": true,
+      "payload": { "tool_name": "edit", "reason": "stopped by user", "state_change": "tool failed (stopped)" }
+    },
+    {
+      "event_type": "turn.cancelled",
+      "session_id": "sess_stop_003",
+      "turn_id": "turn_001",
+      "event_id": "sess_stop_003:8",
+      "seq": 8,
+      "timestamp": "2026-08-17T12:00:07Z",
+      "durable": true,
+      "payload": { "state_change": "turn cancelled" }
+    }
+  ],
+  "expected_snapshot_ref": "snapshot-003-stop.json",
+  "notes": "Stop command lifecycle: RelayReceived -> HostAccepted -> Executing -> Cancelled. tool.failed (seq 7) is not the same as turn.failed. Turn goes through Stopping (seq 6) then Cancelled (seq 8). No duplicate Host acceptance for same request_id."
+}

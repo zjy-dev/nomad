@@ -1,0 +1,2 @@
+{"ts":"2026-08-17T00:00:00+08:00","source":"orchestrator","level":"decision","event":"scope","detail":"Implement Dual Spike and runnable disposable-repository vertical slice before Private Alpha breadth."}
+{"ts":"2026-08-17T01:10:00+08:00","source":"orchestrator","level":"warn","event":"completion_report_mismatch","detail":"CON reports claimed conformance PASS before three digest fixes were applied; orchestrator rerun remained red. Reports and data were corrected only after independent verification. Future gates must use orchestrator-run commands, not worker summaries."}
