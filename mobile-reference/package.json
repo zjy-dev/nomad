@@ -7,6 +7,8 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "build:process-bridge": "tsc -p process-bridge/tsconfig.json",
+    "test:gateway": "node --test pilot-gateway/*.test.mjs",
+    "pilot:gateway": "node pilot-gateway/server.mjs",
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest"

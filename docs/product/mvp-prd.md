@@ -9,6 +9,8 @@
 | 技术 DRI | 角色：技术负责人；Dual Spike 启动前必须登记到具体人 |
 | 安全 DRI | 角色：安全负责人；协议实现前必须登记到具体人，顾问不能代替内部 DRI |
 
+> 本文描述 Private Alpha 的长期完整范围。2026-08-18 的当前执行候选是更窄的 [Controlled Pilot v0.2](iteration-2-prd.md)：只使用可丢弃仓库和临时账户，保持 `allow_once=false`，不代表已进入本 PRD 的发布阶段。
+
 ## 1. 目的
 
 验证高频 OpenCode CLI 用户是否会持续使用手机推进本机任务，并证明 Nomad 能在真实网络环境下安全、准确地同步 Agent 会话。这个版本验证 Companion，不验证自有 Agent Runtime 是否已经完成。

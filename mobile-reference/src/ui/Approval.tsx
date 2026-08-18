@@ -1,99 +1,71 @@
-import { ViewState } from '../contracts/reducer';
-import { StatusChips, SafetyGateBanner } from './StatusChips';
+import { useState } from 'react';
+import type { CommandSubmission, SessionView } from '../client/types';
 import { canSubmitSafeOperations } from '../contracts/reducer';
-import type { CommandResult } from '../contracts/types';
+import { StatusChips, SafetyGateBanner } from './StatusChips';
 
 interface ApprovalProps {
-  state: ViewState;
-  onDeny: () => Promise<CommandResult>;
+  view: SessionView;
+  onDeny: () => Promise<CommandSubmission>;
   onStop: () => void;
-  onExplainAllowDisabled: () => void;
 }
 
-/**
- * Approval card per MB-011.
- *
- * `allow_once` is explicitly ABSENT / disabled in this reference client
- * with a clear, documented reason: the HC-009 live gate is not passed
- * (MB-011 gate requires Security/biometric pipeline which is out of scope
- * for the validation companion). The UI renders the Host's facts so the
- * user can inspect, deny, or Stop the turn — but cannot approve yet.
- */
-export function Approval({ state, onDeny, onStop, onExplainAllowDisabled }: ApprovalProps) {
+export function Approval({ view, onDeny, onStop }: ApprovalProps) {
+  const { state, approval } = view;
   const gate = canSubmitSafeOperations(state);
-  const permId = state.activePermissionId;
-  const hasPendingPermission = state.session.turn_state === 'NeedsPermission' && permId !== null;
+  const pending = state.session.turn_state === 'NeedsPermission' && state.activePermissionId !== null && approval !== null;
+  const [status, setStatus] = useState<string | null>(null);
+  const actionDisabled = !gate.ok || !pending;
+
+  async function deny() {
+    setStatus('Sending your denial…');
+    const { status: commandStatus, result } = await onDeny();
+    setStatus(commandStatus === 'RelayReceived'
+      ? 'Relay received your denial. Waiting for the Host.'
+      : commandStatus === 'HostAccepted' || commandStatus === 'Executing' || commandStatus === 'Completed'
+        ? 'The Host accepted your denial.'
+        : result.error_message ?? 'The denial was not accepted.');
+  }
 
   return (
     <div className="stack">
       <StatusChips state={state} />
       <SafetyGateBanner state={state} />
+      <section className="section" aria-labelledby="action-title">
+        <div className="page-heading"><span className="eyebrow">PROTECTED ACTION</span><h1 id="action-title">Review request</h1><p>These are facts reported by the Host, not the agent's recommendation.</p></div>
 
-      <div className="section">
-        <div className="section-header">
-          <span className="section-title">Approval</span>
-          {permId && <span className="muted code" style={{ fontSize: 11 }}>permission_id: {permId}</span>}
-        </div>
-
-        <div className="card card--warn" aria-live="polite">
-          <div className="card-title">Host requested permission</div>
-          <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
-            The Host is waiting for your decision on a <span className="code">permission_decision</span> request.
-          </div>
-          <div style={{ marginTop: 12 }}>
-            <FactRow label="permission_id" value={permId ?? '—'} raw />
-            <FactRow label="action_hash" value="sha256: (provided by Host in fact block)" raw />
-            <FactRow label="turn_state" value={state.session.turn_state} />
-            <FactRow label="host_connectivity" value={state.session.host_connectivity} />
-            <FactRow label="client_freshness" value={state.session.client_freshness} />
-          </div>
-
-          <div className="perm-warning" role="note">
-            <strong>`allow_once` is disabled in this build.</strong>
-            The HC-009 live gate (local biometric + security envelope) is not yet
-            passed for the Validation Companion. You can <em>inspect</em> the
-            facts and <em>deny</em> or <em>stop</em> the turn, but you cannot
-            approve until the security gate is shipped.
-          </div>
-
-          <div className="btn-row" style={{ marginTop: 14 }}>
-            <button
-              className="btn btn--danger"
-              disabled={!gate.ok || !hasPendingPermission}
-              onClick={() => {
-                void onDeny();
-              }}
-              aria-label="Deny permission request"
-            >
-              Deny
-            </button>
-            <button
-              className="btn btn--danger"
-              disabled={!gate.ok || !hasPendingPermission}
-              onClick={onStop}
-              aria-label="Stop current turn instead of approving"
-            >
-              Stop turn
-            </button>
-            <button
-              className="btn btn--ghost"
-              onClick={onExplainAllowDisabled}
-              aria-label="Explain why allow once is not available"
-            >
-              Why is allow disabled?
-            </button>
-          </div>
-        </div>
-      </div>
+        {!approval && <div className="empty-state"><strong>Nothing is waiting for approval</strong><p>Return here when the Host reports a protected action.</p></div>}
+        {approval && (
+          <>
+            <div className="risk-banner"><span aria-hidden="true">!</span><div><strong>The agent wants to {approval.operation.toLowerCase()}</strong><p>The Pilot cannot approve actions from mobile. You may deny it or stop the task.</p></div></div>
+            <article className="facts-card">
+              <div className="facts-card-head"><span className="tool-badge">{approval.tool.slice(0, 2).toUpperCase()}</span><div><span className="eyebrow">TOOL</span><h2>{approval.tool}</h2></div></div>
+              <dl>
+                <Fact label="Requested action" value={approval.operation} />
+                {approval.arguments.map((fact) => <Fact key={fact.label} label={fact.label} value={fact.value} />)}
+                {approval.workingDirectory && <Fact label="Working area" value={approval.workingDirectory} />}
+                {approval.resources.length > 0 && <Fact label="Known resources" value={approval.resources.join(', ')} />}
+                {approval.expiresAt && <Fact label="Request expires" value={formatExpiry(approval.expiresAt)} />}
+                <Fact label="Fact source" value={approval.source} />
+              </dl>
+            </article>
+            <div className="explanation-card"><span className="eyebrow">WHAT THIS MEANS</span><p>Denying closes this request. Stopping asks the Host to end the current task. Neither action reverses work already written to disk.</p></div>
+            {status && <div className="command-status" role="status">{status}</div>}
+            <div className="action-stack">
+              <button className="btn btn--danger btn--block" disabled={actionDisabled} onClick={() => void deny()}>Deny request</button>
+              <button className="btn btn--danger-secondary btn--block" disabled={actionDisabled} onClick={onStop}>Stop task instead</button>
+            </div>
+          </>
+        )}
+      </section>
     </div>
   );
 }
 
-function FactRow({ label, value, raw }: { label: string; value: string; raw?: boolean }) {
-  return (
-    <div className="perm-fact">
-      <span className="label">{label}</span>
-      <span className={`value${raw ? ' raw' : ''} break-all`}>{value}</span>
-    </div>
-  );
+function Fact({ label, value }: { label: string; value: string }) {
+  return <div><dt>{label}</dt><dd>{value}</dd></div>;
+}
+
+function formatExpiry(iso: string): string {
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? 'Unknown' : date.toLocaleString(undefined, { hour: '2-digit', minute: '2-digit', month: 'short', day: 'numeric' });
 }

@@ -2,7 +2,9 @@ pub mod dedup;
 pub mod error;
 pub mod fixture_loader;
 pub mod journal;
+pub mod opencode_adapter;
 pub mod permission;
+pub mod pilot_bridge;
 pub mod process_bridge;
 pub mod projection;
 pub mod snapshot;
@@ -15,7 +17,12 @@ pub use fixture_loader::{
     load_synthetic, load_trace_events, Provenance, SyntheticCase, SyntheticFile,
 };
 pub use journal::{CommandJournal, JournalCommand};
+pub use opencode_adapter::{
+    AdapterCommandResult, CaptureSource, FileDiff, OpenCodeClient, OpenCodeCommandResponse,
+    OpenCodeEvent, OpenCodeSession, PilotAdapter, PilotCapture, PilotCommand, UreqOpenCodeClient,
+};
 pub use permission::{PermissionDecision, PermissionService, PermissionViewResult};
+pub use pilot_bridge::{parse_pilot_command, result_payload};
 pub use process_bridge::{
     AckPayload, BridgeDispatcher, CommandResult, RelayClient, RelayMessage, UreqRelayClient,
 };

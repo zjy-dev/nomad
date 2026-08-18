@@ -82,45 +82,43 @@ export function ReplyComposer({ draft, onChange, onSubmit, onClear, disabled }: 
 
 function DraftStatusRow({ draft }: { draft: DraftState }) {
   const items: Array<{ label: string; cls: string; highlight?: boolean }> = [];
-  if (draft.requestId) items.push({ label: `request_id: ${draft.requestId}`, cls: 'muted', highlight: true });
-
-  items.push({ label: 'LOCAL-DRAFT', cls: 'muted' });
-  if (draft.status === 'sending') items.push({ label: 'RELAY-SENDING', cls: 'muted' });
+  items.push({ label: 'Saved on this phone', cls: 'draft-stage' });
+  if (draft.status === 'sending') items.push({ label: 'Sending to Relay', cls: 'draft-stage draft-stage--current' });
   if (draft.status === 'sent' && draft.result) {
     // INV-003-2: RELAY-RECEIVED is always shown when the relay has acknowledged.
     // HOST-ACCEPTED is ONLY shown when the explicit commandStatus says so —
     // never inferred from error_code === 'OK'.
     const cs = draft.commandStatus;
     if (cs === null || cs === 'RelayReceived') {
-      items.push({ label: 'RELAY-RECEIVED', cls: 'muted' });
+      items.push({ label: 'Relay received', cls: 'draft-stage draft-stage--current' });
     } else if (cs === 'HostAccepted') {
-      items.push({ label: 'RELAY-RECEIVED', cls: 'muted' });
-      items.push({ label: 'HOST-ACCEPTED', cls: 'muted' });
+      items.push({ label: 'Relay received', cls: 'draft-stage' });
+      items.push({ label: 'Host accepted', cls: 'draft-stage draft-stage--current' });
     } else if (cs === 'Executing') {
-      items.push({ label: 'RELAY-RECEIVED', cls: 'muted' });
-      items.push({ label: 'HOST-ACCEPTED', cls: 'muted' });
-      items.push({ label: 'EXECUTING', cls: 'muted' });
+      items.push({ label: 'Relay received', cls: 'draft-stage' });
+      items.push({ label: 'Host accepted', cls: 'draft-stage' });
+      items.push({ label: 'Agent is continuing', cls: 'draft-stage draft-stage--current' });
     } else if (cs === 'Completed') {
-      items.push({ label: 'RELAY-RECEIVED', cls: 'muted' });
-      items.push({ label: 'HOST-ACCEPTED', cls: 'muted' });
-      items.push({ label: 'EXECUTING', cls: 'muted' });
-      items.push({ label: 'COMPLETED', cls: 'muted' });
+      items.push({ label: 'Relay received', cls: 'draft-stage' });
+      items.push({ label: 'Host accepted', cls: 'draft-stage' });
+      items.push({ label: 'Agent continued', cls: 'draft-stage' });
+      items.push({ label: 'Finished', cls: 'draft-stage draft-stage--current' });
     } else if (cs === 'Rejected') {
-      items.push({ label: 'RELAY-RECEIVED', cls: 'muted' });
-      items.push({ label: `REJECTED:${draft.result.error_code}`, cls: 'muted' });
+      items.push({ label: 'Relay received', cls: 'draft-stage' });
+      items.push({ label: 'Host rejected', cls: 'draft-stage draft-stage--current' });
     } else if (cs === 'Stale') {
-      items.push({ label: 'RELAY-RECEIVED', cls: 'muted' });
-      items.push({ label: 'STALE', cls: 'muted' });
+      items.push({ label: 'Relay received', cls: 'draft-stage' });
+      items.push({ label: 'State changed — review again', cls: 'draft-stage draft-stage--current' });
     } else if (cs === 'OutcomeUnknown') {
-      items.push({ label: 'RELAY-RECEIVED', cls: 'muted' });
-      items.push({ label: 'OUTCOME-UNKNOWN', cls: 'muted' });
+      items.push({ label: 'Relay received', cls: 'draft-stage' });
+      items.push({ label: 'Host result unknown', cls: 'draft-stage draft-stage--current' });
     } else {
-      items.push({ label: 'RELAY-RECEIVED', cls: 'muted' });
-      items.push({ label: `STATUS:${cs}`, cls: 'muted' });
+      items.push({ label: 'Relay received', cls: 'draft-stage' });
+      items.push({ label: 'Waiting for Host result', cls: 'draft-stage draft-stage--current' });
     }
   }
   if (draft.status === 'failed' && draft.error) {
-    items.push({ label: `FAILED:${draft.error}`, cls: 'muted' });
+    items.push({ label: 'Not sent — review the safety notice', cls: 'draft-stage draft-stage--current' });
   }
   return (
     <div className="draft-status" aria-live="polite">

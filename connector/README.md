@@ -88,3 +88,28 @@ These are informational snapshots. If the upstream schema changes, regenerate th
 - No `captured/` directory. All fixtures are synthetic.
 - No secrets or credentials in fixture data.
 - Connector communicates over loopback only (`127.0.0.1:4096`). Non-loopback addresses must be rejected.
+
+## Controlled Pilot HTTP adapter
+
+`pilot-adapter` is the executable fixed-interface path. It connects only to
+`http://127.0.0.1:4096`, requires OpenCode `1.18.16`, and emits one compact JSON
+object on stdout. Start the test substitute from the repository root, then run:
+
+```bash
+python3 testkit/fake-opencode/server.py --scenario happy
+cargo run --manifest-path connector/Cargo.toml --bin pilot-adapter -- \
+  capture --session-id pilot-session
+```
+
+Commands use a persistent SQLite journal for the `request_id` idempotency
+boundary:
+
+```bash
+cargo run --manifest-path connector/Cargo.toml --bin pilot-adapter -- \
+  command --journal /tmp/nomad-pilot.sqlite3 --command-json \
+  '{"command_type":"stop","request_id":"req-stop-1","session_id":"pilot-session","seq":7,"target_turn_id":"turn-1"}'
+```
+
+`capture` can additionally publish a `session.checkpoint` through the existing
+test Relay client when all of `--relay-url`, `--relay-token`, and
+`--relay-channel` are supplied. Tokens have no built-in default.

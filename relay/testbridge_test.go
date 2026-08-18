@@ -33,16 +33,6 @@ func newTestServerWithoutBridge(addr string) (*Server, *httptest.Server) {
 	return srv, ts
 }
 
-func (s *Server) registerTestBridgeRoutes(mux *http.ServeMux) {
-	if s.testBridgeEnabled {
-		mux.HandleFunc("/v1/test/messages", s.testBridgeHandleMessages)
-		mux.HandleFunc("/v1/test/ack", s.testBridgeHandleAck)
-	} else {
-		mux.HandleFunc("/v1/test/messages", s.testBridgeDisabled)
-		mux.HandleFunc("/v1/test/ack", s.testBridgeDisabled)
-	}
-}
-
 func authHeader(token string) map[string]string {
 	return map[string]string{"Authorization": "Bearer " + token}
 }

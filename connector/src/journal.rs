@@ -143,6 +143,27 @@ impl CommandJournal {
         Ok(())
     }
 
+    pub fn update_outcome(
+        &self,
+        request_id: &str,
+        status: &str,
+        accepted_at_seq: Option<u64>,
+        result_json: &str,
+    ) -> Result<(), ConnectorError> {
+        let changed = self.conn.execute(
+            "UPDATE commands
+             SET status = ?1, accepted_at_seq = ?2, result_json = ?3
+             WHERE request_id = ?4",
+            params![status, accepted_at_seq, result_json, request_id],
+        )?;
+        if changed != 1 {
+            return Err(ConnectorError::Journal(format!(
+                "request_id {request_id} is missing during outcome update"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn transaction<F>(&self, f: F) -> Result<(), ConnectorError>
     where
         F: FnOnce(&Connection) -> Result<(), ConnectorError>,
@@ -231,5 +252,22 @@ mod tests {
         j.insert(&c1).unwrap();
         let result = j.insert(&c2);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn update_outcome_replaces_status_and_result() {
+        let j = CommandJournal::open_memory().unwrap();
+        let cmd = sample_cmd();
+        j.insert(&cmd).unwrap();
+        j.update_outcome(
+            "req_001",
+            "OutcomeUnknown",
+            None,
+            r#"{"error_code":"ERR_OUTCOME_UNKNOWN"}"#,
+        )
+        .unwrap();
+        let got = j.get_by_request_id("req_001").unwrap().unwrap();
+        assert_eq!(got.status, "OutcomeUnknown");
+        assert!(got.result_json.contains("ERR_OUTCOME_UNKNOWN"));
     }
 }

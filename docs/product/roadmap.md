@@ -7,6 +7,12 @@
 | 规划方式 | 阶段门，而不是固定发布日期 |
 | 基准团队 | 4 名工程师、1 名产品设计、1 名产品负责人；其中一名工程师担任内部安全 DRI，独立安全顾问按阶段参与 |
 
+## 当前状态（2026-08-18）
+
+Stage-1 synthetic/disposable Local Validation Slice 已通过工程验收，但只覆盖参考实现和真实本地进程闭环。Problem Discovery、固定 OpenCode live adapter、生产安全架构和外部用户产品门仍未通过。
+
+建议下一步按 [Controlled Pilot v0.2 评估与路线图](iteration-2-plan.md) 推进，并在 M0 由产品、技术和安全 DRI 确认：先完成阶段 0 问题门，再把 Stage 1 参考闭环升级为可丢弃真实任务 Pilot。未达到 Pilot 门前不进入 Companion Internal Alpha；Native Runtime 继续保持独立 go/no-go。
+
 ## 1. 路线图原则
 
 - 先验证跨端需求，再承诺完整 Runtime。

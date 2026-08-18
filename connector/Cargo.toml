@@ -11,6 +11,14 @@ path = "src/main.rs"
 name = "process-bridge"
 path = "src/bin/process_bridge.rs"
 
+[[bin]]
+name = "pilot-host-bridge"
+path = "src/bin/pilot_host_bridge.rs"
+
+[[bin]]
+name = "pilot-adapter"
+path = "src/bin/pilot_adapter.rs"
+
 [dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

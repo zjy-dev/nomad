@@ -1,143 +1,81 @@
-import { ViewState, TimelineNode } from '../contracts/reducer';
+import type { ContractEvent } from '../contracts/types';
+import type { TimelineNode, ViewState } from '../contracts/reducer';
 import { StatusChips } from './StatusChips';
 
-interface TimelineProps {
-  state: ViewState;
-  onSelectEvent: (seq: number) => void;
-}
-
-// Virtualized / bounded rendering: render only the N most recent nodes in
-// expanded form and collapse older ones into a "history" summary. This keeps
-// the DOM small even at 100k-event budgets (MB-007).
 const VISIBLE_HEAD = 30;
 
-export function Timeline({ state, onSelectEvent }: TimelineProps) {
-  const { timeline } = state;
-  const visible = timeline.length <= VISIBLE_HEAD ? timeline : timeline.slice(-VISIBLE_HEAD);
-  const skipped = timeline.length - visible.length;
+export function Timeline({ state }: { state: ViewState }) {
+  const visible = state.timeline.length <= VISIBLE_HEAD ? state.timeline : state.timeline.slice(-VISIBLE_HEAD);
+  const skipped = state.timeline.length - visible.length;
 
   return (
     <div className="stack">
       <StatusChips state={state} />
-
-      <div className="section">
-        <div className="section-header">
-          <span className="section-title">Timeline</span>
-          <span className="muted" style={{ fontSize: 11, fontFamily: 'var(--mono)' }}>
-            {timeline.length} nodes · last {visible.length} rendered
-          </span>
+      <section className="section" aria-labelledby="activity-title">
+        <div className="page-heading"><span className="eyebrow">PROGRESS LOG</span><h1 id="activity-title">Activity</h1><p>What the agent did, translated into task progress.</p></div>
+        {skipped > 0 && <div className="history-note">{skipped} older updates are collapsed.</div>}
+        <div className="timeline" role="log" aria-label="Task activity">
+          {visible.map((node) => <ActivityNode key={nodeKey(node)} node={node} />)}
+          {visible.length === 0 && <div className="empty-state"><strong>No activity yet</strong><p>The latest Host progress will appear here.</p></div>}
         </div>
-
-        {skipped > 0 && (
-          <div className="card" style={{ marginBottom: 12 }}>
-            <div className="muted" style={{ fontSize: 12 }}>
-              <strong>{skipped} older node(s) collapsed.</strong> Virtualized display keeps rendering
-              bounded. Use Host logs or full replay for deep history.
-            </div>
-          </div>
-        )}
-
-        <div className="timeline" role="log" aria-label="Session timeline">
-          {visible.map((node) => (
-            <TimelineNodeView key={nodeKey(node)} node={node} onSelectEvent={onSelectEvent} />
-          ))}
-          {visible.length === 0 && (
-            <div className="muted" style={{ fontSize: 13 }}>
-              No events yet. Waiting for Host to emit the first durable event…
-            </div>
-          )}
-        </div>
-      </div>
+      </section>
     </div>
   );
+}
+
+function ActivityNode({ node }: { node: TimelineNode }) {
+  if (node.kind === 'gap') {
+    return <article className="t-node t-node--gap"><span className="event-label">UPDATE MISSING</span><h2>Some progress could not be verified</h2><p>Refresh the session. Commands stay disabled until the complete state is restored.</p></article>;
+  }
+  if (node.kind === 'note') {
+    return <article className="t-node t-node--gap"><span className="event-label">RECOVERY NOTE</span><h2>{node.text}</h2></article>;
+  }
+  const content = describeEvent(node.event);
+  return (
+    <article className={`t-node t-node--${content.tone}`}>
+      <div className="t-node-head"><span className="event-label">{content.label}</span><time>{formatTime(node.event.timestamp)}</time></div>
+      <h2>{content.title}</h2>
+      <p>{content.detail}</p>
+      <details><summary>Technical details</summary><dl><div><dt>Event</dt><dd>{node.event.event_type}</dd></div><div><dt>Sequence</dt><dd>{node.event.seq}</dd></div><div><dt>Recorded</dt><dd>{node.event.timestamp}</dd></div></dl></details>
+    </article>
+  );
+}
+
+export function describeEvent(event: ContractEvent): { label: string; title: string; detail: string; tone: string } {
+  const tool = friendlyTool(event.payload.tool_name);
+  switch (event.event_type) {
+    case 'session.created': return { label: 'STARTED', title: 'Connected to the task', detail: 'The Host began tracking this session.', tone: 'running' };
+    case 'turn.started': return { label: 'WORKING', title: 'The agent started a new step', detail: 'Work is continuing on your Mac.', tone: 'running' };
+    case 'message.accepted': return { label: 'RECEIVED', title: 'Your reply reached the Host', detail: 'The Host accepted the message for this task.', tone: 'completed' };
+    case 'message.completed': return { label: 'CONTINUING', title: 'The agent processed your reply', detail: 'Work can continue from your answer.', tone: 'completed' };
+    case 'tool.started': return { label: 'WORKING', title: `${tool} started`, detail: event.payload.summary ?? 'The agent began a workspace step.', tone: 'running' };
+    case 'tool.completed': return { label: 'DONE', title: `${tool} finished`, detail: event.payload.summary ?? 'The workspace step completed.', tone: 'completed' };
+    case 'tool.failed': return { label: 'FAILED', title: `${tool} did not finish`, detail: event.payload.reason ?? 'The agent reported an error in this step.', tone: 'failed' };
+    case 'permission.requested': return { label: 'NEEDS YOU', title: 'Paused before a protected action', detail: 'Review the Host facts. This Pilot only allows deny or Stop.', tone: 'waiting' };
+    case 'permission.resolved': return { label: 'RESOLVED', title: 'The permission request was closed', detail: 'The agent can update its plan from the decision.', tone: 'completed' };
+    case 'diff.updated': return { label: 'CHANGES', title: 'The workspace change summary was updated', detail: 'Open Changes to view it only when the Host supplies verified file data.', tone: 'completed' };
+    case 'turn.stopping': return { label: 'STOPPING', title: 'The Host is stopping the task', detail: 'Wait for a final Host result before assuming it has stopped.', tone: 'waiting' };
+    case 'turn.completed': return { label: 'FINISHED', title: 'The agent finished the task', detail: event.payload.summary ?? 'The Host reported a completed turn.', tone: 'completed' };
+    case 'turn.cancelled': return { label: 'STOPPED', title: 'The task was stopped', detail: 'Files already written to disk were not undone.', tone: 'failed' };
+    case 'turn.failed': return { label: 'FAILED', title: 'The task ended with an error', detail: event.payload.reason ?? 'Review the last successful activity before continuing.', tone: 'failed' };
+    case 'turn.outcome_unknown': return { label: 'UNKNOWN', title: 'The final outcome could not be verified', detail: 'Do not retry from mobile. Check the Mac before taking another action.', tone: 'failed' };
+    case 'session.compacted': return { label: 'RECOVERED', title: 'Older activity was summarized', detail: 'The current verified snapshot remains available.', tone: 'completed' };
+    case 'session.updated': return { label: 'UPDATED', title: 'Session status refreshed', detail: 'The Host reported a newer state.', tone: 'running' };
+  }
+}
+
+function friendlyTool(value: unknown): string {
+  if (typeof value !== 'string' || !value) return 'Workspace step';
+  const names: Record<string, string> = { grep: 'File search', shell: 'Command', edit: 'File edit', write: 'File write', test: 'Test run' };
+  return names[value.toLowerCase()] ?? value.replaceAll('_', ' ');
 }
 
 function nodeKey(node: TimelineNode): string {
-  switch (node.kind) {
-    case 'event': return `ev:${node.event.event_id}`;
-    case 'gap': return `gap:${node.fromSeq}-${node.toSeq}`;
-    case 'note': return `note:${node.text.slice(0, 40)}`;
-  }
+  if (node.kind === 'event') return node.event.event_id;
+  if (node.kind === 'gap') return `gap-${node.fromSeq}-${node.toSeq}`;
+  return `note-${node.text}`;
 }
 
-function TimelineNodeView({ node, onSelectEvent }: { node: TimelineNode; onSelectEvent: (seq: number) => void }) {
-  if (node.kind === 'gap') {
-    return (
-      <div className="t-node t-node--gap" role="note" aria-label={`Gap detected between seq ${node.fromSeq} and ${node.toSeq}`}>
-        <div className="t-node-head">
-          <span className="seq">gap</span>
-          <span className="type">GAP</span>
-        </div>
-        <div className="t-node-body">
-          Events <span className="code">{node.fromSeq}</span> to <span className="code">{node.toSeq}</span> are missing. Manual recovery required.
-        </div>
-      </div>
-    );
-  }
-  if (node.kind === 'note') {
-    return (
-      <div className="t-node t-node--gap" role="note" aria-label={node.text}>
-        <div className="t-node-head">
-          <span className="seq">·</span>
-          <span className="type">NOTE</span>
-        </div>
-        <div className="t-node-body">{node.text}</div>
-      </div>
-    );
-  }
-
-  const ev = node.event;
-  const cls = classify(ev.event_type);
-  return (
-    <div
-      className={`t-node t-node--${cls}`}
-      role="listitem"
-      aria-label={`Event seq ${ev.seq}: ${ev.event_type}`}
-      tabIndex={0}
-      onClick={() => onSelectEvent(ev.seq)}
-      onKeyDown={(e) => { if (e.key === 'Enter') onSelectEvent(ev.seq); }}
-    >
-      <div className="t-node-head">
-        <span className="seq">#{ev.seq}</span>
-        <span className="type">{ev.event_type}</span>
-      </div>
-      <div className="t-node-body">{summarize(ev)}</div>
-      <div className="t-node-meta">
-        <span>id:{ev.event_id}</span>
-        {ev.turn_id && <span>turn:{ev.turn_id}</span>}
-        {ev.payload?.tool_name && <span>tool:{String(ev.payload.tool_name)}</span>}
-        <span>{ev.timestamp}</span>
-      </div>
-    </div>
-  );
-}
-
-function classify(type: string): string {
-  switch (type) {
-    case 'turn.completed':
-    case 'message.completed':
-    case 'tool.completed':
-      return 'completed';
-    case 'turn.failed':
-    case 'tool.failed':
-      return 'failed';
-    case 'turn.stopping':
-    case 'turn.cancelled':
-    case 'turn.outcome_unknown':
-      return 'failed';
-    case 'permission.requested':
-      return 'waiting';
-    case 'tool.started':
-    case 'turn.started':
-      return 'running';
-    default:
-      return 'running';
-  }
-}
-
-function summarize(ev: { event_type: string; payload: Record<string, unknown> }): string {
-  const p = ev.payload ?? {};
-  const reason = p.state_change ?? p.summary ?? p.reason;
-  if (typeof reason === 'string' && reason.length > 0) return reason;
-  return ev.event_type;
+function formatTime(iso: string): string {
+  return new Date(iso).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
 }

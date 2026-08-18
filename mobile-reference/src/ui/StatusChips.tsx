@@ -1,62 +1,27 @@
-import { ViewState, canSubmitSafeOperations } from '../contracts/reducer';
+import type { ViewState } from '../contracts/reducer';
+import { canSubmitSafeOperations } from '../contracts/reducer';
 
 export function StatusChips({ state }: { state: ViewState }) {
+  const online = state.session.host_connectivity === 'Online';
+  const freshness = state.session.client_freshness;
   return (
-    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-      <HostChip value={state.session.host_connectivity} />
-      <FreshnessChip value={state.session.client_freshness} />
-      {state.digestStatus === 'mismatch' && (
-        <span className="chip" style={{ color: 'var(--danger)', borderColor: 'rgba(255,107,107,0.4)' }} aria-label="Snapshot digest mismatch">
-          <span className="dot" aria-hidden="true" /> DIGEST-MISMATCH
-        </span>
-      )}
-      {state.versionStatus === 'incompatible' && (
-        <span className="chip" style={{ color: 'var(--danger)', borderColor: 'rgba(255,107,107,0.4)' }} aria-label="Protocol version incompatible">
-          <span className="dot" aria-hidden="true" /> VERSION-INCOMPATIBLE
-        </span>
-      )}
-      {state.gapToSeq !== null && (
-        <span className="chip" style={{ color: 'var(--warn)', borderColor: 'rgba(255,176,32,0.4)' }} aria-label="Event gap detected">
-          <span className="dot" aria-hidden="true" /> GAP-DETECTED
-        </span>
-      )}
-      <span className="chip" aria-label={`Turn state: ${state.session.turn_state}`}>
-        <span className="dot" aria-hidden="true" /> STATE:{state.session.turn_state}
-      </span>
+    <div className="status-strip" aria-label="Connection safety status">
+      <span className={`status-cell status-cell--${online ? 'ok' : 'danger'}`} role="status"><b>{online ? '✓' : '×'}</b><span><strong>{online ? 'Online' : 'Offline'}</strong><small>{online ? 'Host reachable' : 'Host unreachable'}</small></span></span>
+      <span className={`status-cell status-cell--${freshness === 'Live' ? 'ok' : freshness === 'Reconnecting' ? 'warn' : 'danger'}`} role="status"><b>{freshness === 'Live' ? '✓' : freshness === 'Reconnecting' ? '↻' : '!'}</b><span><strong>{freshness}</strong><small>{freshness === 'Live' ? 'State verified' : freshness === 'Reconnecting' ? 'Checking state' : 'State not verified'}</small></span></span>
     </div>
-  );
-}
-
-function HostChip({ value }: { value: string }) {
-  const cls = value === 'Online' ? 'chip chip--online' : 'chip chip--offline';
-  return (
-    <span className={cls} role="status" aria-label={`Host is ${value}`}>
-      <span className="dot" aria-hidden="true" /> HOST:{value.toUpperCase()}
-    </span>
-  );
-}
-
-function FreshnessChip({ value }: { value: string }) {
-  const map: Record<string, { cls: string; label: string }> = {
-    Live: { cls: 'chip chip--live', label: 'LIVE' },
-    Reconnecting: { cls: 'chip chip--reconnect', label: 'RECONNECTING' },
-    Stale: { cls: 'chip chip--stale', label: 'STALE' },
-  };
-  const m = map[value] ?? map.Stale;
-  return (
-    <span className={m.cls} role="status" aria-label={`Client is ${value}`}>
-      <span className="dot" aria-hidden="true" /> CLIENT:{m.label}
-    </span>
   );
 }
 
 export function SafetyGateBanner({ state }: { state: ViewState }) {
   const gate = canSubmitSafeOperations(state);
   if (gate.ok) return null;
-  return (
-    <div className="perm-block" role="alert" aria-live="polite">
-      <strong style={{ fontWeight: 600 }}>Safe operations blocked</strong>
-      <div>{gate.reason}</div>
-    </div>
-  );
+  return <div className="perm-block" role="alert"><strong>Actions are paused</strong><div>{friendlyGateReason(state)}</div></div>;
+}
+
+export function friendlyGateReason(state: ViewState): string {
+  if (state.session.host_connectivity === 'Offline') return 'Your Mac cannot be reached. Reconnect it before sending a reply, denial, or Stop.';
+  if (state.session.client_freshness === 'Reconnecting') return 'The latest state is still being checked. Actions unlock after it is verified Live.';
+  if (state.session.client_freshness === 'Stale') return 'This page may be behind the Host. Refresh and wait for Live before taking action.';
+  if (state.versionStatus !== 'ok') return 'The Host version is not compatible with this Pilot client.';
+  return 'The latest Host snapshot could not be verified. Refresh before taking action.';
 }

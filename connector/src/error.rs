@@ -3,11 +3,17 @@ pub enum ConnectorError {
     #[error("URL {0} is not loopback-only; only 127.0.0.1 or localhost is allowed")]
     NonLoopbackUrl(String),
 
-    #[error("OpenCode version mismatch: expected {expected}, got {actual}")]
+    #[error("OpenCode version mismatch: expected {expected}, got {actual}; repair with `npm install -g opencode-ai@{expected}`")]
     VersionMismatch { expected: String, actual: String },
 
     #[error("OpenCode unreachable at {0}")]
     OpenCodeUnreachable(String),
+
+    #[error("OpenCode protocol mismatch: {0}")]
+    ProtocolMismatch(String),
+
+    #[error("OpenCode HTTP {status}: {message}")]
+    OpenCodeHttpStatus { status: u16, message: String },
 
     #[error("Fixture load error: {0}")]
     FixtureLoad(String),
@@ -74,6 +80,8 @@ impl ConnectorError {
             ConnectorError::SafetyBlocked(_) => "ERR_SAFETY_BLOCKED",
             ConnectorError::HostOffline => "ERR_HOST_OFFLINE",
             ConnectorError::VersionMismatch { .. } => "ERR_INCOMPATIBLE_VERSION",
+            ConnectorError::ProtocolMismatch(_) => "ERR_INCOMPATIBLE_VERSION",
+            ConnectorError::OpenCodeUnreachable(_) => "ERR_HOST_OFFLINE",
             ConnectorError::OutcomeUnknown => "ERR_OUTCOME_UNKNOWN",
             _ => "ERR_INTERNAL",
         }

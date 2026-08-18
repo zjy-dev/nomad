@@ -1,0 +1,5 @@
+[
+  "parallel vertical slice: host, mobile, relay, quality-security",
+  "root integration: fake OpenCode to Host to restarted Relay acceptance harness",
+  "PM P0 rework: stock OpenCode certification, Host command bridge, same-origin TLS Gateway"
+]

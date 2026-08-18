@@ -33,6 +33,7 @@
 | D-014 | Companion 与 Runtime Alpha 是两个独立阶段门 | Accepted | 产品 DRI | Roadmap 4.4、5、6 | Dual Spike 结束 |
 | D-015 | Validation Companion 首发只支持 Apple Silicon macOS + iOS | Accepted | 产品 DRI | 4 人团队容量评审 | Discovery 结束，可因目标用户设备分布重审 |
 | D-016 | 外部工具只保证 Host 接纳去重，不承诺副作用 exactly-once | Accepted | 技术 DRI | PRD 6-9；故障窗口分析 | Session Semantics v0 评审时 |
+| D-017 | Stage 1 后先做 Controlled Pilot，不直接进入 Internal Alpha | Proposed | 产品 DRI | Stage-1 acceptance；Iteration 2 plan | M0 评审确认 |
 
 这里的 Owner 是角色 DRI。Discovery 启动前必须在本表顶部补充具体姓名；未登记产品、技术和安全 DRI 时，路线图不进入执行状态。
 
@@ -235,6 +236,18 @@
 原因：Git push、HTTP 请求、包安装和任意程序不能参与 Runtime 的本地事务。网络层至少一次传递不可能给这些外部系统提供通用 exactly-once 保证。
 
 重审条件：某个结构化工具提供专用幂等键和 reconciliation 时，可以单独增强该工具的保证，不能扩写成全局承诺。
+
+## D-017：Stage 1 后先做 Controlled Pilot
+
+状态：`Proposed`
+
+建议决定：Stage-1 synthetic/disposable 工程闭环通过后，下一迭代先完成 Problem Discovery 与 Controlled Product Pilot，不直接进入 Companion Internal Alpha。Pilot 只使用项目提供的可丢弃仓库和临时账户，只开放查看、reply、deny 和 Stop，保持 `allow_once=false`。
+
+原因：Stage 1 证明了协议和真实进程可工作，但尚无问题频率、无主持安装、真实 OpenCode Session 或外部用户价值证据。直接进入 Internal Alpha 会同时扩大产品、安全、原生移动和真实仓库四类风险。
+
+转为 Accepted 的条件：M0 评审登记产品、技术和安全 DRI，并共同确认范围、数据边界和资源。
+
+重审条件：Problem Discovery 和 Controlled Pilot 结束。若产品门通过，进入安全架构收口和 Internal Alpha；若只需要通知、结构化 UI 不成立或问题频率不足，则收缩、转向或停止。
 
 ## 待进入决策记录的问题
 

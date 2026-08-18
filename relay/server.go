@@ -4,10 +4,13 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/sha1"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -97,12 +100,10 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/v1/ws", s.handleWebSocket)
 
 	if s.testBridgeEnabled {
-		mux.HandleFunc("/v1/test/messages", s.testBridgeHandleMessages)
-		mux.HandleFunc("/v1/test/ack", s.testBridgeHandleAck)
+		s.registerTestBridgeRoutes(mux)
 		log.Printf("[relay] TEST-ONLY bridge enabled on loopback")
 	} else {
-		mux.HandleFunc("/v1/test/messages", s.testBridgeDisabled)
-		mux.HandleFunc("/v1/test/ack", s.testBridgeDisabled)
+		s.registerTestBridgeRoutes(mux)
 	}
 
 	s.httpSrv = &http.Server{
@@ -392,6 +393,24 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 // --- TEST-ONLY Bridge Handlers ---
 
+func (s *Server) registerTestBridgeRoutes(mux *http.ServeMux) {
+	if s.testBridgeEnabled {
+		mux.HandleFunc("/v1/test/messages", s.testBridgeHandleMessages)
+		mux.HandleFunc("/v1/test/ack", s.testBridgeHandleAck)
+		mux.HandleFunc("/v1/test/pairing/challenges", s.testPilotPairingCreate)
+		mux.HandleFunc("/v1/test/pairing/confirm", s.testPilotPairingConfirm)
+		mux.HandleFunc("/v1/test/pairing/consume", s.testPilotPairingConsume)
+		mux.HandleFunc("/v1/test/cleanup", s.testPilotCleanupChannel)
+		return
+	}
+	mux.HandleFunc("/v1/test/messages", s.testBridgeDisabled)
+	mux.HandleFunc("/v1/test/ack", s.testBridgeDisabled)
+	mux.HandleFunc("/v1/test/pairing/challenges", s.testBridgeDisabled)
+	mux.HandleFunc("/v1/test/pairing/confirm", s.testBridgeDisabled)
+	mux.HandleFunc("/v1/test/pairing/consume", s.testBridgeDisabled)
+	mux.HandleFunc("/v1/test/cleanup", s.testBridgeDisabled)
+}
+
 // testBridgeDisabled returns 404 when the test bridge is not enabled.
 func (s *Server) testBridgeDisabled(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "test bridge is disabled", http.StatusNotFound)
@@ -407,7 +426,40 @@ func (s *Server) testBridgeAuthenticate(r *http.Request) bool {
 	if !strings.HasPrefix(auth, prefix) {
 		return false
 	}
-	return strings.TrimPrefix(auth, prefix) == s.testBridgeToken
+	provided := strings.TrimPrefix(auth, prefix)
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(s.testBridgeToken)) == 1
+}
+
+func (s *Server) testPilotStore(w http.ResponseWriter) (testPilotBridgeStorage, bool) {
+	store, ok := s.testBridge.(testPilotBridgeStorage)
+	if !ok {
+		http.Error(w, "pilot bridge storage is unavailable", http.StatusNotImplemented)
+	}
+	return store, ok
+}
+
+func decodeTestBridgeJSON(w http.ResponseWriter, r *http.Request, dst interface{}) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, TestOnlyMaxJSONBody)
+	defer r.Body.Close()
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(dst); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		} else {
+			http.Error(w, "invalid JSON request", http.StatusBadRequest)
+		}
+		return false
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		http.Error(w, "request must contain one JSON object", http.StatusBadRequest)
+		return false
+	}
+	return true
+}
+
+func validTestBridgeID(value string, maxLength int) bool {
+	return value != "" && value == strings.TrimSpace(value) && len(value) <= maxLength
 }
 
 // testBridgeHandleMessages handles POST /v1/test/messages and GET /v1/test/messages.
@@ -432,7 +484,7 @@ func (s *Server) testBridgeListMessages(w http.ResponseWriter, r *http.Request) 
 
 	channel := r.URL.Query().Get("channel")
 	target := r.URL.Query().Get("target")
-	if channel == "" {
+	if !validTestBridgeID(channel, testOnlyMaxChannelLength) {
 		http.Error(w, "channel query required", http.StatusBadRequest)
 		return
 	}
@@ -482,13 +534,11 @@ func (s *Server) testBridgeCreateMessage(w http.ResponseWriter, r *http.Request)
 		MessageID string                 `json:"message_id"`
 		Payload   map[string]interface{} `json:"payload"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !decodeTestBridgeJSON(w, r, &req) {
 		return
 	}
-	defer r.Body.Close()
 
-	if req.Channel == "" {
+	if !validTestBridgeID(req.Channel, testOnlyMaxChannelLength) {
 		http.Error(w, "channel is required", http.StatusBadRequest)
 		return
 	}
@@ -496,7 +546,7 @@ func (s *Server) testBridgeCreateMessage(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "target must be 'host' or 'mobile'", http.StatusBadRequest)
 		return
 	}
-	if req.MessageID == "" {
+	if !validTestBridgeID(req.MessageID, testOnlyMaxMessageIDLength) {
 		http.Error(w, "message_id is required", http.StatusBadRequest)
 		return
 	}
@@ -540,19 +590,23 @@ func (s *Server) testBridgeHandleAck(w http.ResponseWriter, r *http.Request) {
 		Target     string   `json:"target"`
 		MessageIDs []string `json:"message_ids"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !decodeTestBridgeJSON(w, r, &req) {
 		return
 	}
-	defer r.Body.Close()
 
-	if req.Channel == "" {
+	if !validTestBridgeID(req.Channel, testOnlyMaxChannelLength) {
 		http.Error(w, "channel is required", http.StatusBadRequest)
 		return
 	}
 	if req.Target != "host" && req.Target != "mobile" {
 		http.Error(w, "target must be 'host' or 'mobile'", http.StatusBadRequest)
 		return
+	}
+	for _, messageID := range req.MessageIDs {
+		if !validTestBridgeID(messageID, testOnlyMaxMessageIDLength) {
+			http.Error(w, "message_ids contains an invalid value", http.StatusBadRequest)
+			return
+		}
 	}
 
 	if err := s.testBridge.Ack(req.Channel, req.Target, req.MessageIDs); err != nil {
@@ -567,6 +621,207 @@ func (s *Server) testBridgeHandleAck(w http.ResponseWriter, r *http.Request) {
 		"acked":       len(req.MessageIDs),
 		"message_ids": req.MessageIDs,
 	})
+}
+
+// testPilotPairingCreate creates a TEST-ONLY two-minute comparison challenge.
+func (s *Server) testPilotPairingCreate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.testBridgeAuthenticate(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	store, ok := s.testPilotStore(w)
+	if !ok {
+		return
+	}
+	var req struct {
+		Channel string `json:"channel"`
+	}
+	if !decodeTestBridgeJSON(w, r, &req) {
+		return
+	}
+	if !validTestBridgeID(req.Channel, testOnlyMaxChannelLength) {
+		http.Error(w, "invalid channel", http.StatusBadRequest)
+		return
+	}
+
+	challenge, err := store.CreatePairingChallenge(req.Channel, TestOnlyPairingTTL)
+	if err != nil {
+		http.Error(w, "could not create pairing challenge", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"challenge_id":    challenge.ChallengeID,
+		"comparison_code": challenge.Code,
+		"expires_at":      challenge.ExpiresAt,
+		"test_only":       true,
+	})
+}
+
+// testPilotPairingConfirm records one host/mobile comparison-code confirmation.
+func (s *Server) testPilotPairingConfirm(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.testBridgeAuthenticate(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	store, ok := s.testPilotStore(w)
+	if !ok {
+		return
+	}
+	var req struct {
+		Channel        string `json:"channel"`
+		ChallengeID    string `json:"challenge_id"`
+		Side           string `json:"side"`
+		ComparisonCode string `json:"comparison_code"`
+	}
+	if !decodeTestBridgeJSON(w, r, &req) {
+		return
+	}
+	if !validPairingRequest(req.Channel, req.ChallengeID, req.Side, req.ComparisonCode) {
+		http.Error(w, "invalid pairing confirmation", http.StatusBadRequest)
+		return
+	}
+	state, err := store.ConfirmPairingChallenge(req.Channel, req.ChallengeID, req.Side, req.ComparisonCode)
+	if err != nil {
+		writeTestPairingError(w, err)
+		return
+	}
+	writeTestPairingState(w, state)
+}
+
+// testPilotPairingConsume consumes a fully confirmed challenge exactly once.
+func (s *Server) testPilotPairingConsume(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.testBridgeAuthenticate(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	store, ok := s.testPilotStore(w)
+	if !ok {
+		return
+	}
+	var req struct {
+		Channel     string `json:"channel"`
+		ChallengeID string `json:"challenge_id"`
+	}
+	if !decodeTestBridgeJSON(w, r, &req) {
+		return
+	}
+	if !validTestBridgeID(req.Channel, testOnlyMaxChannelLength) || !validTestBridgeID(req.ChallengeID, 64) {
+		http.Error(w, "invalid pairing consume request", http.StatusBadRequest)
+		return
+	}
+	state, err := store.ConsumePairingChallenge(req.Channel, req.ChallengeID)
+	if err != nil {
+		writeTestPairingError(w, err)
+		return
+	}
+	writeTestPairingState(w, state)
+}
+
+// testPilotCleanupChannel removes all bridge messages and pairing state for a
+// Pilot channel. Only aggregate deletion counts are returned.
+func (s *Server) testPilotCleanupChannel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.testBridgeAuthenticate(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	store, ok := s.testPilotStore(w)
+	if !ok {
+		return
+	}
+	var req struct {
+		Channel string `json:"channel"`
+	}
+	if !decodeTestBridgeJSON(w, r, &req) {
+		return
+	}
+	if !validTestBridgeID(req.Channel, testOnlyMaxChannelLength) {
+		http.Error(w, "invalid channel", http.StatusBadRequest)
+		return
+	}
+	result, err := store.CleanupChannel(req.Channel)
+	if err != nil {
+		http.Error(w, "could not clean up channel", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"deleted_unacked_messages":   result.UnackedMessages,
+		"deleted_acked_messages":     result.AckedMessages,
+		"deleted_pairing_challenges": result.PairingChallenges,
+	})
+}
+
+func validPairingRequest(channel, challengeID, side, code string) bool {
+	if !validTestBridgeID(channel, testOnlyMaxChannelLength) || !validTestBridgeID(challengeID, 64) {
+		return false
+	}
+	if side != "host" && side != "mobile" {
+		return false
+	}
+	if len(code) != testOnlyPairingCodeDigits {
+		return false
+	}
+	for _, digit := range code {
+		if digit < '0' || digit > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func writeTestPairingState(w http.ResponseWriter, state testPairingChallengeState) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"challenge_id":     state.ChallengeID,
+		"channel":          state.Channel,
+		"expires_at":       state.ExpiresAt,
+		"host_confirmed":   state.HostConfirmed,
+		"mobile_confirmed": state.MobileConfirmed,
+		"consumed":         state.Consumed,
+		"test_only":        true,
+	})
+}
+
+func writeTestPairingError(w http.ResponseWriter, err error) {
+	status := http.StatusInternalServerError
+	code := "PAIRING_INTERNAL"
+	switch {
+	case errors.Is(err, ErrTestPairingNotFound):
+		status, code = http.StatusNotFound, "PAIRING_NOT_FOUND"
+	case errors.Is(err, ErrTestPairingExpired):
+		status, code = http.StatusGone, "PAIRING_EXPIRED"
+	case errors.Is(err, ErrTestPairingConsumed):
+		status, code = http.StatusConflict, "PAIRING_CONSUMED"
+	case errors.Is(err, ErrTestPairingCodeMismatch):
+		status, code = http.StatusForbidden, "PAIRING_CODE_MISMATCH"
+	case errors.Is(err, ErrTestPairingAlreadyConfirmed):
+		status, code = http.StatusConflict, "PAIRING_CONFIRMATION_REPLAY"
+	case errors.Is(err, ErrTestPairingConfirmationRequired):
+		status, code = http.StatusConflict, "PAIRING_CONFIRMATION_REQUIRED"
+	case errors.Is(err, ErrTestPairingInvalidSide):
+		status, code = http.StatusBadRequest, "PAIRING_INVALID_SIDE"
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]string{"error_code": code})
 }
 
 // --- WebSocket Hub ---

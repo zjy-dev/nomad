@@ -1,118 +1,112 @@
-import { ViewState } from '../contracts/reducer';
+import type { SessionView } from '../client/types';
+import { canSubmitSafeOperations } from '../contracts/reducer';
 import { StatusChips, SafetyGateBanner } from './StatusChips';
 
 interface HomeProps {
-  state: ViewState;
-  onReply: () => void;
+  view: SessionView;
   onStop: () => void;
-  onInterruptAndSend: () => void;
-  onOpenTimeline: () => void;
+  onOpenActivity: () => void;
+  onOpenAction: () => void;
   onReload: () => void;
 }
 
-export function Home({ state, onReply, onStop, onInterruptAndSend, onOpenTimeline, onReload }: HomeProps) {
-  const needsInput = state.session.turn_state === 'NeedsInput';
-  const needsPermission = state.session.turn_state === 'NeedsPermission';
-  const isRunning = state.session.turn_state === 'Running';
-  const canStop = state.session.turn_state === 'Running' || state.session.turn_state === 'NeedsInput' || state.session.turn_state === 'NeedsPermission';
+export function Home({ view, onStop, onOpenActivity, onOpenAction, onReload }: HomeProps) {
+  const { state, display } = view;
+  const turn = state.session.turn_state;
+  const gate = canSubmitSafeOperations(state);
+  const needsInput = turn === 'NeedsInput';
+  const needsPermission = turn === 'NeedsPermission';
+  const needsYou = needsInput || needsPermission;
+  const canStop = gate.ok && state.session.turn_id !== null && ['Running', 'NeedsInput', 'NeedsPermission'].includes(turn);
+  const heading = !gate.ok
+    ? 'Check this task'
+    : needsInput
+      ? 'The agent needs your answer'
+      : needsPermission
+        ? 'The agent is waiting before a change'
+        : turn === 'Running'
+          ? 'No action needed'
+          : turn === 'Completed'
+            ? 'Task finished'
+            : turn === 'Cancelled'
+              ? 'Task stopped'
+              : 'Check this task';
 
   return (
     <div className="stack">
       <StatusChips state={state} />
       <SafetyGateBanner state={state} />
 
-      {(needsInput || needsPermission) && (
-        <div className={`callout ${needsInput ? 'callout--input' : 'callout--permission'}`} aria-live="polite">
-          <div className="callout-title">
-            {needsInput ? 'NEEDS INPUT — waiting on you' : 'NEEDS PERMISSION — waiting on you'}
-          </div>
-          <div className="callout-body">
-            {state.activePermissionId && (
-              <div className="muted" style={{ fontSize: 12, fontFamily: 'var(--mono)' }}>
-                permission_id: {state.activePermissionId}
-              </div>
-            )}
-            {needsInput && (
-              <div className="btn-row" style={{ marginTop: 10 }}>
-                <button className="btn btn--primary" onClick={onReply}>Reply</button>
-                <button className="btn btn--ghost" onClick={onStop}>Stop</button>
-                <button className="btn btn--ghost" onClick={onInterruptAndSend}>Interrupt & send</button>
-              </div>
-            )}
-            {needsPermission && (
-              <div className="btn-row" style={{ marginTop: 10 }}>
-                <button className="btn btn--ghost" onClick={onOpenTimeline}>Review facts</button>
-              </div>
-            )}
-          </div>
+      <section className={`command-hero ${needsYou ? 'command-hero--attention' : ''}`} aria-labelledby="task-status-title">
+        <span className="eyebrow">{needsYou ? 'NEEDS YOU' : 'CURRENT TASK'}</span>
+        <h1 id="task-status-title">{heading}</h1>
+        <p>
+          {needsInput && 'A reply is required before work can continue.'}
+          {needsPermission && 'Review what the Host knows. This Pilot can only deny the request or stop the task.'}
+          {turn === 'Running' && 'The agent is continuing on your Mac. You can leave it running or stop it.'}
+          {turn === 'Completed' && 'The Host reported a completed turn. Review activity or verified changes when available.'}
+          {turn === 'Cancelled' && 'The Host accepted the stop request. Work already written to disk was not undone.'}
+          {!['NeedsInput', 'NeedsPermission', 'Running', 'Completed', 'Cancelled'].includes(turn) && 'Review the latest activity before deciding what to do.'}
+        </p>
+        <div className="hero-actions">
+          {needsPermission && <button className="btn btn--primary" onClick={onOpenAction}>Review request</button>}
+          {needsInput && <a className="btn btn--primary" href="#reply-title">Write a reply</a>}
+          {!needsYou && <button className="btn btn--primary" onClick={onOpenActivity}>View activity</button>}
+          {state.session.turn_id && <button className="btn btn--danger-secondary" disabled={!canStop} onClick={onStop}>Stop task</button>}
         </div>
-      )}
+      </section>
 
-      {isRunning && (
-        <div className="callout callout--input" aria-live="polite">
-          <div className="callout-title">RUNNING</div>
-          <div className="callout-body muted" style={{ fontSize: 12 }}>
-            Turn <span className="code">{state.session.turn_id ?? '—'}</span> is in progress.
-          </div>
-          <div className="btn-row" style={{ marginTop: 10 }}>
-            <button className="btn btn--primary" onClick={onOpenTimeline}>View timeline</button>
-            <button className="btn btn--danger" disabled={!canStop} onClick={onStop}>Stop</button>
-          </div>
-        </div>
-      )}
+      <section className="section" aria-labelledby="last-activity-title">
+        <div className="section-header"><h2 className="section-title" id="last-activity-title">Last activity</h2><time>{formatRelative(state.session.updated_at)}</time></div>
+        <button className="activity-summary" onClick={onOpenActivity}>
+          <span className="activity-glyph" aria-hidden="true">↳</span>
+          <span><strong>{display.lastActivityLabel ?? lastEventLabel(state)}</strong><small>Open the user-facing progress log</small></span>
+          <span aria-hidden="true">›</span>
+        </button>
+      </section>
 
-      <div className="section">
-        <div className="section-header">
-          <span className="section-title">Session</span>
-          <div className="section-actions">
-            <button className="btn btn--ghost" onClick={onReload} aria-label="Reload session">Reload</button>
-          </div>
+      <section className="section" aria-labelledby="controls-title">
+        <div className="section-header"><h2 className="section-title" id="controls-title">Now available</h2></div>
+        <div className="control-grid">
+          <button onClick={onOpenActivity}><span>Activity</span><small>See what happened</small></button>
+          <button onClick={onOpenAction} disabled={!needsPermission}><span>Action</span><small>{needsPermission ? 'Deny or stop safely' : 'Nothing waiting'}</small></button>
+          <button onClick={onReload}><span>Refresh</span><small>Verify the latest state</small></button>
         </div>
-        <div className="card">
-          <div className="card-row">
-            <span className="card-title">Session ID</span>
-            <span className="card-sub break-all">{state.session.session_id}</span>
-          </div>
-          <div className="card-row">
-            <span className="card-title">Turn</span>
-            <span className="card-sub">{state.session.turn_id ?? '—'}</span>
-          </div>
-          <div className="card-row">
-            <span className="card-title">Last applied seq</span>
-            <span className="card-sub">{state.lastAppliedSeq}</span>
-          </div>
-          <div className="card-row">
-            <span className="card-title">Diff files</span>
-            <span className="card-sub">{state.diffFileCount}</span>
-          </div>
-          <div className="card-row">
-            <span className="card-title">Snapshot digest</span>
-            <span className="card-sub">
-              {state.digestStatus === 'verified' && <span style={{ color: 'var(--ok)' }}>VERIFIED</span>}
-              {state.digestStatus === 'pending' && <span style={{ color: 'var(--warn)' }}>PENDING</span>}
-              {state.digestStatus === 'mismatch' && <span style={{ color: 'var(--danger)' }}>MISMATCH</span>}
-              {state.digestStatus === 'none' && <span style={{ color: 'var(--text-muted)' }}>—</span>}
-            </span>
-          </div>
-        </div>
-      </div>
+      </section>
 
-      <div className="section">
-        <div className="section-header">
-          <span className="section-title">Tools</span>
-        </div>
-        <div className="card">
-          {state.tools.length === 0 && <div className="muted" style={{ fontSize: 13 }}>No tool activity yet.</div>}
-          {state.tools.map((t) => (
-            <div className="tool-row" key={t.tool_name}>
-              <span>{t.tool_name}</span>
-              <span className={`status-pill status-pill--${t.status.toLowerCase()}`}>
-                {t.status}
-              </span>
-            </div>
-          ))}
-        </div>
-      </div>
+      <details className="technical-details">
+        <summary>Technical details</summary>
+        <dl>
+          <div><dt>Session</dt><dd>{state.session.session_id}</dd></div>
+          <div><dt>Workspace</dt><dd>{display.workspaceLabel}</dd></div>
+          <div><dt>Snapshot</dt><dd>{state.digestStatus === 'verified' ? 'Verified' : state.digestStatus}</dd></div>
+          <div><dt>Contract</dt><dd>{state.session.semantics_version}</dd></div>
+        </dl>
+      </details>
     </div>
   );
+}
+
+function lastEventLabel(state: SessionView['state']): string {
+  const event = state.events[state.events.length - 1];
+  if (!event) return 'Waiting for the Host';
+  const tool = event.payload.tool_name;
+  switch (event.event_type) {
+    case 'permission.requested': return 'Paused before a protected action';
+    case 'tool.started': return `Started ${tool ?? 'a workspace step'}`;
+    case 'tool.completed': return `Finished ${tool ?? 'a workspace step'}`;
+    case 'tool.failed': return `${tool ?? 'A workspace step'} failed`;
+    case 'turn.completed': return 'Finished the task';
+    case 'turn.cancelled': return 'Stopped the task';
+    default: return 'Session status updated';
+  }
+}
+
+function formatRelative(iso: string): string {
+  const delta = Date.now() - new Date(iso).getTime();
+  if (!Number.isFinite(delta) || delta < 0) return 'just now';
+  const minutes = Math.floor(delta / 60_000);
+  if (minutes < 1) return 'just now';
+  if (minutes < 60) return `${minutes}m ago`;
+  return `${Math.floor(minutes / 60)}h ago`;
 }

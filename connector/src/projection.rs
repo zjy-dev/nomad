@@ -155,12 +155,15 @@ fn apply_event(state: &mut SessionState, ev: &ProjectedEvent) {
     state.updated_at = ev.timestamp.clone();
 
     match ev.event_type.as_str() {
-        "session.created" | "session.updated" => {
-            // session exists, no turn
+        "session.created" => {
+            // A new session exists before its first turn.
             state.turn_id = None;
             if matches!(state.turn_state, TurnState::None) {
                 // keep None
             }
+        }
+        "session.updated" => {
+            // Connectivity/metadata updates do not end or replace the active turn.
         }
         "turn.started" => {
             state.turn_id = ev.turn_id.clone();
@@ -182,7 +185,16 @@ fn apply_event(state: &mut SessionState, ev: &ProjectedEvent) {
             state.turn_state = TurnState::OutcomeUnknown;
         }
         "message.accepted" | "message.completed" => {
-            state.turn_state = TurnState::Running;
+            let is_question = ev
+                .payload
+                .as_ref()
+                .and_then(|payload| payload["action"].as_str())
+                == Some("question");
+            state.turn_state = if is_question {
+                TurnState::NeedsInput
+            } else {
+                TurnState::Running
+            };
         }
         "tool.started" | "tool.completed" | "tool.failed" => {
             // tool events don't change turn_state directly
