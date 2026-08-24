@@ -1,0 +1,61 @@
+{
+  "schema": "nomad.stock-opencode.disposable-task.v1",
+  "data_boundary": {
+    "workspace": "harness_created_temporary_directory",
+    "repository_source": "project_owned_generated_fixture",
+    "personal_source_allowed": false,
+    "ambient_opencode_auth_allowed": false,
+    "provider_credential": "explicit_temporary_environment_variable_only",
+    "cleanup_required": true
+  },
+  "fixture_files": [
+    {
+      "relative_name": "README.md",
+      "content_class": "project_owned_static_fixture"
+    },
+    {
+      "relative_name": "src/arithmetic.js",
+      "content_class": "project_owned_static_fixture"
+    },
+    {
+      "relative_name": "test/arithmetic.test.js",
+      "content_class": "project_owned_static_fixture"
+    }
+  ],
+  "task_flow": [
+    {
+      "step": "question",
+      "required_observation": "question.asked",
+      "operator_action": "answer_with_project_owned_choice"
+    },
+    {
+      "step": "diff",
+      "required_observation": "authoritative_workspace_diff",
+      "expected_file_count_min": 1
+    },
+    {
+      "step": "permission",
+      "required_observation": "permission.asked",
+      "operator_action": "reject"
+    },
+    {
+      "step": "stop",
+      "required_observation": "session_abort_or_interrupt_terminal_fact"
+    },
+    {
+      "step": "reconnect",
+      "required_observation": "snapshot_reconciliation_after_host_restart"
+    }
+  ],
+  "forbidden_persisted_content": [
+    "provider_credential",
+    "prompt",
+    "source_text",
+    "filesystem_path",
+    "command_body",
+    "diff_content",
+    "raw_session_id",
+    "raw_question_id",
+    "raw_permission_id"
+  ]
+}

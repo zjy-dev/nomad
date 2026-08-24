@@ -1,0 +1,977 @@
+{
+  "actions": {
+    "permission_reply": {
+      "digest": "b20592d595461d06bb40d0ca97f786cefd24b524b879e0c9a7e32cd537f08275",
+      "method": "post",
+      "operation_id": "v2.session.permission.reply",
+      "request": {
+        "application/json": {
+          "properties": {
+            "message": {
+              "properties": {},
+              "property_names": [],
+              "required": [],
+              "type": "string"
+            },
+            "reply": {
+              "enum": [
+                "once",
+                "always",
+                "reject"
+              ],
+              "properties": {},
+              "property_names": [],
+              "required": [],
+              "type": "string"
+            }
+          },
+          "property_names": [
+            "message",
+            "reply"
+          ],
+          "required": [
+            "reply"
+          ],
+          "type": "object"
+        }
+      },
+      "responses": {
+        "204": {},
+        "400": {
+          "application/json": {
+            "properties": {
+              "_tag": {
+                "enum": [
+                  "InvalidRequestError"
+                ],
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              },
+              "field": {
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              },
+              "kind": {
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              },
+              "message": {
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              }
+            },
+            "property_names": [
+              "_tag",
+              "field",
+              "kind",
+              "message"
+            ],
+            "required": [
+              "_tag",
+              "message"
+            ],
+            "type": "object"
+          }
+        },
+        "401": {
+          "application/json": {
+            "properties": {
+              "_tag": {
+                "enum": [
+                  "UnauthorizedError"
+                ],
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              },
+              "message": {
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              }
+            },
+            "property_names": [
+              "_tag",
+              "message"
+            ],
+            "required": [
+              "_tag",
+              "message"
+            ],
+            "type": "object"
+          }
+        },
+        "404": {
+          "application/json": {
+            "properties": {},
+            "property_names": [],
+            "required": [],
+            "type": "unspecified"
+          }
+        }
+      },
+      "route": "/api/session/{sessionID}/permission/{requestID}/reply"
+    },
+    "question_reject": {
+      "digest": "94e340c12c608c06dfc39716dfe9e6aac9a642123f3dc1e14654e266b8667a13",
+      "method": "post",
+      "operation_id": "v2.session.question.reject",
+      "request": {},
+      "responses": {
+        "204": {},
+        "400": {
+          "application/json": {
+            "properties": {
+              "_tag": {
+                "enum": [
+                  "InvalidRequestError"
+                ],
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              },
+              "field": {
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              },
+              "kind": {
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              },
+              "message": {
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              }
+            },
+            "property_names": [
+              "_tag",
+              "field",
+              "kind",
+              "message"
+            ],
+            "required": [
+              "_tag",
+              "message"
+            ],
+            "type": "object"
+          }
+        },
+        "401": {
+          "application/json": {
+            "properties": {
+              "_tag": {
+                "enum": [
+                  "UnauthorizedError"
+                ],
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              },
+              "message": {
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              }
+            },
+            "property_names": [
+              "_tag",
+              "message"
+            ],
+            "required": [
+              "_tag",
+              "message"
+            ],
+            "type": "object"
+          }
+        },
+        "404": {
+          "application/json": {
+            "properties": {},
+            "property_names": [],
+            "required": [],
+            "type": "unspecified"
+          }
+        }
+      },
+      "route": "/api/session/{sessionID}/question/{requestID}/reject"
+    },
+    "question_reply": {
+      "digest": "69a8080e9580babb8ccefdcb50cc5d122412c5dd4af52519893b757f45b2b9d6",
+      "method": "post",
+      "operation_id": "v2.session.question.reply",
+      "request": {
+        "application/json": {
+          "properties": {
+            "answers": {
+              "items": {
+                "items": {
+                  "properties": {},
+                  "property_names": [],
+                  "required": [],
+                  "type": "string"
+                },
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "array"
+              },
+              "properties": {},
+              "property_names": [],
+              "required": [],
+              "type": "array"
+            }
+          },
+          "property_names": [
+            "answers"
+          ],
+          "required": [
+            "answers"
+          ],
+          "type": "object"
+        }
+      },
+      "responses": {
+        "204": {},
+        "400": {
+          "application/json": {
+            "properties": {
+              "_tag": {
+                "enum": [
+                  "InvalidRequestError"
+                ],
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              },
+              "field": {
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              },
+              "kind": {
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              },
+              "message": {
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              }
+            },
+            "property_names": [
+              "_tag",
+              "field",
+              "kind",
+              "message"
+            ],
+            "required": [
+              "_tag",
+              "message"
+            ],
+            "type": "object"
+          }
+        },
+        "401": {
+          "application/json": {
+            "properties": {
+              "_tag": {
+                "enum": [
+                  "UnauthorizedError"
+                ],
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              },
+              "message": {
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              }
+            },
+            "property_names": [
+              "_tag",
+              "message"
+            ],
+            "required": [
+              "_tag",
+              "message"
+            ],
+            "type": "object"
+          }
+        },
+        "404": {
+          "application/json": {
+            "properties": {},
+            "property_names": [],
+            "required": [],
+            "type": "unspecified"
+          }
+        }
+      },
+      "route": "/api/session/{sessionID}/question/{requestID}/reply"
+    },
+    "session_prompt": {
+      "digest": "7464d11dc616519845c1fb45b8095f514f9a38b5089c2b54520e60e8b9e0ef7a",
+      "method": "post",
+      "operation_id": "v2.session.prompt",
+      "request": {
+        "application/json": {
+          "properties": {
+            "delivery": {
+              "enum": [
+                "steer",
+                "queue"
+              ],
+              "properties": {},
+              "property_names": [],
+              "required": [],
+              "type": "string"
+            },
+            "id": {
+              "properties": {},
+              "property_names": [],
+              "required": [],
+              "type": "string"
+            },
+            "prompt": {
+              "properties": {
+                "agents": {
+                  "items": {
+                    "properties": {
+                      "name": {
+                        "properties": {},
+                        "property_names": [],
+                        "required": [],
+                        "type": "string"
+                      },
+                      "source": {
+                        "properties": {
+                          "end": {
+                            "properties": {},
+                            "property_names": [],
+                            "required": [],
+                            "type": "number"
+                          },
+                          "start": {
+                            "properties": {},
+                            "property_names": [],
+                            "required": [],
+                            "type": "number"
+                          },
+                          "text": {
+                            "properties": {},
+                            "property_names": [],
+                            "required": [],
+                            "type": "string"
+                          }
+                        },
+                        "property_names": [
+                          "end",
+                          "start",
+                          "text"
+                        ],
+                        "required": [
+                          "end",
+                          "start",
+                          "text"
+                        ],
+                        "type": "object"
+                      }
+                    },
+                    "property_names": [
+                      "name",
+                      "source"
+                    ],
+                    "required": [
+                      "name"
+                    ],
+                    "type": "object"
+                  },
+                  "properties": {},
+                  "property_names": [],
+                  "required": [],
+                  "type": "array"
+                },
+                "files": {
+                  "items": {
+                    "properties": {
+                      "description": {
+                        "properties": {},
+                        "property_names": [],
+                        "required": [],
+                        "type": "string"
+                      },
+                      "name": {
+                        "properties": {},
+                        "property_names": [],
+                        "required": [],
+                        "type": "string"
+                      },
+                      "source": {
+                        "properties": {
+                          "end": {
+                            "properties": {},
+                            "property_names": [],
+                            "required": [],
+                            "type": "number"
+                          },
+                          "start": {
+                            "properties": {},
+                            "property_names": [],
+                            "required": [],
+                            "type": "number"
+                          },
+                          "text": {
+                            "properties": {},
+                            "property_names": [],
+                            "required": [],
+                            "type": "string"
+                          }
+                        },
+                        "property_names": [
+                          "end",
+                          "start",
+                          "text"
+                        ],
+                        "required": [
+                          "end",
+                          "start",
+                          "text"
+                        ],
+                        "type": "object"
+                      },
+                      "uri": {
+                        "properties": {},
+                        "property_names": [],
+                        "required": [],
+                        "type": "string"
+                      }
+                    },
+                    "property_names": [
+                      "description",
+                      "name",
+                      "source",
+                      "uri"
+                    ],
+                    "required": [
+                      "uri"
+                    ],
+                    "type": "object"
+                  },
+                  "properties": {},
+                  "property_names": [],
+                  "required": [],
+                  "type": "array"
+                },
+                "text": {
+                  "properties": {},
+                  "property_names": [],
+                  "required": [],
+                  "type": "string"
+                }
+              },
+              "property_names": [
+                "agents",
+                "files",
+                "text"
+              ],
+              "required": [
+                "text"
+              ],
+              "type": "object"
+            },
+            "resume": {
+              "properties": {},
+              "property_names": [],
+              "required": [],
+              "type": "boolean"
+            }
+          },
+          "property_names": [
+            "delivery",
+            "id",
+            "prompt",
+            "resume"
+          ],
+          "required": [
+            "prompt"
+          ],
+          "type": "object"
+        }
+      },
+      "responses": {
+        "200": {
+          "application/json": {
+            "properties": {
+              "data": {
+                "properties": {
+                  "admittedSeq": {
+                    "properties": {},
+                    "property_names": [],
+                    "required": [],
+                    "type": "integer"
+                  },
+                  "delivery": {
+                    "enum": [
+                      "steer",
+                      "queue"
+                    ],
+                    "properties": {},
+                    "property_names": [],
+                    "required": [],
+                    "type": "string"
+                  },
+                  "id": {
+                    "properties": {},
+                    "property_names": [],
+                    "required": [],
+                    "type": "string"
+                  },
+                  "promotedSeq": {
+                    "properties": {},
+                    "property_names": [],
+                    "required": [],
+                    "type": "integer"
+                  },
+                  "prompt": {
+                    "properties": {
+                      "agents": {
+                        "items": {
+                          "properties": {
+                            "name": {
+                              "properties": {},
+                              "property_names": [],
+                              "required": [],
+                              "type": "string"
+                            },
+                            "source": {
+                              "properties": {
+                                "end": {
+                                  "properties": {},
+                                  "property_names": [],
+                                  "required": [],
+                                  "type": "number"
+                                },
+                                "start": {
+                                  "properties": {},
+                                  "property_names": [],
+                                  "required": [],
+                                  "type": "number"
+                                },
+                                "text": {
+                                  "properties": {},
+                                  "property_names": [],
+                                  "required": [],
+                                  "type": "string"
+                                }
+                              },
+                              "property_names": [
+                                "end",
+                                "start",
+                                "text"
+                              ],
+                              "required": [
+                                "end",
+                                "start",
+                                "text"
+                              ],
+                              "type": "object"
+                            }
+                          },
+                          "property_names": [
+                            "name",
+                            "source"
+                          ],
+                          "required": [
+                            "name"
+                          ],
+                          "type": "object"
+                        },
+                        "properties": {},
+                        "property_names": [],
+                        "required": [],
+                        "type": "array"
+                      },
+                      "files": {
+                        "items": {
+                          "properties": {
+                            "description": {
+                              "properties": {},
+                              "property_names": [],
+                              "required": [],
+                              "type": "string"
+                            },
+                            "mime": {
+                              "properties": {},
+                              "property_names": [],
+                              "required": [],
+                              "type": "string"
+                            },
+                            "name": {
+                              "properties": {},
+                              "property_names": [],
+                              "required": [],
+                              "type": "string"
+                            },
+                            "source": {
+                              "properties": {
+                                "end": {
+                                  "properties": {},
+                                  "property_names": [],
+                                  "required": [],
+                                  "type": "number"
+                                },
+                                "start": {
+                                  "properties": {},
+                                  "property_names": [],
+                                  "required": [],
+                                  "type": "number"
+                                },
+                                "text": {
+                                  "properties": {},
+                                  "property_names": [],
+                                  "required": [],
+                                  "type": "string"
+                                }
+                              },
+                              "property_names": [
+                                "end",
+                                "start",
+                                "text"
+                              ],
+                              "required": [
+                                "end",
+                                "start",
+                                "text"
+                              ],
+                              "type": "object"
+                            },
+                            "uri": {
+                              "properties": {},
+                              "property_names": [],
+                              "required": [],
+                              "type": "string"
+                            }
+                          },
+                          "property_names": [
+                            "description",
+                            "mime",
+                            "name",
+                            "source",
+                            "uri"
+                          ],
+                          "required": [
+                            "mime",
+                            "uri"
+                          ],
+                          "type": "object"
+                        },
+                        "properties": {},
+                        "property_names": [],
+                        "required": [],
+                        "type": "array"
+                      },
+                      "text": {
+                        "properties": {},
+                        "property_names": [],
+                        "required": [],
+                        "type": "string"
+                      }
+                    },
+                    "property_names": [
+                      "agents",
+                      "files",
+                      "text"
+                    ],
+                    "required": [
+                      "text"
+                    ],
+                    "type": "object"
+                  },
+                  "sessionID": {
+                    "properties": {},
+                    "property_names": [],
+                    "required": [],
+                    "type": "string"
+                  },
+                  "timeCreated": {
+                    "properties": {},
+                    "property_names": [],
+                    "required": [],
+                    "type": "number"
+                  }
+                },
+                "property_names": [
+                  "admittedSeq",
+                  "delivery",
+                  "id",
+                  "promotedSeq",
+                  "prompt",
+                  "sessionID",
+                  "timeCreated"
+                ],
+                "required": [
+                  "admittedSeq",
+                  "delivery",
+                  "id",
+                  "prompt",
+                  "sessionID",
+                  "timeCreated"
+                ],
+                "type": "object"
+              }
+            },
+            "property_names": [
+              "data"
+            ],
+            "required": [
+              "data"
+            ],
+            "type": "object"
+          }
+        },
+        "400": {
+          "application/json": {
+            "properties": {
+              "_tag": {
+                "enum": [
+                  "InvalidRequestError"
+                ],
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              },
+              "field": {
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              },
+              "kind": {
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              },
+              "message": {
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              }
+            },
+            "property_names": [
+              "_tag",
+              "field",
+              "kind",
+              "message"
+            ],
+            "required": [
+              "_tag",
+              "message"
+            ],
+            "type": "object"
+          }
+        },
+        "401": {
+          "application/json": {
+            "properties": {
+              "_tag": {
+                "enum": [
+                  "UnauthorizedError"
+                ],
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              },
+              "message": {
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              }
+            },
+            "property_names": [
+              "_tag",
+              "message"
+            ],
+            "required": [
+              "_tag",
+              "message"
+            ],
+            "type": "object"
+          }
+        },
+        "404": {
+          "application/json": {
+            "properties": {},
+            "property_names": [],
+            "required": [],
+            "type": "unspecified"
+          }
+        },
+        "409": {
+          "application/json": {
+            "properties": {
+              "_tag": {
+                "enum": [
+                  "ConflictError"
+                ],
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              },
+              "message": {
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              },
+              "resource": {
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              }
+            },
+            "property_names": [
+              "_tag",
+              "message",
+              "resource"
+            ],
+            "required": [
+              "_tag",
+              "message"
+            ],
+            "type": "object"
+          }
+        }
+      },
+      "route": "/api/session/{sessionID}/prompt"
+    },
+    "stop": {
+      "digest": "42ab353699b0a5c7b645d9da98bd3ed0d57e758e724f97bd27077e061a9c4f8b",
+      "method": "post",
+      "operation_id": "v2.session.interrupt",
+      "request": {},
+      "responses": {
+        "204": {},
+        "400": {
+          "application/json": {
+            "properties": {
+              "_tag": {
+                "enum": [
+                  "InvalidRequestError"
+                ],
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              },
+              "field": {
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              },
+              "kind": {
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              },
+              "message": {
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              }
+            },
+            "property_names": [
+              "_tag",
+              "field",
+              "kind",
+              "message"
+            ],
+            "required": [
+              "_tag",
+              "message"
+            ],
+            "type": "object"
+          }
+        },
+        "401": {
+          "application/json": {
+            "properties": {
+              "_tag": {
+                "enum": [
+                  "UnauthorizedError"
+                ],
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              },
+              "message": {
+                "properties": {},
+                "property_names": [],
+                "required": [],
+                "type": "string"
+              }
+            },
+            "property_names": [
+              "_tag",
+              "message"
+            ],
+            "required": [
+              "_tag",
+              "message"
+            ],
+            "type": "object"
+          }
+        },
+        "404": {
+          "application/json": {
+            "properties": {},
+            "property_names": [],
+            "required": [],
+            "type": "unspecified"
+          }
+        }
+      },
+      "route": "/api/session/{sessionID}/interrupt"
+    }
+  },
+  "classification": "official_shape_only_not_lifecycle",
+  "runtime_provenance_digest": "9c760995cccf626759067424748e39174d869822142dd045a02f8ba9d8df815a",
+  "schema": "nomad.stock-opencode.command-shapes.v1"
+}

@@ -1,0 +1,9 @@
+{
+  "digest": "5f7bbebf2dc100357fab74eb985e49e606b3aed3c73b79f8828d3f74d874da21",
+  "files": [
+    {"content_class": "project_owned_static_fixture", "relative_name": "README.md", "sha256": "74871dd910e6bb0c02751bf09ff5e0b2426b9ab137e9233b331f15845810cfee", "size": 32},
+    {"content_class": "project_owned_static_fixture", "relative_name": "src/arithmetic.js", "sha256": "fb6e8256e50afcdab2bc23a3aadafeebc74c4bdd7d6d589da64017cc6a6af77e", "size": 50},
+    {"content_class": "project_owned_static_fixture", "relative_name": "test/arithmetic.test.js", "sha256": "f22f919ef101000041a28fc6e795a9d43161c958c5e69116304bf1608c1285cd", "size": 96}
+  ],
+  "schema": "nomad.stock-opencode.fixture-manifest.v1"
+}

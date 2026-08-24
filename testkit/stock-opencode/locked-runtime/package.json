@@ -1,0 +1,9 @@
+{
+  "name": "nomad-stock-opencode-locked-runtime",
+  "private": true,
+  "version": "1.0.0",
+  "packageManager": "npm@11.12.1",
+  "dependencies": {
+    "opencode-ai": "1.18.16"
+  }
+}

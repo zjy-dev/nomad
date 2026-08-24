@@ -14,7 +14,7 @@
 - OpenAPI JSON is served from GET /doc; GET /openapi.json serves the Web UI HTML.
 - GET /session returns a Session list; the disposable empty workspace returned an empty list.
 - GET /event is an unbounded text/event-stream. The first stock event was server.connected with id, type and properties.
-- Permission lifecycle is permission.asked/replied and question lifecycle includes question.asked.
+- The OpenAPI schema vocabulary includes permission.asked/replied and question.asked; without a Provider-backed task, this does not observe either lifecycle.
 
 ## Adapter incompatibility
 

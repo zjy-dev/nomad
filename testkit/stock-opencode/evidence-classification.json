@@ -1,0 +1,23 @@
+{
+  "schema": "nomad.stock-opencode.evidence-classification.v1",
+  "classes": {
+    "official_registry_integrity_bound_stock_contract": {
+      "definition": "Shape-only facts captured after exact registry archive and committed-lock validation, fresh npm ci, and spawning an observed installed entrypoint constrained to that runtime. This does not attest all final executable or child-process code produced or selected by install/postinstall behavior.",
+      "execution_provenance_scope": "registry_archives_exact_lock_fresh_npm_ci_selected_packages_and_spawned_entrypoint",
+      "postinstall_final_code_attested": false,
+      "may_claim": ["version", "route_presence", "schema_shape", "event_envelope_shape", "snapshot_endpoint_shape"],
+      "must_not_claim": ["question", "permission", "diff", "stop", "reconnect", "task_outcome"]
+    },
+    "disposable_real_task": {
+      "definition": "Sanitized proof from an operator-supplied Provider-backed disposable task.",
+      "may_claim": ["question", "permission", "diff", "stop", "reconnect", "task_outcome"],
+      "repository_rule": "Only classification and content-free derived assertions may be committed."
+    },
+    "synthetic": {
+      "definition": "Fixture, fake server, or unit-test evidence.",
+      "may_claim": ["test_behavior"],
+      "must_not_claim": ["official_registry_integrity_bound_stock_contract", "real_task_outcome"]
+    }
+  },
+  "prohibited_persisted_content": ["provider_credential", "prompt", "source", "path", "command", "diff_content", "personal_identifier", "raw_session_content"]
+}

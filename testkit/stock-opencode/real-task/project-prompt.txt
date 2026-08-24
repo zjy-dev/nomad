@@ -1,0 +1,4 @@
+Use only the disposable project fixture. First ask whether the arithmetic helper
+should remain named add. After receiving an answer, make one bounded edit to
+that helper, then run exactly `node test/arithmetic.test.js`. Do not read files
+outside this workspace.

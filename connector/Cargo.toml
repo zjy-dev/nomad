@@ -2,6 +2,19 @@
 name = "nomad-connector"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
+
+[features]
+default = []
+production_release_bundle = []
+actual_launch_test_helper = []
+native_supervisor_test_helper = []
+native_transport_test_helper = ["actual_launch_test_helper"]
+native_proxy_peer_test_helper = []
+native_composed_transport_test_helper = ["native_transport_test_helper", "native_proxy_peer_test_helper"]
+native_audit_proxy_test_helper = []
+native_sse_proxy_test_helper = []
+native_sse_reconnect_test_helper = ["native_audit_proxy_test_helper", "native_sse_proxy_test_helper"]
 
 [[bin]]
 name = "nomad-connector"
@@ -19,6 +32,39 @@ path = "src/bin/pilot_host_bridge.rs"
 name = "pilot-adapter"
 path = "src/bin/pilot_adapter.rs"
 
+[[bin]]
+name = "actual-launch-adopter"
+path = "src/bin/actual_launch_adopter.rs"
+required-features = ["actual_launch_test_helper"]
+
+[[bin]]
+name = "nomad-host"
+path = "src/bin/nomad_host.rs"
+
+[[bin]]
+name = "nomad-supervisor"
+path = "src/bin/nomad_supervisor.rs"
+
+[[bin]]
+name = "native-proxy-peer"
+path = "src/bin/native_proxy_peer.rs"
+required-features = ["native_proxy_peer_test_helper"]
+
+[[bin]]
+name = "native-audit-proxy"
+path = "src/bin/native_audit_proxy.rs"
+required-features = ["native_audit_proxy_test_helper"]
+
+[[bin]]
+name = "native-sse-proxy"
+path = "src/bin/native_sse_proxy.rs"
+required-features = ["native_sse_proxy_test_helper"]
+
+[[bin]]
+name = "native-sse-reconnect"
+path = "src/bin/native_sse_reconnect.rs"
+required-features = ["native_sse_reconnect_test_helper"]
+
 [dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -27,6 +73,13 @@ sha2 = "0.10"
 url = "2"
 thiserror = "1"
 ureq = "2"
+time = { version = "0.3", features = ["parsing"] }
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+
+[build-dependencies]
+libc = "0.2"
+serde_json = "1"
+sha2 = "0.10"

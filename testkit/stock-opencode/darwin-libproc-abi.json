@@ -1,0 +1,36 @@
+{
+  "arch": "arm64",
+  "constants": {
+    "max_path_len": 1024,
+    "proc_flag_inexit": 4,
+    "proc_pid_region_path_info": 8,
+    "proc_pid_tbsd_info": 3,
+    "sidl": 1,
+    "sleep": 3,
+    "srun": 2,
+    "sstop": 4,
+    "szomb": 5,
+    "vm_prot_execute": 4
+  },
+  "generated_by": "darwin_libproc_abi_probe.c",
+  "platform": "darwin",
+  "schema_version": "nomad.darwin-libproc-abi.v1",
+  "structs": {
+    "proc_bsdinfo": {
+      "offsets": {"flags": 0, "pid": 12, "ppid": 16, "start_sec": 120, "start_usec": 128, "status": 4},
+      "size": 136
+    },
+    "proc_regioninfo": {
+      "offsets": {"address": 80, "file_offset": 16, "protection": 0, "size": 88},
+      "size": 96
+    },
+    "proc_regionwithpathinfo": {
+      "offsets": {"path": 248, "region": 0, "vnode": 96, "vnode_stat": 96},
+      "size": 1272
+    },
+    "vinfo_stat": {
+      "offsets": {"ctime": 56, "ctime_nsec": 64, "device": 0, "generation": 112, "inode": 8, "mode": 4, "mtime": 40, "mtime_nsec": 48, "size": 88},
+      "size": 136
+    }
+  }
+}
