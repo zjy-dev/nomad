@@ -17,12 +17,15 @@ from .bundle import (
     AGENT_RUNTIME,
     GATEWAY_MODULES,
     MANIFEST,
+    REQUIRED_PACKAGE,
     SCHEMA,
     _rename_exclusive,
     gateway_module_closure,
     verify_bundle,
 )
 from .processes import run_checked
+
+SOURCE_ONLY_MODULES = {"onboarding.py"}
 
 
 def materialize(repo: Path, output: Path) -> dict[str, Any]:
@@ -61,8 +64,9 @@ def materialize(repo: Path, output: Path) -> dict[str, Any]:
             shutil.copyfile(gateway_source / name, destination)
         (root / "gateway" / "package.json").write_text("{\"type\":\"module\"}\n", encoding="utf-8")
         shutil.copytree(repo / "mobile-reference" / "dist", root / "web", dirs_exist_ok=True)
-        for source in sorted((repo / "tools" / "nomad_web").glob("*.py")):
-            shutil.copyfile(source, root / "lib" / "nomad_web" / source.name)
+        for relative in sorted(REQUIRED_PACKAGE):
+            source = repo / "tools" / Path(relative).relative_to("lib")
+            shutil.copyfile(source, root / relative)
         runner_source = repo / "testkit" / "remote-v2"
         for name in ("run_m3e_product_slice.py", "run_m3e_desktop_browser.py"):
             shutil.copyfile(runner_source / name, root / "testkit" / "remote-v2" / name)

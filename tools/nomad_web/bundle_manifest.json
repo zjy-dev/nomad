@@ -14,6 +14,21 @@
     "mobile-reference/pilot-gateway/view.mjs"
   ],
   "mobile_dist": "mobile-reference/dist",
+  "onboarding": {
+    "schema": "nomad.web-companion.onboarding.v1",
+    "installed_runtime_module": "tools/nomad_web/install_lifecycle.py",
+    "source_facade": "tools/nomad_web/onboarding.py",
+    "states": [
+      "NOT_INSTALLED",
+      "INSTALLED_NEEDS_START",
+      "INSTALLED_BLOCKED_HOST_IDENTITY",
+      "RUNNING_NEEDS_PAIRING",
+      "RUNNING_PAIRED",
+      "RUNNING_DEGRADED_RECOVERY_REQUIRED"
+    ],
+    "production_ready": false,
+    "external_readiness": "NOT_RUN"
+  },
   "required_environment_names": ["NOMAD_WEB_HOME"],
   "optional_provider_environment_names": ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY", "OPENROUTER_API_KEY", "DEEPSEEK_API_KEY"],
   "default_loopback_ports": {"relay": 18089, "gateway": 14173},

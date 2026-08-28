@@ -120,6 +120,10 @@ class InstallLifecycleTests(unittest.TestCase):
         second = self.install()
         self.assertEqual(first, second)
         self.assertEqual(first["state"], "INSTALLED")
+        self.assertEqual(
+            first["onboarding"]["state"], "INSTALLED_BLOCKED_HOST_IDENTITY"
+        )
+        self.assertFalse(first["onboarding"]["production_ready"])
         self.assertEqual(len(first["history"]), 1)
         target = self.config.home / "bundles" / self.digest(self.v1)
         self.assertEqual((target / "bin" / "nomad-web").read_bytes(), b"first payload")
@@ -189,6 +193,7 @@ class InstallLifecycleTests(unittest.TestCase):
         second = lifecycle.upgrade(self.config, self.v2)
         self.assertEqual(first, second)
         self.assertEqual(first["current_bundle_digest"], self.digest(self.v2))
+        self.assertIn(first["onboarding"]["state"], lifecycle.ONBOARDING_STATES)
         self.assertEqual([entry["operation"] for entry in first["history"]], ["install", "upgrade"])
         current_raw = (self.config.home / "install" / "current.json").read_bytes()
         self.assertNotIn(b"secret-database-bytes", current_raw)
@@ -209,6 +214,7 @@ class InstallLifecycleTests(unittest.TestCase):
 
         rolled_back = lifecycle.rollback(self.config)
         self.assertEqual(rolled_back["current_bundle_digest"], self.digest(self.v1))
+        self.assertIn(rolled_back["onboarding"]["state"], lifecycle.ONBOARDING_STATES)
         self.assertEqual(database.read_bytes(), b"v2 database")
         self.assertEqual(cursor.read_bytes(), b"v2 cursor")
         self.assertEqual(sidecar.read_bytes(), b"v2 only")

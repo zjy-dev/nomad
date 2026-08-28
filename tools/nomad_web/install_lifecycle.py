@@ -15,11 +15,13 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import uuid
 from pathlib import Path
 from typing import Any
 
+from . import processes
 from .bundle import MANIFEST, verify_bundle
 from .state import lifecycle_lock, read_run_state, validate_home
 
@@ -30,6 +32,32 @@ MAX_CURRENT_BYTES = 4 * 1024 * 1024
 MAX_MANIFEST_BYTES = 256 * 1024
 MAX_STATE_FILE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_STATE_SNAPSHOT_BYTES = 4 * 1024 * 1024 * 1024
+ONBOARDING_SCHEMA = "nomad.web-companion.onboarding.v1"
+ONBOARDING_STATES = (
+    "NOT_INSTALLED",
+    "INSTALLED_NEEDS_START",
+    "INSTALLED_BLOCKED_HOST_IDENTITY",
+    "RUNNING_NEEDS_PAIRING",
+    "RUNNING_PAIRED",
+    "RUNNING_DEGRADED_RECOVERY_REQUIRED",
+)
+EXTERNAL_GATES = (
+    "PROVIDER_E3_EVIDENCE_NOT_RUN",
+    "PHYSICAL_PHONE_SAFARI_NOT_RUN",
+    "CLEAN_MACHINE_INSTALL_NOT_RUN",
+    "DEVELOPER_ID_SIGNING_NOT_RUN",
+    "APPLE_NOTARIZATION_NOT_RUN",
+    "PUBLICATION_PROVENANCE_NOT_RUN",
+)
+HOST_IDENTITY_RESULTS = {
+    "READY": None,
+    "AUTH_REQUIRED": "HOST_IDENTITY_AUTH_REQUIRED",
+    "USER_DENIED": "HOST_IDENTITY_USER_DENIED",
+    "KEYCHAIN_LOCKED": "HOST_IDENTITY_KEYCHAIN_LOCKED",
+    "CORRUPT": "HOST_IDENTITY_CORRUPT",
+    "UNAVAILABLE": "HOST_IDENTITY_UNAVAILABLE",
+}
+_ONBOARDING_UNSET = object()
 
 # The device registry is identity authority, not versioned application state.
 # Keeping it out of this allowlist prevents rollback from resurrecting a
@@ -60,7 +88,7 @@ def install(config: Any, bundle: Path | str) -> dict[str, Any]:
             if current["bundle_digest"] != digest:
                 raise RuntimeError("INSTALL_ALREADY_PRESENT_USE_UPGRADE")
             _verify_installed_bundle(home, digest)
-            return _status_unlocked(home, current)
+            return _with_onboarding(config, _status_unlocked(home, current), None)
 
         _publish_bundle(source, manifest, home)
         record = _current_record(
@@ -70,7 +98,7 @@ def install(config: Any, bundle: Path | str) -> dict[str, Any]:
         _checkpoint("before_current_switch")
         _write_current(home, record)
         _checkpoint("after_current_switch")
-        return _status_unlocked(home, record)
+        return _with_onboarding(config, _status_unlocked(home, record), None)
 
 
 def upgrade(config: Any, bundle: Path | str) -> dict[str, Any]:
@@ -89,7 +117,7 @@ def upgrade(config: Any, bundle: Path | str) -> dict[str, Any]:
         digest = _manifest_digest(manifest)
         _checkpoint("source_verified")
         if digest == old_digest:
-            return _status_unlocked(home, old)
+            return _with_onboarding(config, _status_unlocked(home, old), None)
 
         snapshot_digest = _snapshot_persistent_state(home)
         _checkpoint("state_snapshotted")
@@ -102,7 +130,7 @@ def upgrade(config: Any, bundle: Path | str) -> dict[str, Any]:
         _checkpoint("before_current_switch")
         _write_current(home, record)
         _checkpoint("after_current_switch")
-        return _status_unlocked(home, record)
+        return _with_onboarding(config, _status_unlocked(home, record), None)
 
 
 def rollback(config: Any) -> dict[str, Any]:
@@ -119,7 +147,7 @@ def rollback(config: Any) -> dict[str, Any]:
         _verify_installed_bundle(home, old["bundle_digest"])
         selected = _rollback_entry(old)
         if selected is None:
-            return _status_unlocked(home, old)
+            return _with_onboarding(config, _status_unlocked(home, old), None)
 
         target_digest = selected["from_bundle_digest"]
         snapshot_digest = selected["state_snapshot_digest"]
@@ -136,13 +164,17 @@ def rollback(config: Any) -> dict[str, Any]:
         _checkpoint("before_current_switch")
         _write_current(home, record)
         _checkpoint("after_current_switch")
-        return _status_unlocked(home, record)
+        return _with_onboarding(config, _status_unlocked(home, record), None)
 
 
 def status(config: Any) -> dict[str, Any]:
     """Return the verified install selector and digest-only history."""
     with lifecycle_lock(config, create=False) as owned:
-        return status_unlocked(config) if owned else _empty_status()
+        if not owned:
+            empty = _empty_status()
+            return _with_onboarding(config, empty, None)
+        installed = status_unlocked(config)
+        return _with_onboarding(config, installed, _ONBOARDING_UNSET)
 
 
 def status_unlocked(config: Any) -> dict[str, Any]:
@@ -153,6 +185,91 @@ def status_unlocked(config: Any) -> dict[str, Any]:
     if current is None:
         return _empty_status()
     return _status_unlocked(home, current)
+
+
+def onboarding_status(config: Any) -> dict[str, Any]:
+    """Return a commitment-only ordinary-user state without readiness claims."""
+    with lifecycle_lock(config, create=False) as owned:
+        if not owned:
+            return _classify_onboarding_unlocked(config, _empty_status(), None)
+        installed = status_unlocked(config)
+        return _classify_onboarding_unlocked(config, installed, _ONBOARDING_UNSET)
+
+
+def onboarding_status_unlocked(config: Any) -> dict[str, Any]:
+    """Classify onboarding while the caller already holds lifecycle_lock()."""
+    return _classify_onboarding_unlocked(
+        config, status_unlocked(config), _ONBOARDING_UNSET
+    )
+
+
+def _with_onboarding(
+    config: Any, installed: dict[str, Any], run_state: Any,
+) -> dict[str, Any]:
+    return {
+        **installed,
+        "onboarding": _classify_onboarding_unlocked(config, installed, run_state),
+    }
+
+
+def _classify_onboarding_unlocked(
+    config: Any, installed: dict[str, Any], run_state: Any,
+) -> dict[str, Any]:
+    if run_state is _ONBOARDING_UNSET:
+        try:
+            run_state = read_run_state(config)
+        except RuntimeError as error:
+            return _onboarding_result(
+                "RUNNING_DEGRADED_RECOVERY_REQUIRED", installed, None,
+                [_safe_onboarding_error(error, "RUNTIME_STATE_INVALID")],
+                "RECOVER_RUNNING_IDENTITY",
+            )
+    if installed.get("state") != "INSTALLED":
+        if run_state is not None:
+            return _onboarding_result(
+                "RUNNING_DEGRADED_RECOVERY_REQUIRED", installed, run_state,
+                ["RUNNING_WITHOUT_VERIFIED_INSTALL"], "RECOVER_RUNNING_IDENTITY",
+            )
+        return _onboarding_result(
+            "NOT_INSTALLED", installed, None, [], "INSTALL_VERIFIED_BUNDLE"
+        )
+
+    if run_state is None:
+        blocker = _host_identity_blocker(config, installed)
+        if blocker is not None:
+            return _onboarding_result(
+                "INSTALLED_BLOCKED_HOST_IDENTITY", installed, None,
+                [blocker], "AUTHORIZE_HOST_IDENTITY",
+            )
+        return _onboarding_result(
+            "INSTALLED_NEEDS_START", installed, None, [], "START_INSTALLED_BUNDLE"
+        )
+
+    drift = _running_drift(installed, run_state)
+    if drift is not None:
+        return _onboarding_result(
+            "RUNNING_DEGRADED_RECOVERY_REQUIRED", installed, run_state,
+            [drift], "RECOVER_RUNNING_IDENTITY",
+        )
+    paired = run_state["identity"]["paired_device"]
+    if paired["availability"] == "READY":
+        return _onboarding_result(
+            "RUNNING_PAIRED", installed, run_state, [], "USE_INSTALLED_CANDIDATE"
+        )
+    if paired["availability"] == "UNPAIRED":
+        return _onboarding_result(
+            "RUNNING_NEEDS_PAIRING", installed, run_state,
+            ["PAIRED_DEVICE_REQUIRED"], "PAIR_PHONE",
+        )
+    if paired["availability"] == "NOT_RUN":
+        return _onboarding_result(
+            "RUNNING_DEGRADED_RECOVERY_REQUIRED", installed, run_state,
+            ["OFFICIAL_AGENT_RUNTIME_REQUIRED"], "START_OFFICIAL_AGENT",
+        )
+    return _onboarding_result(
+        "RUNNING_DEGRADED_RECOVERY_REQUIRED", installed, run_state,
+        ["PAIRED_DEVICE_IDENTITY_UNAVAILABLE"], "RECOVER_RUNNING_IDENTITY",
+    )
 
 
 def select_bundle_for_start(config: Any, explicit_bundle: Path | str | None) -> Path | None:
@@ -203,6 +320,123 @@ def _get(config: Any, name: str) -> Any:
     if isinstance(config, dict) and name in config:
         return config[name]
     raise RuntimeError(f"CONFIG_{name.upper()}_MISSING")
+
+
+def _host_identity_blocker(config: Any, installed: dict[str, Any]) -> str | None:
+    digest = installed.get("current_bundle_digest")
+    if not isinstance(digest, str) or _DIGEST.fullmatch(digest) is None:
+        return "INSTALLED_IDENTITY_INVALID"
+    binary = _home(config) / "bundles" / digest / "bin" / "nomad-product-host"
+    try:
+        result = subprocess.run(
+            [str(binary), "identity-preflight", "--non-interactive"],
+            cwd=binary.parent.parent,
+            env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return "HOST_IDENTITY_PREFLIGHT_TIMEOUT"
+    except OSError:
+        return "HOST_IDENTITY_PREFLIGHT_FAILED"
+    if result.stderr != b"":
+        return "HOST_IDENTITY_PREFLIGHT_INVALID"
+    for status, blocker in HOST_IDENTITY_RESULTS.items():
+        expected_code = 0 if status == "READY" else 1
+        expected = (json.dumps({"status": status}, separators=(",", ":")) + "\n").encode("ascii")
+        if result.stdout == expected:
+            return blocker if result.returncode == expected_code else "HOST_IDENTITY_PREFLIGHT_INVALID"
+    return "HOST_IDENTITY_PREFLIGHT_INVALID"
+
+
+def _running_drift(installed: dict[str, Any], run_state: Any) -> str | None:
+    if not isinstance(run_state, dict):
+        return "RUNTIME_STATE_INVALID"
+    selected = installed.get("current_bundle_digest")
+    identity = run_state.get("identity")
+    if not isinstance(identity, dict):
+        return "RUNNING_IDENTITY_MISMATCH"
+    installed_identity = identity.get("installed")
+    running_identity = identity.get("running")
+    expected_installed_identity = _expected_installed_identity(installed)
+    if (
+        run_state.get("bundle_digest") != selected
+        or installed_identity != expected_installed_identity
+        or not isinstance(running_identity, dict)
+        or running_identity.get("availability") != "READY"
+        or running_identity.get("bundle_digest") != selected
+    ):
+        return "RUNNING_IDENTITY_MISMATCH"
+    ownership = [processes.ownership(item) for item in run_state.get("processes", [])]
+    if not ownership or any(value != "owned" for value in ownership):
+        return "RUNNING_PROCESS_SET_DEGRADED"
+    return None
+
+
+def _expected_installed_identity(installed: dict[str, Any]) -> dict[str, Any] | None:
+    digest = installed.get("current_bundle_digest")
+    history = installed.get("history")
+    if (
+        not isinstance(digest, str)
+        or _DIGEST.fullmatch(digest) is None
+        or not isinstance(history, list)
+        or not history
+        or not isinstance(history[-1], dict)
+        or type(history[-1].get("sequence")) is not int
+        or history[-1]["sequence"] <= 0
+    ):
+        return None
+    sequence = history[-1]["sequence"]
+    return {
+        "availability": "READY",
+        "bundle_digest": digest,
+        "install_sequence": sequence,
+        "install_identity": hashlib.sha256(
+            f"nomad.web.install-identity.v1:{digest}:{sequence}".encode("ascii")
+        ).hexdigest(),
+    }
+
+
+def _onboarding_result(
+    state: str,
+    installed: dict[str, Any],
+    run_state: dict[str, Any] | None,
+    blockers: list[str],
+    next_action: str,
+) -> dict[str, Any]:
+    if state not in ONBOARDING_STATES:
+        raise RuntimeError("INVALID_ONBOARDING_STATE")
+    history = installed.get("history")
+    sequence = history[-1].get("sequence") if isinstance(history, list) and history else None
+    identity = run_state.get("identity") if isinstance(run_state, dict) else None
+    running = identity.get("running") if isinstance(identity, dict) else None
+    paired = identity.get("paired_device") if isinstance(identity, dict) else None
+    return {
+        "schema": ONBOARDING_SCHEMA,
+        "state": state,
+        "production_ready": False,
+        "external_readiness": "NOT_RUN",
+        "external_gates": [
+            {"code": code, "status": "NOT_RUN"} for code in EXTERNAL_GATES
+        ],
+        "installed_bundle_digest": installed.get("current_bundle_digest"),
+        "install_sequence": sequence,
+        "run_identity": running.get("run_identity") if isinstance(running, dict) else None,
+        "paired_device_commitment": (
+            paired.get("device_key_commitment") if isinstance(paired, dict) else None
+        ),
+        "pairing_epoch": paired.get("pairing_epoch") if isinstance(paired, dict) else None,
+        "blockers": blockers,
+        "next_action": next_action,
+    }
+
+
+def _safe_onboarding_error(error: RuntimeError, fallback: str) -> str:
+    value = str(error)
+    return value if re.fullmatch(r"[A-Z][A-Z0-9_]*", value) is not None else fallback
 
 
 def _home(config: Any) -> Path:
@@ -816,4 +1050,8 @@ def _checkpoint(_stage: str) -> None:
     """Patchable, side-effect-free failure-injection boundary for tests."""
 
 
-__all__ = ["install", "upgrade", "rollback", "status", "select_bundle_for_start"]
+__all__ = [
+    "ONBOARDING_SCHEMA", "ONBOARDING_STATES", "install", "upgrade",
+    "rollback", "status", "status_unlocked", "onboarding_status",
+    "onboarding_status_unlocked", "select_bundle_for_start",
+]
