@@ -391,7 +391,7 @@ class M3ELauncherTests(unittest.TestCase):
                 install_result = cli.install(config, bundle)
             self.assertEqual(install_result["state"], "INSTALLED")
             self.assertEqual(install_result["onboarding"]["state"], "INSTALLED_BLOCKED_HOST_IDENTITY")
-            self.assertFalse((config.home / "bin").exists())
+            self.assertTrue((config.home / "bin" / "nomad-web").is_file())
             self.assertFalse((config.home / "run").exists())
             self.assertFalse((config.home / "logs").exists())
             self.assertTrue((config.home / "install").is_dir())
@@ -404,7 +404,7 @@ class M3ELauncherTests(unittest.TestCase):
             self.assertEqual(reset["install_state"], "PRESERVED")
             self.assertEqual(reset["host_identity_disposition"], "retained")
             self.assertTrue(config.home.is_dir())
-            self.assertFalse((config.home / "bin").exists())
+            self.assertTrue((config.home / "bin" / "nomad-web").is_file())
             self.assertFalse((config.home / "run").exists())
             self.assertFalse((config.home / "logs").exists())
 
