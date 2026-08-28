@@ -10,6 +10,7 @@ import shutil
 import stat
 import uuid
 from pathlib import Path
+from collections.abc import Callable, Mapping, Set
 from typing import Any
 
 SCHEMA_V1 = "nomad.web-companion.prebuilt.v1"
@@ -51,7 +52,10 @@ REQUIRED_PACKAGE_V1 = {
 }
 REQUIRED_PACKAGE = REQUIRED_PACKAGE_V1 | {
     f"lib/nomad_web/{name}"
-    for name in ("evidence_resume.py", "install_lifecycle.py", "release_verify.py")
+    for name in (
+        "diagnostics.py", "evidence_resume.py", "install_lifecycle.py",
+        "recovery.py", "release_verify.py",
+    )
 }
 REQUIRED_RUNNER_CLOSURE = {
     "testkit/remote-v2/run_m3e_product_slice.py",
@@ -61,7 +65,7 @@ REQUIRED_RUNNER_CLOSURE = {
 # distinguishes the native/gateway artifact set, not the launcher package.
 PACKAGE_BY_SCHEMA = {SCHEMA_V1: REQUIRED_PACKAGE, SCHEMA: REQUIRED_PACKAGE}
 RUNNERS_BY_SCHEMA = {
-    SCHEMA_V1: REQUIRED_RUNNER_CLOSURE, SCHEMA: REQUIRED_RUNNER_CLOSURE
+    SCHEMA_V1: REQUIRED_RUNNER_CLOSURE, SCHEMA: REQUIRED_RUNNER_CLOSURE,
 }
 TOP_KEYS = {"schema", "classification", "platform", "launcher_version", "source_commit_oid", "source_dirty", "build_tools", "agent_runtime", "files", "bundle_digest"}
 FILE_KEYS = {"path", "size_bytes", "raw_sha256", "mode"}
@@ -83,6 +87,56 @@ def verify_bundle(root: Path) -> dict[str, Any]:
     if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o755:
         raise RuntimeError("UNSAFE_BUNDLE_ROOT")
     raw_manifest = _read(root / MANIFEST, MAX_MANIFEST, 0o644)
+    actual, directories = _walk(root)
+    return _verify_bundle_inputs(
+        raw_manifest,
+        lambda name, limit, mode: _read(root / name, limit, mode),
+        actual,
+        directories,
+    )
+
+
+def verify_bundle_snapshot(
+    files: Mapping[str, bytes], modes: Mapping[str, int], directories: Set[str],
+) -> dict[str, Any]:
+    """Verify one already captured bundle without reading its paths again.
+
+    The installed launcher uses this after it has captured every regular file
+    under the lifecycle lock.  Keeping the manifest contract here makes the
+    bytes that were checked exactly the bytes later imported by the launcher.
+    """
+    if (
+        not isinstance(files, Mapping) or not isinstance(modes, Mapping)
+        or not isinstance(directories, Set)
+        or set(files) != set(modes)
+        or any(not isinstance(name, str) or not isinstance(raw, bytes) for name, raw in files.items())
+        or any(type(mode) is not int for mode in modes.values())
+        or modes.get(MANIFEST) != 0o644
+    ):
+        raise RuntimeError("INVALID_BUNDLE_SNAPSHOT")
+    raw_manifest = files.get(MANIFEST)
+    if raw_manifest is None or len(raw_manifest) > MAX_MANIFEST:
+        raise RuntimeError("INVALID_BUNDLE_SNAPSHOT")
+
+    def read_snapshot(name: str, limit: int, expected_mode: int) -> bytes:
+        raw = files.get(name)
+        if raw is None or modes.get(name) != expected_mode:
+            raise RuntimeError("UNSAFE_BUNDLE_FILE")
+        if len(raw) > limit:
+            raise RuntimeError("BUNDLE_FILE_TOO_LARGE")
+        return raw
+
+    return _verify_bundle_inputs(
+        raw_manifest, read_snapshot, set(files), set(directories),
+    )
+
+
+def _verify_bundle_inputs(
+    raw_manifest: bytes,
+    read_file: Callable[[str, int, int], bytes],
+    actual: set[str],
+    directories: set[str],
+) -> dict[str, Any]:
     try:
         value = json.loads(raw_manifest)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -142,12 +196,11 @@ def verify_bundle(root: Path) -> dict[str, Any]:
         ):
             raise RuntimeError("INVALID_BUNDLE_MODE")
         limit = 192 * 1024 * 1024 if name == AGENT_RUNTIME["entrypoint"] else 64 * 1024 * 1024
-        raw = _read(root / name, limit, mode)
+        raw = read_file(name, limit, mode)
         if entry["size_bytes"] != len(raw) or entry["raw_sha256"] != hashlib.sha256(raw).hexdigest():
             raise RuntimeError("BUNDLE_FILE_MISMATCH")
         if name == AGENT_RUNTIME["entrypoint"] and entry["raw_sha256"] != AGENT_ENTRYPOINT_SHA256:
             raise RuntimeError("AGENT_ENTRYPOINT_MISMATCH")
-    actual, directories = _walk(root)
     expected_files = observed | {MANIFEST}
     expected_dirs = {str(parent) for name in expected_files for parent in Path(name).parents if str(parent) != "."}
     if (
@@ -158,11 +211,13 @@ def verify_bundle(root: Path) -> dict[str, Any]:
         or observed & REQUIRED_RUNNER_CLOSURE != required_runners
     ):
         raise RuntimeError("BUNDLE_FILE_SET_MISMATCH")
-    closure = gateway_module_closure(root / "gateway")
+    closure = _gateway_module_closure(
+        lambda name: read_file(f"gateway/{name}", 2 * 1024 * 1024, 0o644)
+    )
     expected_gateway_modules = GATEWAY_MODULES if value["schema"] == SCHEMA else GATEWAY_MODULES_V1
     if {f"gateway/{name}" for name in closure} != set(expected_gateway_modules):
         raise RuntimeError("GATEWAY_MODULE_ALLOWLIST_MISMATCH")
-    if _read(root / "gateway" / "package.json", 1024, 0o644) != b'{"type":"module"}\n':
+    if read_file("gateway/package.json", 1024, 0o644) != b'{"type":"module"}\n':
         raise RuntimeError("INVALID_GATEWAY_PACKAGE")
     core = dict(value)
     digest = core.pop("bundle_digest")
@@ -173,6 +228,15 @@ def verify_bundle(root: Path) -> dict[str, Any]:
 
 def gateway_module_closure(gateway_root: Path, entrypoint: str = "server.mjs") -> set[str]:
     """Return the complete local ESM closure, rejecting non-bundled dependencies."""
+    return _gateway_module_closure(
+        lambda name: _read(gateway_root / name, 2 * 1024 * 1024, 0o644),
+        entrypoint,
+    )
+
+
+def _gateway_module_closure(
+    read_module: Callable[[str], bytes], entrypoint: str = "server.mjs",
+) -> set[str]:
     pending = [entrypoint]
     observed: set[str] = set()
     while pending:
@@ -181,9 +245,8 @@ def gateway_module_closure(gateway_root: Path, entrypoint: str = "server.mjs") -
             continue
         if not _safe_relative(name) or not name.endswith(".mjs"):
             raise RuntimeError("INVALID_GATEWAY_MODULE_PATH")
-        path = gateway_root / name
         try:
-            raw = _read(path, 2 * 1024 * 1024, 0o644)
+            raw = read_module(name)
             source = raw.decode("utf-8")
         except (OSError, UnicodeDecodeError, RuntimeError) as error:
             raise RuntimeError("GATEWAY_MODULE_MISSING") from error

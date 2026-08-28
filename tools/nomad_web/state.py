@@ -7,6 +7,8 @@ import re
 import stat
 import uuid
 from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +43,19 @@ REMOTE_RUN_KEYS = {
     "session_alias", "workspace_binding_digest",
     "product_host_socket_identity", "identity",
 }
+
+
+@dataclass(frozen=True)
+class _AdoptedLifecycleLock:
+    home: Path
+    marker_identity: tuple[int, int, int, int]
+    descriptor: int
+    depth: int
+
+
+_ADOPTED_LIFECYCLE_LOCK: ContextVar[_AdoptedLifecycleLock | None] = ContextVar(
+    "nomad_web_adopted_lifecycle_lock", default=None,
+)
 
 
 def state_path(config: Any) -> Path:
@@ -143,7 +158,23 @@ def _reject_symlink_components(path: Path) -> None:
 
 @contextmanager
 def lifecycle_lock(config: Any, *, create: bool):
-    home = Path(config.home)
+    home = Path(os.path.abspath(os.fspath(config.home)))
+    adopted = _ADOPTED_LIFECYCLE_LOCK.get()
+    if adopted is not None:
+        if home != adopted.home:
+            raise RuntimeError("LIFECYCLE_LOCK_HOME_MISMATCH")
+        _validate_adopted_lifecycle_lock(adopted)
+        token = _ADOPTED_LIFECYCLE_LOCK.set(
+            _AdoptedLifecycleLock(
+                adopted.home, adopted.marker_identity, adopted.descriptor,
+                adopted.depth + 1,
+            )
+        )
+        try:
+            yield True
+        finally:
+            _ADOPTED_LIFECYCLE_LOCK.reset(token)
+        return
     if not os.path.lexists(home):
         if not create:
             yield False
@@ -162,6 +193,64 @@ def lifecycle_lock(config: Any, *, create: bool):
             fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
+
+
+@contextmanager
+def adopt_lifecycle_lock(home: Path | str, descriptor: int):
+    """Adopt an already-held exclusive marker lock for nested lifecycle calls.
+
+    The installed launcher acquires the lock before loading any bundle code.
+    This context keeps that single lock authoritative through CLI execution and
+    lets the normal lifecycle APIs re-enter without issuing another flock.
+    """
+    if _ADOPTED_LIFECYCLE_LOCK.get() is not None:
+        raise RuntimeError("LIFECYCLE_LOCK_ALREADY_ADOPTED")
+    normalized = Path(os.path.abspath(os.fspath(home)))
+    identity = _marker_identity_from_fd(descriptor)
+    adopted = _AdoptedLifecycleLock(normalized, identity, descriptor, 1)
+    _validate_adopted_lifecycle_lock(adopted)
+    token = _ADOPTED_LIFECYCLE_LOCK.set(adopted)
+    try:
+        yield
+    finally:
+        _ADOPTED_LIFECYCLE_LOCK.reset(token)
+
+
+def _marker_identity_from_fd(descriptor: int) -> tuple[int, int, int, int]:
+    try:
+        info = os.fstat(descriptor)
+    except OSError as error:
+        raise RuntimeError("UNSAFE_HOME_MARKER") from error
+    mode = stat.S_IMODE(info.st_mode)
+    if (
+        not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+        or info.st_uid != os.geteuid() or mode != 0o600
+    ):
+        raise RuntimeError("UNSAFE_HOME_MARKER")
+    return (info.st_dev, info.st_ino, info.st_uid, mode)
+
+
+def _validate_adopted_lifecycle_lock(adopted: _AdoptedLifecycleLock) -> None:
+    if adopted.depth < 1:
+        raise RuntimeError("LIFECYCLE_LOCK_ADOPTION_INVALID")
+    try:
+        descriptor_identity = _marker_identity_from_fd(adopted.descriptor)
+    except RuntimeError as error:
+        raise RuntimeError("LIFECYCLE_LOCK_MARKER_CHANGED") from error
+    if descriptor_identity != adopted.marker_identity:
+        raise RuntimeError("LIFECYCLE_LOCK_MARKER_CHANGED")
+    marker = adopted.home / HOME_MARKER
+    try:
+        descriptor = os.open(
+            marker, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+    except OSError as error:
+        raise RuntimeError("LIFECYCLE_LOCK_MARKER_CHANGED") from error
+    try:
+        if _marker_identity_from_fd(descriptor) != adopted.marker_identity:
+            raise RuntimeError("LIFECYCLE_LOCK_MARKER_CHANGED")
+    finally:
+        os.close(descriptor)
 
 
 def read_run_state(config: Any) -> dict[str, Any] | None:

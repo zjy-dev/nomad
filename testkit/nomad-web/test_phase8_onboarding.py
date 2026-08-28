@@ -134,6 +134,27 @@ class Phase8OnboardingTests(unittest.TestCase):
         self.assertEqual(contract["installed_runtime_module"], "tools/nomad_web/install_lifecycle.py")
         self.assertFalse(contract["production_ready"])
         self.assertEqual(contract["external_readiness"], "NOT_RUN")
+        manifest = json.loads((repo / "tools" / "nomad_web" / "bundle_manifest.json").read_text())
+        self.assertEqual(
+            manifest["ordinary_user_commands"],
+            [
+                "install", "install-status", "onboarding", "doctor",
+                "start", "status", "stop", "reset-remote-access",
+                "diagnostics", "uninstall",
+            ],
+        )
+        self.assertEqual(manifest["advanced_support_commands"], ["upgrade", "rollback"])
+        self.assertEqual(
+            manifest["internal_release_tools"],
+            ["materialize", "resume-evidence", "verify-release"],
+        )
+        self.assertNotIn("resume-evidence", manifest["ordinary_user_commands"])
+        self.assertFalse(manifest["production_ready"])
+        self.assertEqual(manifest["external_readiness"], "NOT_RUN")
+        self.assertEqual(len(manifest["external_gates"]), 6)
+        self.assertEqual({item["status"] for item in manifest["external_gates"]}, {"NOT_RUN"})
+        self.assertNotIn("pair", manifest["ordinary_user_commands"])
+        self.assertNotIn("revoke", manifest["ordinary_user_commands"])
 
     def test_materialized_bundle_classifies_without_repo_checkout(self) -> None:
         from tools.nomad_web.materialize import materialize

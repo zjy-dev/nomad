@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -73,6 +74,166 @@ PERSISTENT_STATE_NAMES = frozenset(
     for suffix in ("", "-wal", "-shm")
 )
 _DIGEST = re.compile(r"[0-9a-f]{64}")
+STABLE_LAUNCHER_TEMPLATE = '''#!/bin/sh
+set -eu
+BIN=$(CDPATH= cd -- "$(/usr/bin/dirname -- "$0")" && /bin/pwd -P)
+NOMAD_HOME=$(CDPATH= cd -- "$BIN/.." && /bin/pwd -P)
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+unset PYTHONHOME PYTHONPATH PYTHONSAFEPATH PYTHONSTARTUP PYTHONINSPECT PYTHONWARNINGS PYTHONHASHSEED PYTHONPYCACHEPREFIX PYTHONUSERBASE PYTHONEXECUTABLE PYTHONCASEOK PYTHONDONTWRITEBYTECODE PYTHONIOENCODING PYTHONUTF8 PYTHONMALLOC PYTHONTRACEMALLOC PYTHONFAULTHANDLER PYTHONBREAKPOINT PYTHONDEVMODE PYTHONPROFILEIMPORTTIME PYTHONNODEBUGRANGES PYTHONINTMAXSTRDIGITS PYTHONPLATLIBDIR PYTHONCOERCECLOCALE DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_FRAMEWORK_PATH DYLD_FALLBACK_LIBRARY_PATH DYLD_FALLBACK_FRAMEWORK_PATH DYLD_ROOT_PATH DYLD_IMAGE_SUFFIX DYLD_SHARED_REGION DYLD_PRINT_APIS DYLD_PRINT_BINDINGS DYLD_PRINT_DEPENDENTS DYLD_PRINT_ENV DYLD_PRINT_INITIALIZERS DYLD_PRINT_LIBRARIES DYLD_PRINT_LIBRARIES_POST_LAUNCH DYLD_PRINT_OPTS DYLD_PRINT_REBASINGS DYLD_PRINT_RPATHS DYLD_PRINT_SEGMENTS DYLD_PRINT_STATISTICS DYLD_PRINT_STATISTICS_DETAILS DYLD_PRINT_TO_FILE DYLD_USE_CLOSURES NOMAD_WEB_BUNDLE NOMAD_WEB_ALLOW_SOURCE_BUILD NOMAD_ALPHA_RELAY_TOKEN NOMAD_TLS_FDS_V1
+export NOMAD_WEB_HOME="$NOMAD_HOME"
+exec __NOMAD_PYTHON__ -I -B -c '
+import json,os,sys
+bootstrap_errors=frozenset({"INVALID_INSTALL_CURRENT","UNSAFE_HOME_MARKER","UNSAFE_INSTALLED_BUNDLE","INVALID_INSTALLED_BUNDLE","INSTALLED_BUNDLE_DIGEST_MISMATCH","INSTALLED_BUNDLE_FILE_MISMATCH","INSTALLED_BUNDLE_FILE_SET_MISMATCH","UNSAFE_INSTALLED_LAUNCHER_INPUT","INSTALLED_LAUNCHER_INPUT_TOO_LARGE","INVALID_BUNDLE_MANIFEST","NONCANONICAL_BUNDLE_MANIFEST","INVALID_AGENT_RUNTIME","INVALID_BUNDLE_PATH","INVALID_BUNDLE_MODE","BUNDLE_FILE_TOO_LARGE","BUNDLE_FILE_MISMATCH","AGENT_ENTRYPOINT_MISMATCH","BUNDLE_FILE_SET_MISMATCH","GATEWAY_MODULE_ALLOWLIST_MISMATCH","GATEWAY_MODULE_MISSING","GATEWAY_DYNAMIC_IMPORT_FORBIDDEN","GATEWAY_EXTERNAL_DEPENDENCY","INVALID_GATEWAY_MODULE_PATH","GATEWAY_JAVASCRIPT_LEX_ERROR","GATEWAY_IMPORT_SYNTAX","INVALID_GATEWAY_PACKAGE","BUNDLE_DIGEST_MISMATCH","INVALID_BUNDLE_SNAPSHOT","UNSAFE_BUNDLE_FILE","LIFECYCLE_LOCK_HOME_MISMATCH","LIFECYCLE_LOCK_ALREADY_ADOPTED","LIFECYCLE_LOCK_ADOPTION_INVALID","LIFECYCLE_LOCK_MARKER_CHANGED"})
+def bootstrap_excepthook(_type,error,_traceback):
+ try:
+  candidate=error.args[0] if isinstance(error,RuntimeError) and len(error.args)==1 and isinstance(error.args[0],str) else None
+  code=candidate if candidate in bootstrap_errors else "INSTALLED_LAUNCHER_FAILURE"
+  if "--json" in sys.argv[2:]:
+   payload={"schema":"nomad.web-companion.error.v1","state":"BLOCKED","error":code,"production_ready":False}
+   os.write(1,json.dumps(payload,sort_keys=True,separators=(",",":")).encode("utf-8")+b"\\n")
+  else: os.write(2,b"nomad-web: installed launcher failed\\n")
+ except BaseException: pass
+sys.excepthook=bootstrap_excepthook
+import fcntl,hashlib,importlib.abc,importlib.util,re,stat
+from pathlib import Path
+home=Path(sys.argv[1])
+for environment_name in tuple(os.environ):
+ if environment_name.startswith(("PYTHON","DYLD_","NOMAD_")): os.environ.pop(environment_name,None)
+os.environ.update(__PINNED_ENVIRONMENT__)
+os.environ["NOMAD_WEB_HOME"]=str(home)
+digest_pattern=re.compile(r"[0-9a-f]{64}")
+def read(path,limit,mode):
+ fd=os.open(path,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW)
+ try:
+  info=os.fstat(fd)
+  if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != mode: raise RuntimeError("UNSAFE_INSTALLED_LAUNCHER_INPUT")
+  chunks=[]; total=0
+  while True:
+   chunk=os.read(fd,min(1024*1024,limit+1-total))
+   if not chunk: break
+   chunks.append(chunk); total+=len(chunk)
+   if total>limit: raise RuntimeError("INSTALLED_LAUNCHER_INPUT_TOO_LARGE")
+  return b"".join(chunks)
+ finally: os.close(fd)
+def canonical(value): return json.dumps(value,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()
+lock_fd=os.open(home/".nomad-web-home.json",os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW)
+lock_info=os.fstat(lock_fd)
+if not stat.S_ISREG(lock_info.st_mode) or lock_info.st_nlink!=1 or lock_info.st_uid!=os.geteuid() or stat.S_IMODE(lock_info.st_mode)!=0o600: raise RuntimeError("UNSAFE_HOME_MARKER")
+fcntl.flock(lock_fd,fcntl.LOCK_EX)
+raw=read(home/"install/current.json",4*1024*1024,0o600)
+current=json.loads(raw); history=current.get("history") if isinstance(current,dict) else None
+if set(current)!={"schema","bundle_digest","history"} or current["schema"]!="nomad.web-companion.install-current.v1" or digest_pattern.fullmatch(current["bundle_digest"]) is None or not isinstance(history,list) or not history or not isinstance(history[-1],dict) or history[-1].get("to_bundle_digest")!=current["bundle_digest"] or type(history[-1].get("sequence")) is not int or history[-1]["sequence"]!=len(history) or raw!=canonical(current)+b"\\n": raise RuntimeError("INVALID_INSTALL_CURRENT")
+digest=current["bundle_digest"]; root=home/"bundles"/digest
+root_info=root.lstat()
+if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode) or root_info.st_uid!=os.geteuid() or stat.S_IMODE(root_info.st_mode)!=0o755: raise RuntimeError("UNSAFE_INSTALLED_BUNDLE")
+manifest_raw=read(root/"manifest.json",256*1024,0o644); manifest=json.loads(manifest_raw)
+if not isinstance(manifest,dict) or manifest.get("bundle_digest")!=digest or manifest_raw!=canonical(manifest)+b"\\n": raise RuntimeError("INVALID_INSTALLED_BUNDLE")
+core=dict(manifest); core.pop("bundle_digest",None)
+if hashlib.sha256(canonical(core)).hexdigest()!=digest: raise RuntimeError("INSTALLED_BUNDLE_DIGEST_MISMATCH")
+entries=manifest.get("files")
+if not isinstance(entries,list) or not entries: raise RuntimeError("INVALID_INSTALLED_BUNDLE")
+expected={"manifest.json"}; expected_dirs=set(); previous=""; snapshot={"manifest.json":manifest_raw}; modes={"manifest.json":0o644}
+for entry in entries:
+ if not isinstance(entry,dict) or set(entry)!={"path","size_bytes","raw_sha256","mode"}: raise RuntimeError("INVALID_INSTALLED_BUNDLE")
+ name=entry["path"]
+ if not isinstance(name,str) or not name or name<=previous or chr(92) in name: raise RuntimeError("INVALID_INSTALLED_BUNDLE")
+ relative=Path(name)
+ if relative.is_absolute() or any(part in ("",".","..") for part in relative.parts): raise RuntimeError("INVALID_INSTALLED_BUNDLE")
+ mode_text=entry["mode"]
+ if mode_text not in ("0644","0755") or type(entry["size_bytes"]) is not int or entry["size_bytes"]<=0 or not isinstance(entry["raw_sha256"],str) or digest_pattern.fullmatch(entry["raw_sha256"]) is None: raise RuntimeError("INVALID_INSTALLED_BUNDLE")
+ payload=read(root/relative,192*1024*1024,int(mode_text,8))
+ if len(payload)!=entry["size_bytes"] or hashlib.sha256(payload).hexdigest()!=entry["raw_sha256"]: raise RuntimeError("INSTALLED_BUNDLE_FILE_MISMATCH")
+ snapshot[name]=payload; modes[name]=int(mode_text,8)
+ expected.add(name); expected_dirs.update(str(parent) for parent in relative.parents if str(parent)!="."); previous=name
+actual=set(); actual_dirs=set()
+for directory,dirs,files in os.walk(root,topdown=True,followlinks=False):
+ base=Path(directory)
+ for name in dirs:
+  path=base/name; info=path.lstat()
+  if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.geteuid() or stat.S_IMODE(info.st_mode)!=0o755: raise RuntimeError("UNSAFE_INSTALLED_BUNDLE")
+  actual_dirs.add(str(path.relative_to(root)))
+ for name in files: actual.add(str((base/name).relative_to(root)))
+if actual!=expected or actual_dirs!=expected_dirs: raise RuntimeError("INSTALLED_BUNDLE_FILE_SET_MISMATCH")
+class SnapshotLoader(importlib.abc.MetaPathFinder,importlib.abc.Loader):
+ def find_spec(self,fullname,path=None,target=None):
+  if fullname=="nomad_web": entry="lib/nomad_web/__init__.py"; package=True
+  elif fullname.startswith("nomad_web."): entry="lib/"+fullname.replace(".","/")+".py"; package=False
+  else: return None
+  if entry not in snapshot: raise ModuleNotFoundError(fullname)
+  return importlib.util.spec_from_loader(fullname,self,is_package=package)
+ def create_module(self,spec): return None
+ def exec_module(self,module):
+  entry="lib/nomad_web/__init__.py" if module.__name__=="nomad_web" else "lib/"+module.__name__.replace(".","/")+".py"
+  module.__file__=str(root/entry)
+  exec(compile(snapshot[entry],module.__file__,"exec"),module.__dict__,module.__dict__)
+sys.meta_path.insert(0,SnapshotLoader())
+from nomad_web.bundle import verify_bundle_snapshot
+if verify_bundle_snapshot(snapshot,modes,actual_dirs).get("bundle_digest")!=digest: raise RuntimeError("INSTALLED_BUNDLE_DIGEST_MISMATCH")
+from nomad_web import install_lifecycle as install_module
+install_module._validate_current(current)
+from nomad_web import cli as cli_module
+from nomad_web.state import adopt_lifecycle_lock
+with adopt_lifecycle_lock(home,lock_fd): raise SystemExit(cli_module.run(sys.argv[2:]))
+' "$NOMAD_HOME" "$@"
+'''
+
+
+def _stable_launcher_bytes(config: Any | None = None) -> bytes:
+    executable = Path(sys.executable)
+    if not executable.is_absolute():
+        raise RuntimeError("PYTHON_EXECUTABLE_NOT_ABSOLUTE")
+    try:
+        resolved = executable.resolve(strict=True)
+        info = resolved.stat()
+    except OSError as error:
+        raise RuntimeError("PYTHON_EXECUTABLE_UNAVAILABLE") from error
+    if (
+        not stat.S_ISREG(info.st_mode) or info.st_uid not in (0, os.geteuid())
+        or not os.access(resolved, os.X_OK)
+        or bool(stat.S_IMODE(info.st_mode) & 0o022)
+    ):
+        raise RuntimeError("UNSAFE_PYTHON_EXECUTABLE")
+    for ancestor in resolved.parents:
+        try:
+            ancestor_info = ancestor.lstat()
+        except OSError as error:
+            raise RuntimeError("UNSAFE_PYTHON_EXECUTABLE_ANCESTOR") from error
+        if (
+            not stat.S_ISDIR(ancestor_info.st_mode)
+            or stat.S_ISLNK(ancestor_info.st_mode)
+            or ancestor_info.st_uid not in (0, os.geteuid())
+            or bool(stat.S_IMODE(ancestor_info.st_mode) & 0o022)
+        ):
+            raise RuntimeError("UNSAFE_PYTHON_EXECUTABLE_ANCESTOR")
+    defaults = {
+        "NOMAD_WEB_RELAY_PORT": 18089,
+        "NOMAD_WEB_GATEWAY_PORT": 14173,
+        "NOMAD_WEB_AGENT_PORT": 4096,
+        "NOMAD_WEB_JOIN_GATEWAY_PORT": 14174,
+        "NOMAD_WEB_RELAY_HOST_V2_PORT": 18090,
+        "NOMAD_WEB_RELAY_DEVICE_V2_PORT": 18091,
+        "NOMAD_WEB_RELAY_ADMIN_PORT": 18092,
+        "NOMAD_WEB_RELAY_DEVICE_V1_PORT": 18093,
+    }
+    pinned_environment = {
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        **{
+            name: str(getattr(config, name.removeprefix("NOMAD_WEB_").lower(), default))
+            for name, default in defaults.items()
+        },
+    }
+    return (
+        STABLE_LAUNCHER_TEMPLATE
+        .replace("__NOMAD_PYTHON__", shlex.quote(os.fspath(resolved)))
+        .replace(
+            "__PINNED_ENVIRONMENT__",
+            json.dumps(pinned_environment, sort_keys=True, separators=(",", ":")),
+        )
+        .encode("utf-8")
+    )
+
+
 def install(config: Any, bundle: Path | str) -> dict[str, Any]:
     """Install the first verified bundle, or return the identical install."""
     source = Path(bundle).absolute()
@@ -88,9 +249,11 @@ def install(config: Any, bundle: Path | str) -> dict[str, Any]:
             if current["bundle_digest"] != digest:
                 raise RuntimeError("INSTALL_ALREADY_PRESENT_USE_UPGRADE")
             _verify_installed_bundle(home, digest)
+            _publish_stable_launcher(home, config)
             return _with_onboarding(config, _status_unlocked(home, current), None)
 
         _publish_bundle(source, manifest, home)
+        _publish_stable_launcher(home, config)
         record = _current_record(
             digest,
             [_history_entry(1, "install", None, digest, None, None)],
@@ -116,6 +279,7 @@ def upgrade(config: Any, bundle: Path | str) -> dict[str, Any]:
         manifest = verify_bundle(source)
         digest = _manifest_digest(manifest)
         _checkpoint("source_verified")
+        _publish_stable_launcher(home, config)
         if digest == old_digest:
             return _with_onboarding(config, _status_unlocked(home, old), None)
 
@@ -155,6 +319,7 @@ def rollback(config: Any) -> dict[str, Any]:
             raise RuntimeError("INVALID_INSTALL_HISTORY")
         _verify_installed_bundle(home, target_digest)
         _validate_snapshot(home, snapshot_digest)
+        _publish_stable_launcher(home, config)
         history = [*old["history"], _history_entry(
             len(old["history"]) + 1, "rollback",
             old["bundle_digest"], target_digest, snapshot_digest,
@@ -310,6 +475,7 @@ def select_bundle_for_start(config: Any, explicit_bundle: Path | str | None) -> 
         digest,
         [_history_entry(1, "install", None, digest, None, None)],
     )
+    _publish_stable_launcher(home, config)
     _write_current(home, record)
     return (home / "bundles" / digest).resolve(strict=True)
 
@@ -460,6 +626,18 @@ def _ensure_layout(home: Path) -> None:
     _ensure_private_dir(install_root / "staging", install_root)
     _ensure_private_dir(install_root / "snapshots", install_root)
     _ensure_private_dir(home / "bundles", home)
+    _ensure_private_dir(home / "bin", home)
+
+
+def _publish_stable_launcher(home: Path, config: Any) -> None:
+    bin_root = home / "bin"
+    temporary = bin_root / f".nomad-web-{uuid.uuid4().hex}.tmp"
+    _write_new_file(temporary, _stable_launcher_bytes(config), 0o755)
+    try:
+        os.replace(temporary, bin_root / "nomad-web")
+        _fsync_directory(bin_root)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _ensure_private_dir(path: Path, parent: Path) -> Path:

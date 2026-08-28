@@ -4,7 +4,10 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from collections.abc import Callable
 from pathlib import Path
@@ -12,6 +15,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from tools.nomad_web import install_lifecycle as lifecycle
+from tools.nomad_web import state
 
 
 def canonical(value: object) -> bytes:
@@ -25,8 +29,8 @@ class InstallLifecycleTests(unittest.TestCase):
         self.config = SimpleNamespace(home=self.root / "home")
         self.bundles = self.root / "sources"
         self.bundles.mkdir(mode=0o700)
-        self.v1 = self.make_bundle("v1", b"first payload")
-        self.v2 = self.make_bundle("v2", b"second payload")
+        self.v1 = self.make_bundle("v1", b"#!/bin/sh\nprintf 'v1:%s\n' \"$*\"\n")
+        self.v2 = self.make_bundle("v2", b"#!/bin/sh\nprintf 'v2:%s\n' \"$*\"\n")
         self.verifier = mock.patch.object(lifecycle, "verify_bundle", side_effect=self.verify_bundle)
         self.verifier.start()
 
@@ -37,24 +41,72 @@ class InstallLifecycleTests(unittest.TestCase):
     def make_bundle(self, name: str, payload: bytes) -> Path:
         root = self.bundles / name
         (root / "bin").mkdir(parents=True, mode=0o755)
+        package = root / "lib" / "nomad_web"
+        package.mkdir(parents=True, mode=0o755)
         executable = root / "bin" / "nomad-web"
         executable.write_bytes(payload)
         os.chmod(executable, 0o755)
         readme = root / "README.txt"
         readme.write_bytes(name.encode())
         os.chmod(readme, 0o644)
+        (package / "__init__.py").write_text("# test package\n")
+        (package / "bundle.py").write_text(
+            "import json,sys\n"
+            "def verify_bundle(root):\n"
+            " raise AssertionError('installed launcher reread bundle path')\n"
+            "def verify_bundle_snapshot(files,modes,directories):\n"
+            " if 'bootstrap-failure' in sys.argv: raise ValueError('/secret/bootstrap/path')\n"
+            " assert set(files)==set(modes)\n"
+            " assert modes['manifest.json']==0o644\n"
+            " return json.loads(files['manifest.json'])\n"
+        )
+        (package / "install_lifecycle.py").write_text(
+            "def _validate_current(value):\n"
+            " assert value['history'][-1]['to_bundle_digest'] == value['bundle_digest']\n"
+        )
+        (package / "state.py").write_text(
+            "from contextlib import contextmanager\n"
+            "@contextmanager\n"
+            "def adopt_lifecycle_lock(home, descriptor):\n"
+            " yield\n"
+        )
+        (package / "cli.py").write_text(
+            "from pathlib import Path\n"
+            "import time\n"
+            "def run(args):\n"
+            " version=(Path(__file__).parents[2]/'README.txt').read_text()\n"
+            " if args and args[0]=='hold':\n"
+            "  Path(args[1]).write_text('ready')\n"
+            "  while not Path(args[2]).exists(): time.sleep(0.01)\n"
+            " print(f\"{version}:{' '.join(args)}\")\n"
+            " return 0\n"
+        )
+        os.chmod(package / "__init__.py", 0o644)
+        os.chmod(package / "bundle.py", 0o644)
+        os.chmod(package / "cli.py", 0o644)
+        os.chmod(package / "install_lifecycle.py", 0o644)
+        os.chmod(package / "state.py", 0o644)
         entries = []
-        for relative, mode in (("README.txt", 0o644), ("bin/nomad-web", 0o755)):
+        for relative, mode in (
+            ("README.txt", 0o644), ("bin/nomad-web", 0o755),
+            ("lib/nomad_web/__init__.py", 0o644),
+            ("lib/nomad_web/bundle.py", 0o644),
+            ("lib/nomad_web/cli.py", 0o644),
+            ("lib/nomad_web/install_lifecycle.py", 0o644),
+            ("lib/nomad_web/state.py", 0o644),
+        ):
             raw = (root / relative).read_bytes()
             entries.append({
                 "path": relative, "size_bytes": len(raw),
                 "raw_sha256": hashlib.sha256(raw).hexdigest(), "mode": f"{mode:04o}",
             })
-        digest = hashlib.sha256(canonical({"name": name, "files": entries})).hexdigest()
+        digest = hashlib.sha256(canonical({"files": entries})).hexdigest()
         manifest = {"bundle_digest": digest, "files": entries}
         (root / lifecycle.MANIFEST).write_bytes(canonical(manifest) + b"\n")
         os.chmod(root / lifecycle.MANIFEST, 0o644)
         os.chmod(root / "bin", 0o755)
+        os.chmod(root / "lib" / "nomad_web", 0o755)
+        os.chmod(root / "lib", 0o755)
         os.chmod(root, 0o755)
         return root
 
@@ -126,12 +178,216 @@ class InstallLifecycleTests(unittest.TestCase):
         self.assertFalse(first["onboarding"]["production_ready"])
         self.assertEqual(len(first["history"]), 1)
         target = self.config.home / "bundles" / self.digest(self.v1)
-        self.assertEqual((target / "bin" / "nomad-web").read_bytes(), b"first payload")
+        self.assertEqual((target / "bin" / "nomad-web").read_bytes(), self.v1.joinpath("bin/nomad-web").read_bytes())
         self.assertEqual(
             {str(path.relative_to(target)) for path in target.rglob("*") if path.is_file()},
-            {"README.txt", "bin/nomad-web", "manifest.json"},
+            {
+                "README.txt", "bin/nomad-web", "manifest.json",
+                "lib/nomad_web/__init__.py", "lib/nomad_web/bundle.py",
+                "lib/nomad_web/cli.py",
+                "lib/nomad_web/install_lifecycle.py",
+                "lib/nomad_web/state.py",
+            },
         )
         self.assertFalse((self.config.home / "install" / "current.json").is_symlink())
+        stable = self.config.home / "bin" / "nomad-web"
+        self.assertTrue(stable.is_file())
+        self.assertFalse(stable.is_symlink())
+        self.assertEqual(stat.S_IMODE(stable.stat().st_mode), 0o755)
+        self.assertEqual(stable.read_bytes(), lifecycle._stable_launcher_bytes())
+
+    def test_stable_launcher_uses_current_without_sources_and_ignores_python_injection(self) -> None:
+        self.install()
+        stable = self.config.home / "bin" / "nomad-web"
+        hostile = self.root / "hostile"
+        (hostile / "nomad_web").mkdir(parents=True)
+        (hostile / "nomad_web" / "__main__.py").write_text("raise SystemExit(77)\n")
+        removed_v1 = self.root / "removed-v1-source"
+        self.v1.rename(removed_v1)
+        environment = {
+            "PATH": str(hostile),
+            "LANG": "C", "LC_ALL": "C",
+            "NOMAD_WEB_HOME": str(self.root / "wrong-home"),
+            "NOMAD_WEB_BUNDLE": str(removed_v1),
+            "PYTHONPATH": str(hostile),
+            "PYTHONHOME": str(hostile / "missing"),
+        }
+        python_canary = hostile / "python3"
+        python_canary.write_text(
+            "#!/bin/sh\nprintf 'hostile-python-executed\\n' >&2\nexit 91\n"
+        )
+        os.chmod(python_canary, 0o755)
+
+        first = subprocess.run(
+            [str(stable), "alpha", "beta"], cwd=hostile, env=environment,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+        )
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertEqual(first.stdout, "v1:alpha beta\n")
+        self.assertNotIn("hostile-python-executed", first.stderr)
+
+        lifecycle.upgrade(self.config, self.v2)
+        removed_v2 = self.root / "removed-v2-source"
+        self.v2.rename(removed_v2)
+        second = subprocess.run(
+            [str(stable), "gamma"], cwd=hostile, env=environment,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+        )
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertEqual(second.stdout, "v2:gamma\n")
+
+        lifecycle.rollback(self.config)
+        rolled_back = subprocess.run(
+            [str(stable), "delta"], cwd=hostile, env=environment,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+        )
+        self.assertEqual(rolled_back.returncode, 0, rolled_back.stdout + rolled_back.stderr)
+        self.assertEqual(rolled_back.stdout, "v1:delta\n")
+
+    def test_stable_launcher_fails_closed_on_installed_bundle_tamper(self) -> None:
+        self.install()
+        stable = self.config.home / "bin" / "nomad-web"
+        target = self.config.home / "bundles" / self.digest(self.v1) / "README.txt"
+        target.write_bytes(b"tampered")
+        result = subprocess.run(
+            [str(stable), "--json", "status"],
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C", "LC_ALL": "C"},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(json.loads(result.stdout), {
+            "schema": "nomad.web-companion.error.v1",
+            "state": "BLOCKED",
+            "error": "INSTALLED_BUNDLE_FILE_MISMATCH",
+            "production_ready": False,
+        })
+        self.assertNotIn(str(self.config.home), result.stdout)
+
+    def test_stable_launcher_redacts_unexpected_bootstrap_failure(self) -> None:
+        self.install()
+        stable = self.config.home / "bin" / "nomad-web"
+        environment = {
+            "PATH": "/hostile", "LANG": "C", "LC_ALL": "C",
+        }
+        json_result = subprocess.run(
+            [str(stable), "--json", "bootstrap-failure"], env=environment,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+        )
+        self.assertEqual(json_result.returncode, 1)
+        self.assertEqual(json_result.stderr, "")
+        self.assertEqual(json.loads(json_result.stdout), {
+            "schema": "nomad.web-companion.error.v1",
+            "state": "BLOCKED",
+            "error": "INSTALLED_LAUNCHER_FAILURE",
+            "production_ready": False,
+        })
+        self.assertNotIn("/secret/bootstrap/path", json_result.stdout)
+        self.assertNotIn(str(self.config.home), json_result.stdout)
+
+        human = subprocess.run(
+            [str(stable), "bootstrap-failure"], env=environment,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+        )
+        self.assertEqual(human.returncode, 1)
+        self.assertEqual(human.stdout, "")
+        self.assertEqual(human.stderr, "nomad-web: installed launcher failed\n")
+        self.assertNotIn("/secret/bootstrap/path", human.stderr)
+
+    def test_stable_launcher_holds_lifecycle_lock_through_snapshot_cli_run(self) -> None:
+        self.install()
+        stable = self.config.home / "bin" / "nomad-web"
+        ready = self.root / "launcher-ready"
+        release = self.root / "launcher-release"
+        child = subprocess.Popen(
+            [str(stable), "hold", str(ready), str(release)],
+            env={"PATH": "/hostile", "LANG": "C", "LC_ALL": "C"},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        deadline = time.monotonic() + 10
+        while not ready.exists() and child.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not ready.exists():
+            child.terminate()
+            stdout, stderr = child.communicate(timeout=5)
+            self.fail(stdout + stderr)
+
+        completed = threading.Event()
+        failures: list[BaseException] = []
+
+        def upgrade() -> None:
+            try:
+                lifecycle.upgrade(self.config, self.v2)
+            except BaseException as error:
+                failures.append(error)
+            finally:
+                completed.set()
+
+        worker = threading.Thread(target=upgrade, daemon=True)
+        worker.start()
+        self.assertFalse(completed.wait(0.2))
+        self.assertEqual(
+            json.loads((self.config.home / "install" / "current.json").read_bytes())["bundle_digest"],
+            self.digest(self.v1),
+        )
+        release.write_text("release")
+        stdout, stderr = child.communicate(timeout=10)
+        self.assertEqual(child.returncode, 0, stdout + stderr)
+        worker.join(timeout=10)
+        self.assertTrue(completed.is_set())
+        self.assertEqual(failures, [])
+        self.assertTrue(stdout.startswith("v1:hold "))
+        self.assertEqual(lifecycle.status(self.config)["current_bundle_digest"], self.digest(self.v2))
+
+    def test_stable_launcher_publish_failure_does_not_commit_selector(self) -> None:
+        real_replace = lifecycle.os.replace
+
+        def fail_launcher_once(source: Path, target: Path) -> None:
+            if Path(target) == self.config.home / "bin" / "nomad-web":
+                raise OSError(5, "injected stable launcher failure")
+            real_replace(source, target)
+
+        with mock.patch.object(lifecycle.os, "replace", side_effect=fail_launcher_once):
+            with self.assertRaises(OSError):
+                self.install()
+        self.assertEqual(lifecycle.status(self.config)["state"], "NOT_INSTALLED")
+        self.assertFalse((self.config.home / "bin" / "nomad-web").exists())
+        repaired = self.install()
+        self.assertEqual(repaired["current_bundle_digest"], self.digest(self.v1))
+        self.assertEqual(
+            (self.config.home / "bin" / "nomad-web").read_bytes(),
+            lifecycle._stable_launcher_bytes(),
+        )
+
+    def test_first_selector_failure_leaves_only_inert_launcher(self) -> None:
+        real_replace = lifecycle.os.replace
+
+        def fail_current(source: Path, target: Path) -> None:
+            if Path(target) == self.config.home / "install" / "current.json":
+                raise OSError(5, "injected selector failure")
+            real_replace(source, target)
+
+        with mock.patch.object(lifecycle.os, "replace", side_effect=fail_current):
+            with self.assertRaises(OSError):
+                self.install()
+        self.assertEqual(lifecycle.status(self.config)["state"], "NOT_INSTALLED")
+        stable = self.config.home / "bin" / "nomad-web"
+        self.assertTrue(stable.is_file())
+        result = subprocess.run(
+            [str(stable), "--json", "status"],
+            env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(json.loads(result.stdout), {
+            "schema": "nomad.web-companion.error.v1",
+            "state": "BLOCKED",
+            "error": "INSTALLED_LAUNCHER_FAILURE",
+            "production_ready": False,
+        })
+        self.assertNotIn(str(self.config.home), result.stdout)
+        self.assertNotIn("install/current.json", result.stdout)
 
     def test_install_rejects_tamper_symlink_hardlink_and_extra_file(self) -> None:
         cases: list[tuple[str, Callable[[Path], object]]] = []
@@ -366,6 +622,30 @@ class InstallLifecycleTests(unittest.TestCase):
                 observed = lifecycle.status_unlocked(self.config)
         self.assertEqual(observed["state"], "INSTALLED")
         self.assertEqual(observed["current_bundle_digest"], self.digest(self.v1))
+
+    def test_adopted_lifecycle_lock_reenters_and_rejects_marker_replacement(self) -> None:
+        self.install()
+        marker = self.config.home / state.HOME_MARKER
+        descriptor = os.open(
+            marker, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        try:
+            import fcntl
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            with state.adopt_lifecycle_lock(self.config.home, descriptor):
+                with lifecycle.lifecycle_lock(self.config, create=False) as owned:
+                    self.assertTrue(owned)
+                raw = marker.read_bytes()
+                marker.unlink()
+                marker.write_bytes(raw)
+                os.chmod(marker, 0o600)
+                with self.assertRaisesRegex(
+                    RuntimeError, "LIFECYCLE_LOCK_MARKER_CHANGED",
+                ):
+                    with lifecycle.lifecycle_lock(self.config, create=False):
+                        pass
+        finally:
+            os.close(descriptor)
 
 
 if __name__ == "__main__":

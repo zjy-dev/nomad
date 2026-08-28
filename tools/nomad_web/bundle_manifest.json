@@ -29,6 +29,30 @@
     "production_ready": false,
     "external_readiness": "NOT_RUN"
   },
+  "ordinary_user_commands": [
+    "install",
+    "install-status",
+    "onboarding",
+    "doctor",
+    "start",
+    "status",
+    "stop",
+    "reset-remote-access",
+    "diagnostics",
+    "uninstall"
+  ],
+  "advanced_support_commands": ["upgrade", "rollback"],
+  "internal_release_tools": ["materialize", "resume-evidence", "verify-release"],
+  "production_ready": false,
+  "external_readiness": "NOT_RUN",
+  "external_gates": [
+    {"code": "PROVIDER_E3_EVIDENCE_NOT_RUN", "status": "NOT_RUN"},
+    {"code": "PHYSICAL_PHONE_SAFARI_NOT_RUN", "status": "NOT_RUN"},
+    {"code": "CLEAN_MACHINE_INSTALL_NOT_RUN", "status": "NOT_RUN"},
+    {"code": "DEVELOPER_ID_SIGNING_NOT_RUN", "status": "NOT_RUN"},
+    {"code": "APPLE_NOTARIZATION_NOT_RUN", "status": "NOT_RUN"},
+    {"code": "PUBLICATION_PROVENANCE_NOT_RUN", "status": "NOT_RUN"}
+  ],
   "required_environment_names": ["NOMAD_WEB_HOME"],
   "optional_provider_environment_names": ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY", "OPENROUTER_API_KEY", "DEEPSEEK_API_KEY"],
   "default_loopback_ports": {"relay": 18089, "gateway": 14173},

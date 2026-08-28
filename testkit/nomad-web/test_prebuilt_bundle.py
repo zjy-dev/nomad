@@ -183,14 +183,52 @@ class PrebuiltBundleTests(unittest.TestCase):
         self.assertEqual(set(doctor["tools"]), {"python3", "node"})
         _, started = self.call("start")
         self.assertEqual(started["state"], "RUNNING")
+        stable = self.home / "bin" / "nomad-web"
+        self.assertTrue(stable.is_file())
+        self.assertFalse(stable.is_symlink())
+        hostile = Path(self.case.name) / "installed-hostile"
+        (hostile / "nomad_web").mkdir(parents=True)
+        (hostile / "nomad_web" / "__main__.py").write_text("raise SystemExit(77)\n")
+        previous_pythonpath = self.env.get("PYTHONPATH")
+        previous_pythonhome = self.env.get("PYTHONHOME")
+        previous_bundle = self.env["NOMAD_WEB_BUNDLE"]
+        self.env.update({
+            "PYTHONPATH": str(hostile),
+            "PYTHONHOME": str(hostile / "missing"),
+            "NOMAD_WEB_BUNDLE": str(hostile / "missing-bundle"),
+        })
+        try:
+            installed_status = self.run_cli(
+                [str(stable), "--json", "status"], timeout=60,
+            )
+        finally:
+            self.env["NOMAD_WEB_BUNDLE"] = previous_bundle
+            if previous_pythonpath is None:
+                self.env.pop("PYTHONPATH", None)
+            else:
+                self.env["PYTHONPATH"] = previous_pythonpath
+            if previous_pythonhome is None:
+                self.env.pop("PYTHONHOME", None)
+            else:
+                self.env["PYTHONHOME"] = previous_pythonhome
+        self.assertEqual(
+            installed_status.returncode, 0,
+            installed_status.stdout + installed_status.stderr,
+        )
+        self.assertEqual(json.loads(installed_status.stdout)["state"], "RUNNING")
         try:
             urllib.request.urlopen(started["web_url"] + "api/alpha/session", timeout=5)
             self.fail("no Agent should produce unavailable")
         except urllib.error.HTTPError as error:
             with error:
                 self.assertEqual(error.code, 503)
-        self.call("stop")
-        self.call("uninstall")
+        stopped = self.run_cli([str(stable), "--json", "stop"], timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        result = self.run_cli(
+            [str(stable), "--json", "uninstall", "--confirm"],
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_v2_manifest_has_ingress_and_exact_gateway_module_closure(self) -> None:
         from tools.nomad_web.bundle import (
@@ -210,10 +248,21 @@ class PrebuiltBundleTests(unittest.TestCase):
         self.assertEqual(entries["gateway/pairing-session.mjs"]["mode"], "0644")
         self.assertEqual(REQUIRED["bin/nomad-ingress"], 0o755)
         self.assertTrue(REQUIRED_PACKAGE.issubset(entries))
-        self.assertTrue(REQUIRED_RUNNER_CLOSURE.issubset(entries))
+        self.assertIn("lib/nomad_web/diagnostics.py", entries)
+        self.assertIn("lib/nomad_web/recovery.py", entries)
+        self.assertEqual(
+            {name for name in entries if name.startswith("testkit/")},
+            REQUIRED_RUNNER_CLOSURE,
+        )
         self.assertTrue(
             all(entries[name]["mode"] == "0644" for name in REQUIRED_RUNNER_CLOSURE)
         )
+        from tools.nomad_web.evidence_resume import _runner_entries
+        self.assertEqual(set(_runner_entries(manifest)), {
+            *REQUIRED_RUNNER_CLOSURE,
+            "lib/nomad_web/__init__.py",
+            "lib/nomad_web/bundle.py",
+        })
         self.assertFalse(any("node_modules" in path.parts for path in self.bundle.rglob("*")))
         loaded = subprocess.run(
             [shutil.which("node"), "--input-type=module", "--eval",
@@ -303,6 +352,41 @@ class PrebuiltBundleTests(unittest.TestCase):
             shutil.copytree(self.bundle, clone)
             os.chmod(clone, 0o777)
             with self.assertRaises(RuntimeError):
+                verify_bundle(clone)
+
+    def test_exact_package_allowlist_rejects_omitted_support_module(self) -> None:
+        from tools.nomad_web.bundle import verify_bundle
+
+        with tempfile.TemporaryDirectory() as temporary:
+            clone = Path(temporary) / "bundle"
+            shutil.copytree(self.bundle, clone)
+            missing = clone / "lib" / "nomad_web" / "diagnostics.py"
+            missing.unlink()
+            manifest_path = clone / "manifest.json"
+            value = json.loads(manifest_path.read_text())
+            value["files"] = [
+                item for item in value["files"]
+                if item["path"] != "lib/nomad_web/diagnostics.py"
+            ]
+            core = {key: item for key, item in value.items() if key != "bundle_digest"}
+            value["bundle_digest"] = hashlib.sha256(
+                json.dumps(
+                    core, sort_keys=True, separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode()
+            ).hexdigest()
+            manifest_path.write_text(
+                json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+            )
+            with self.assertRaisesRegex(RuntimeError, "BUNDLE_FILE_SET_MISMATCH"):
+                verify_bundle(clone)
+        with tempfile.TemporaryDirectory() as temporary:
+            clone = Path(temporary) / "bundle"
+            shutil.copytree(self.bundle, clone)
+            extra = clone / "testkit" / "remote-v2" / "unexpected_runner.py"
+            extra.write_text("raise SystemExit(1)\n")
+            os.chmod(extra, 0o644)
+            with self.assertRaisesRegex(RuntimeError, "BUNDLE_FILE_SET_MISMATCH"):
                 verify_bundle(clone)
         with tempfile.TemporaryDirectory() as temporary:
             clone = Path(temporary) / "bundle"

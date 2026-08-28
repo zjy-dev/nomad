@@ -59,9 +59,9 @@ class NomadWebCleanHomeTests(unittest.TestCase):
                 processes.stop(item)
         self.temp.cleanup()
 
-    def run_cli(self, command: str, check: bool = True) -> tuple[int, dict]:
+    def run_cli(self, command: str, *arguments: str, check: bool = True) -> tuple[int, dict]:
         result = subprocess.run(
-            [sys.executable, "-m", "tools.nomad_web", "--json", command],
+            [sys.executable, "-m", "tools.nomad_web", "--json", command, *arguments],
             cwd=self.repo, env=self.env, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=240,
         )
@@ -103,7 +103,7 @@ class NomadWebCleanHomeTests(unittest.TestCase):
         self.assertEqual(stopped["state"], "STOPPED")
         _, stopped_again = self.run_cli("stop")
         self.assertEqual(stopped_again["state"], "STOPPED")
-        _, removed = self.run_cli("uninstall")
+        _, removed = self.run_cli("uninstall", "--confirm")
         self.assertEqual(removed["state"], "UNINSTALLED")
         self.assertFalse(self.home.exists())
 
@@ -111,7 +111,7 @@ class NomadWebCleanHomeTests(unittest.TestCase):
         self.home.mkdir(parents=True)
         sentinel = self.home / "keep.txt"
         sentinel.write_text("user data", encoding="utf-8")
-        code, result = self.run_cli("uninstall", check=False)
+        code, result = self.run_cli("uninstall", "--confirm", check=False)
         self.assertEqual(code, 1)
         self.assertIn(result["error"], {"UNOWNED_NOMAD_WEB_HOME", "UNSAFE_NOMAD_WEB_HOME"})
         self.assertEqual(sentinel.read_text(encoding="utf-8"), "user data")
@@ -131,7 +131,7 @@ class NomadWebCleanHomeTests(unittest.TestCase):
             wal = Path(str(registry_path) + "-wal")
             wal.write_text("unsafe")
             os.chmod(wal, 0o644)
-        code, payload = self.run_cli("uninstall", check=False)
+        code, payload = self.run_cli("uninstall", "--confirm", check=False)
         self.assertEqual(code, 1)
         self.assertEqual(payload["error"], "UNSAFE_DEVICE_REGISTRY")
         self.assertTrue(registry_path.exists())
