@@ -1,0 +1,11 @@
+{
+  "iteration": 7,
+  "milestone": "P7-E release trust scaffold",
+  "status": "NOT_RUN",
+  "code": "PRODUCTION_RELEASE_TRUST_NOT_RUN",
+  "mechanical_checks_passed": true,
+  "production_ready": false,
+  "scope": "canonical provenance, signing, notarization, distribution and publication/download digest verification",
+  "blocked_or_not_run": ["Developer ID credentials", "real notarization ticket and staple", "real publication/download"],
+  "fixture_policy": "fixtures prove mechanical validation only; no fixture can produce PASS or successful release-verifier exit semantics"
+}
