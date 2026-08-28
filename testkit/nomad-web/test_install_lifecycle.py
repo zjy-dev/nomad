@@ -353,6 +353,14 @@ class InstallLifecycleTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "EXPLICIT_BUNDLE_CURRENT_CONFLICT"):
                 lifecycle.select_bundle_for_start(self.config, self.v2)
 
+    def test_status_unlocked_reads_current_without_relocking_marker(self) -> None:
+        self.install()
+        with lifecycle.lifecycle_lock(self.config, create=True):
+            with mock.patch.object(lifecycle, "lifecycle_lock", side_effect=AssertionError("unexpected re-lock")):
+                observed = lifecycle.status_unlocked(self.config)
+        self.assertEqual(observed["state"], "INSTALLED")
+        self.assertEqual(observed["current_bundle_digest"], self.digest(self.v1))
+
 
 if __name__ == "__main__":
     unittest.main()

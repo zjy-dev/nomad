@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import signal
 import shutil
 import socket
 import subprocess
@@ -129,10 +130,9 @@ class PrebuiltBundleTests(unittest.TestCase):
         self.case.cleanup()
 
     def call(self, command: str, check: bool = True) -> tuple[int, dict]:
-        result = subprocess.run(
+        result = self.run_cli(
             [str(self.bundle / "bin" / "nomad-web"), "--json", command],
-            cwd=self.case.name, env=self.env, stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60,
+            timeout=60,
         )
         if check:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -140,7 +140,7 @@ class PrebuiltBundleTests(unittest.TestCase):
         return result.returncode, json.loads(lines[-1]) if lines else {}
 
     def call_agent_start(self, workspace: Path, secret: str) -> tuple[int, dict]:
-        result = subprocess.run(
+        result = self.run_cli(
             [
                 str(self.bundle / "bin" / "nomad-web"),
                 "--json",
@@ -151,16 +151,30 @@ class PrebuiltBundleTests(unittest.TestCase):
                 "--workspace",
                 str(workspace),
             ],
-            cwd=self.case.name,
-            env=self.env,
             input=secret,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
             timeout=90,
         )
         lines = result.stdout.splitlines()
         return result.returncode, json.loads(lines[-1]) if lines else {}
+
+    def run_cli(self, argv: list[str], *, input: str | None = None, timeout: int) -> subprocess.CompletedProcess[str]:
+        process = subprocess.Popen(
+            argv,
+            cwd=self.case.name,
+            env=self.env,
+            stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = process.communicate(input=input, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            stdout, stderr = process.communicate()
+            raise
+        return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
 
     def test_prebuilt_runtime_needs_no_build_toolchain(self) -> None:
         code, doctor = self.call("doctor", check=False)
@@ -419,9 +433,57 @@ class PrebuiltBundleTests(unittest.TestCase):
         self.assertNotIn(canary.encode(), surface)
         self.assertNotIn(b"ses_", surface)
         self.assertRegex(started["session_alias"], r"^sess-[0-9a-f]{32}$")
+        self.assertEqual(
+            set(started["identity"]),
+            {"installed", "running", "host_public_commitment", "paired_device"},
+        )
+        self.assertEqual(started["identity"]["installed"]["availability"], "READY")
+        self.assertEqual(
+            started["identity"]["installed"]["bundle_digest"],
+            started["bundle_digest"],
+        )
+        self.assertGreater(started["identity"]["installed"]["install_sequence"], 0)
+        self.assertRegex(
+            started["identity"]["installed"]["install_identity"],
+            r"^[0-9a-f]{64}$",
+        )
+        self.assertEqual(started["identity"]["running"]["availability"], "READY")
+        self.assertEqual(
+            started["identity"]["running"]["bundle_digest"],
+            started["bundle_digest"],
+        )
+        self.assertEqual(
+            started["identity"]["running"]["run_id"],
+            started["run_id"],
+        )
+        self.assertRegex(
+            started["identity"]["running"]["process_commitment"],
+            r"^[0-9a-f]{64}$",
+        )
+        self.assertRegex(
+            started["identity"]["running"]["socket_commitment"],
+            r"^[0-9a-f]{64}$",
+        )
+        self.assertRegex(
+            started["identity"]["running"]["run_identity"],
+            r"^[0-9a-f]{64}$",
+        )
+        self.assertEqual(
+            started["identity"]["host_public_commitment"],
+            {"availability": "UNAVAILABLE", "commitment": None},
+        )
+        self.assertEqual(
+            started["identity"]["paired_device"],
+            {
+                "availability": "UNPAIRED",
+                "device_key_commitment": None,
+                "pairing_epoch": None,
+            },
+        )
         _, status = self.call("status")
         self.assertEqual(status["state"], "RUNNING")
         self.assertTrue(all(item["alive"] for item in status["processes"]))
+        self.assertEqual(status["identity"], started["identity"])
         self.call("stop")
         self.assertTrue(registry_path.parent.is_dir())
         self.assertTrue(registry_path.exists())
@@ -429,6 +491,14 @@ class PrebuiltBundleTests(unittest.TestCase):
         self.assertFalse(command_db.exists())
         code, restarted = self.call_agent_start(workspace, "second-start-canary")
         self.assertEqual(code, 0, restarted); self.assertNotEqual(restarted["run_id"], started["run_id"])
+        self.assertEqual(
+            restarted["identity"]["installed"],
+            started["identity"]["installed"],
+        )
+        self.assertNotEqual(
+            restarted["identity"]["running"]["run_identity"],
+            started["identity"]["running"]["run_identity"],
+        )
         self.assertEqual(registry_path, self.home / launcher.DEVICE_REGISTRY_DIRNAME / launcher.DEVICE_REGISTRY_BASENAME)
         self.call("stop")
 

@@ -142,14 +142,17 @@ def rollback(config: Any) -> dict[str, Any]:
 def status(config: Any) -> dict[str, Any]:
     """Return the verified install selector and digest-only history."""
     with lifecycle_lock(config, create=False) as owned:
-        if not owned:
-            return _empty_status()
-        home = _home(config)
-        validate_home(config)
-        current = _read_current(home)
-        if current is None:
-            return _empty_status()
-        return _status_unlocked(home, current)
+        return status_unlocked(config) if owned else _empty_status()
+
+
+def status_unlocked(config: Any) -> dict[str, Any]:
+    """Return install status while the caller already holds lifecycle_lock()."""
+    home = _home(config)
+    validate_home(config)
+    current = _read_current(home)
+    if current is None:
+        return _empty_status()
+    return _status_unlocked(home, current)
 
 
 def select_bundle_for_start(config: Any, explicit_bundle: Path | str | None) -> Path | None:

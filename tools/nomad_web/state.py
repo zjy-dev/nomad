@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -18,10 +19,15 @@ RUN_KEYS = {
     "schema", "mode", "real_agent_enabled", "blocked_on",
     "bundle_digest",
     "web_url", "agent_origin", "agent_version", "logs_dir", "relay_port", "gateway_port", "agent_port", "processes",
-    "run_id", "session_alias", "workspace_binding_digest", "product_host_socket_identity",
+    "run_id", "session_alias", "workspace_binding_digest", "product_host_socket_identity", "identity",
 }
 PROCESS_KEYS = {"name", "pid", "process_group", "identity", "log"}
 SOCKET_IDENTITY_KEYS = {"parent_dev", "parent_ino", "parent_uid", "parent_mode", "socket_dev", "socket_ino", "socket_uid", "socket_mode"}
+IDENTITY_KEYS = {"installed", "running", "host_public_commitment", "paired_device"}
+INSTALLED_IDENTITY_KEYS = {"availability", "bundle_digest", "install_sequence", "install_identity"}
+RUNNING_IDENTITY_KEYS = {"availability", "bundle_digest", "run_id", "process_commitment", "socket_commitment", "run_identity"}
+HOST_PUBLIC_COMMITMENT_KEYS = {"availability", "commitment"}
+PAIRED_DEVICE_IDENTITY_KEYS = {"availability", "device_key_commitment", "pairing_epoch"}
 REMOTE_RUN_KEYS = {
     "schema", "mode", "real_agent_enabled", "remote_enabled",
     "bundle_digest",
@@ -33,7 +39,7 @@ REMOTE_RUN_KEYS = {
     "relay_device_v2_port", "relay_admin_port",
     "relay_device_v1_port", "processes", "run_id",
     "session_alias", "workspace_binding_digest",
-    "product_host_socket_identity",
+    "product_host_socket_identity", "identity",
 }
 
 
@@ -266,6 +272,13 @@ def validate_run_state(config: Any, value: Any) -> None:
         log = Path(item["log"]).resolve(strict=False)
         if not log.is_relative_to(home / "logs"):
             raise RuntimeError("INVALID_STATE")
+    _validate_identity(
+        value["identity"],
+        mode=value["mode"],
+        bundle_digest=value["bundle_digest"],
+        run_id=value["run_id"],
+        socket_identity=value["product_host_socket_identity"],
+    )
 
 
 def _config_port(config: Any, name: str) -> int:
@@ -341,3 +354,103 @@ def _validate_remote_run_state(config: Any, value: dict[str, Any]) -> None:
             raise RuntimeError("INVALID_STATE")
         if not Path(item["log"]).resolve(strict=False).is_relative_to(home / "logs"):
             raise RuntimeError("INVALID_STATE")
+    _validate_identity(
+        value["identity"],
+        mode=value["mode"],
+        bundle_digest=value["bundle_digest"],
+        run_id=value["run_id"],
+        socket_identity=value["product_host_socket_identity"],
+    )
+
+
+def _validate_identity(
+    value: Any,
+    *,
+    mode: str,
+    bundle_digest: str | None,
+    run_id: str | None,
+    socket_identity: dict[str, int] | None,
+) -> None:
+    if not isinstance(value, dict) or set(value) != IDENTITY_KEYS:
+        raise RuntimeError("INVALID_STATE")
+
+    installed = value["installed"]
+    if not isinstance(installed, dict) or set(installed) != INSTALLED_IDENTITY_KEYS:
+        raise RuntimeError("INVALID_STATE")
+    if installed["availability"] not in {"READY", "NOT_RUN"}:
+        raise RuntimeError("INVALID_STATE")
+    if installed["availability"] == "READY":
+        if (
+            not _hex64(installed["bundle_digest"])
+            or type(installed["install_sequence"]) is not int
+            or installed["install_sequence"] <= 0
+            or not _hex64(installed["install_identity"])
+        ):
+            raise RuntimeError("INVALID_STATE")
+    elif any(installed[name] is not None for name in ("bundle_digest", "install_sequence", "install_identity")):
+        raise RuntimeError("INVALID_STATE")
+
+    running = value["running"]
+    if not isinstance(running, dict) or set(running) != RUNNING_IDENTITY_KEYS:
+        raise RuntimeError("INVALID_STATE")
+    if running["availability"] not in {"READY", "NOT_RUN"}:
+        raise RuntimeError("INVALID_STATE")
+    if running["availability"] == "READY":
+        if (
+            running["bundle_digest"] != bundle_digest
+            or running["run_id"] != run_id
+            or not _hex64(running["process_commitment"])
+            or not _hex64(running["run_identity"])
+        ):
+            raise RuntimeError("INVALID_STATE")
+        expected_socket = _socket_commitment(socket_identity)
+        if running["socket_commitment"] != expected_socket:
+            raise RuntimeError("INVALID_STATE")
+    elif any(
+        running[name] is not None
+        for name in ("bundle_digest", "run_id", "process_commitment", "socket_commitment", "run_identity")
+    ):
+        raise RuntimeError("INVALID_STATE")
+
+    host = value["host_public_commitment"]
+    if not isinstance(host, dict) or set(host) != HOST_PUBLIC_COMMITMENT_KEYS:
+        raise RuntimeError("INVALID_STATE")
+    if host["availability"] not in {"READY", "UNAVAILABLE", "NOT_RUN"}:
+        raise RuntimeError("INVALID_STATE")
+    if host["availability"] == "READY":
+        if not _hex64(host["commitment"]):
+            raise RuntimeError("INVALID_STATE")
+    elif host["commitment"] is not None:
+        raise RuntimeError("INVALID_STATE")
+    if mode == "foundation-readonly" and host["availability"] != "NOT_RUN":
+        raise RuntimeError("INVALID_STATE")
+    if mode != "foundation-readonly" and host["availability"] == "NOT_RUN":
+        raise RuntimeError("INVALID_STATE")
+
+    paired = value["paired_device"]
+    if not isinstance(paired, dict) or set(paired) != PAIRED_DEVICE_IDENTITY_KEYS:
+        raise RuntimeError("INVALID_STATE")
+    if paired["availability"] not in {"READY", "UNPAIRED", "UNAVAILABLE", "NOT_RUN"}:
+        raise RuntimeError("INVALID_STATE")
+    if paired["availability"] == "READY":
+        if not _hex64(paired["device_key_commitment"]) or type(paired["pairing_epoch"]) is not int or paired["pairing_epoch"] <= 0:
+            raise RuntimeError("INVALID_STATE")
+    elif any(paired[name] is not None for name in ("device_key_commitment", "pairing_epoch")):
+        raise RuntimeError("INVALID_STATE")
+    if mode == "foundation-readonly" and paired["availability"] != "NOT_RUN":
+        raise RuntimeError("INVALID_STATE")
+    if mode != "foundation-readonly" and paired["availability"] == "NOT_RUN":
+        raise RuntimeError("INVALID_STATE")
+
+
+def _hex64(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _socket_commitment(value: dict[str, int] | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != SOCKET_IDENTITY_KEYS:
+        raise RuntimeError("INVALID_STATE")
+    raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
+    return hashlib.sha256(raw).hexdigest()

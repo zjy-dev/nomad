@@ -219,7 +219,7 @@ class M3ELauncherTests(unittest.TestCase):
                 return {"name": "opencode", "pid": pid, "process_group": pid, "identity": f"{pid:064x}", "log": str(log_path), "origin": f"http://127.0.0.1:{port}", "_server_password": "agent-password-canary", "_workspace_binding_digest": "b" * 64}
 
             tls_context = object()
-            with mock.patch.object(launcher, "select_bundle_for_start", return_value=bundle), mock.patch.object(launcher, "_selected_bundle_digest", return_value="9" * 64), mock.patch.object(launcher, "_validate_remote_inputs", return_value=("https://pair.example:8443", "192.0.2.10:8443", [])), mock.patch.object(launcher, "_listen_address_free", return_value=True), mock.patch.object(launcher, "_require_host_identity_ready"), mock.patch.object(launcher, "_tls_probe_context", return_value=tls_context), mock.patch.object(launcher, "_spawn_product_host_with_fds", side_effect=fake_host), mock.patch.object(launcher, "start_agent", side_effect=fake_agent), mock.patch.object(launcher, "_create_run_session", return_value="ses_raw"), mock.patch.object(launcher, "_bootstrap_host", side_effect=fake_bootstrap), mock.patch.object(processes, "spawn", side_effect=fake_spawn), mock.patch.object(launcher, "_wait_relay_role"), mock.patch.object(launcher, "_wait_gateway_route"), mock.patch.object(launcher, "_probe_public_negative_routes") as negative, mock.patch.object(processes, "ownership", return_value="owned"), mock.patch.object(launcher.secrets, "token_bytes", side_effect=lambda _size: next(raw_values)), mock.patch.object(launcher.secrets, "token_urlsafe", return_value="relay-admin-canary-value-0123456789"):
+            with mock.patch.object(launcher, "select_bundle_for_start", return_value=bundle), mock.patch.object(launcher, "_selected_bundle_digest", return_value="9" * 64), mock.patch.object(launcher, "install_status_unlocked", return_value={"state": "INSTALLED", "current_bundle_digest": "9" * 64, "history": [{"sequence": 1}]}), mock.patch.object(launcher, "_validate_remote_inputs", return_value=("https://pair.example:8443", "192.0.2.10:8443", [])), mock.patch.object(launcher, "_listen_address_free", return_value=True), mock.patch.object(launcher, "_require_host_identity_ready"), mock.patch.object(launcher, "_tls_probe_context", return_value=tls_context), mock.patch.object(launcher, "_spawn_product_host_with_fds", side_effect=fake_host), mock.patch.object(launcher, "start_agent", side_effect=fake_agent), mock.patch.object(launcher, "_create_run_session", return_value="ses_raw"), mock.patch.object(launcher, "_bootstrap_host", side_effect=fake_bootstrap), mock.patch.object(processes, "spawn", side_effect=fake_spawn), mock.patch.object(launcher, "_wait_relay_role"), mock.patch.object(launcher, "_wait_gateway_route"), mock.patch.object(launcher, "_probe_public_negative_routes") as negative, mock.patch.object(processes, "ownership", return_value="owned"), mock.patch.object(launcher.secrets, "token_bytes", side_effect=lambda _size: next(raw_values)), mock.patch.object(launcher.secrets, "token_urlsafe", return_value="relay-admin-canary-value-0123456789"):
                 result = launcher._start_remote_unlocked(config, provider_name="OPENAI_API_KEY", credential_fd=credential, workspace=workspace, public_origin="https://pair.example:8443", https_listen="192.0.2.10:8443", tls_cert_fd=cert, tls_key_fd=key)
 
             names = [item["name"] for item in result["processes"]]
@@ -236,10 +236,78 @@ class M3ELauncherTests(unittest.TestCase):
             self.assertEqual(result["schema"], state.REMOTE_STATE_SCHEMA)
             self.assertEqual(result["bundle_digest"], "9" * 64)
             self.assertEqual((result["network_scope"], result["production_external"]), ("lan_direct", False))
+            self.assertEqual(result["identity"]["installed"]["availability"], "READY")
+            self.assertEqual(result["identity"]["running"]["availability"], "READY")
+            self.assertEqual(result["identity"]["host_public_commitment"]["availability"], "UNAVAILABLE")
+            self.assertEqual(result["identity"]["host_public_commitment"]["commitment"], None)
+            self.assertEqual(result["identity"]["paired_device"]["availability"], "UNPAIRED")
             negative.assert_called_once_with("https://pair.example:8443", "192.0.2.10:8443", tls_context)
             surface = (config.home / "run" / "status.json").read_bytes() + json.dumps(calls).encode()
             for secret in (b"c" * 32, b"j" * 32, b"a" * 32, b"t" * 32, b"relay-admin-canary", b"provider-canary", b"cert-canary", b"key-canary", b"agent-password-canary"):
                 self.assertNotIn(secret, surface)
+
+    def test_running_identity_mismatch_blocks_without_silent_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = root / "bundle"
+            bundle.mkdir()
+            config = self.config(root, bundle)
+            state.initialize_home(config)
+            for name in ("bin", "run", "logs"):
+                (config.home / name).mkdir(mode=0o700)
+            running = {
+                "schema": state.STATE_SCHEMA,
+                "mode": "official-agent-local",
+                "real_agent_enabled": True,
+                "bundle_digest": "a" * 64,
+                "blocked_on": ["PRODUCTION_DEVICE_IDENTITY"],
+                "web_url": f"http://127.0.0.1:{config.gateway_port}/",
+                "agent_origin": f"http://127.0.0.1:{config.agent_port}",
+                "agent_version": "1.18.16",
+                "logs_dir": str(config.home / "logs"),
+                "relay_port": config.relay_port,
+                "gateway_port": config.gateway_port,
+                "agent_port": config.agent_port,
+                "run_id": "b" * 64,
+                "session_alias": "sess-" + "c" * 32,
+                "workspace_binding_digest": "d" * 64,
+                "product_host_socket_identity": {
+                    "parent_dev": 1,
+                    "parent_ino": 2,
+                    "parent_uid": os.geteuid(),
+                    "parent_mode": 0o700,
+                    "socket_dev": 3,
+                    "socket_ino": 4,
+                    "socket_uid": os.geteuid(),
+                    "socket_mode": 0o600,
+                },
+                "processes": [
+                    {"name": "opencode", "pid": 101, "process_group": 101, "identity": "1" * 64, "log": str(config.home / "logs" / "agent.log")},
+                    {"name": "product-host", "pid": 102, "process_group": 102, "identity": "2" * 64, "log": str(config.home / "logs" / "host.log")},
+                    {"name": "gateway", "pid": 103, "process_group": 103, "identity": "3" * 64, "log": str(config.home / "logs" / "gateway.log")},
+                ],
+                "identity": {
+                    "installed": {
+                        "availability": "READY",
+                        "bundle_digest": "a" * 64,
+                        "install_sequence": 1,
+                        "install_identity": "4" * 64,
+                    },
+                    "running": {
+                        "availability": "READY",
+                        "bundle_digest": "a" * 64,
+                        "run_id": "b" * 64,
+                        "process_commitment": "5" * 64,
+                        "socket_commitment": "6" * 64,
+                        "run_identity": "7" * 64,
+                    },
+                    "host_public_commitment": {"availability": "UNAVAILABLE", "commitment": None},
+                    "paired_device": {"availability": "UNPAIRED", "device_key_commitment": None, "pairing_epoch": None},
+                },
+            }
+            with mock.patch.object(launcher, "select_bundle_for_start", return_value=bundle), mock.patch.object(launcher, "_selected_bundle_digest", return_value="a" * 64), mock.patch.object(launcher, "read_run_state", return_value=running), mock.patch.object(launcher, "install_status_unlocked", return_value={"state": "INSTALLED", "current_bundle_digest": "a" * 64, "history": [{"sequence": 1}]}), mock.patch.object(launcher, "_validate_device_registry_artifacts"), mock.patch.object(processes, "ownership", return_value="owned"):
+                with self.assertRaisesRegex(RuntimeError, "RUNNING_IDENTITY_MISMATCH"):
+                    launcher._start_unlocked(config, provider_name="OPENAI_API_KEY", credential_fd=9, workspace=root)
 
     def test_remote_rollback_and_stop_are_reverse_dependency_order(self) -> None:
         process_names = ["relay-host", "relay-device", "opencode", "product-host", "desktop-gateway", "join-gateway", "https-ingress"]

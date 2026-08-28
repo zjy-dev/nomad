@@ -13,6 +13,7 @@ import re
 import secrets
 import shutil
 import socket
+import sqlite3
 import ssl
 import stat
 import subprocess
@@ -26,6 +27,7 @@ from typing import Any
 from . import processes
 from .agent_runtime import _validate_credential_source, _verified_workspace, start_agent
 from .bundle import verify_bundle
+from .install_lifecycle import status_unlocked as install_status_unlocked
 from .install_lifecycle import select_bundle_for_start
 from .state import HOME_MARKER, REMOTE_STATE_SCHEMA, STATE_SCHEMA, initialize_home, lifecycle_lock, read_run_state, state_path, validate_home, validate_runtime_dirs, write_run_state
 
@@ -56,6 +58,16 @@ HOST_IDENTITY_RESULTS = {
     "CORRUPT": (1, "HOST_IDENTITY_CORRUPT"),
     "UNAVAILABLE": (1, "HOST_IDENTITY_UNAVAILABLE"),
 }
+PAIRING_DEVICE_REGISTRY_COLUMNS = (
+    "row_id", "device_alias", "principal_alias", "signing_key_digest",
+    "agreement_key_digest", "state", "activated_epoch", "revoked_epoch",
+    "created_at", "updated_at",
+)
+PAIRING_DEVICE_REGISTRY_QUERY = (
+    "SELECT row_id, principal_alias, device_alias, activated_epoch, "
+    "signing_key_digest, agreement_key_digest, state, revoked_epoch "
+    "FROM device_registry WHERE state = 'active' LIMIT 1"
+)
 
 
 class HostIdentityError(RuntimeError):
@@ -86,6 +98,211 @@ def _selected_bundle_digest(config: Any, bundle: Path | None) -> str | None:
     ):
         raise RuntimeError("SELECTED_BUNDLE_BINDING_INVALID")
     return digest
+
+
+def _sha256_json(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
+    ).hexdigest()
+
+
+def _installed_identity(config: Any) -> dict[str, Any]:
+    selected = install_status_unlocked(config)
+    if selected["state"] != "INSTALLED":
+        return {
+            "availability": "NOT_RUN",
+            "bundle_digest": None,
+            "install_sequence": None,
+            "install_identity": None,
+        }
+    history = selected["history"]
+    if (
+        not isinstance(history, list)
+        or not history
+        or not isinstance(history[-1], dict)
+        or type(history[-1].get("sequence")) is not int
+        or history[-1]["sequence"] <= 0
+    ):
+        raise RuntimeError("INSTALL_IDENTITY_INVALID")
+    bundle_digest = selected["current_bundle_digest"]
+    install_sequence = history[-1]["sequence"]
+    return {
+        "availability": "READY",
+        "bundle_digest": bundle_digest,
+        "install_sequence": install_sequence,
+        "install_identity": hashlib.sha256(
+            f"nomad.web.install-identity.v1:{bundle_digest}:{install_sequence}".encode("ascii")
+        ).hexdigest(),
+    }
+
+
+def _running_identity(
+    *,
+    bundle_digest: str | None,
+    run_id: str | None,
+    processes_state: list[dict[str, Any]],
+    socket_identity: dict[str, int] | None,
+) -> dict[str, Any]:
+    if bundle_digest is None or run_id is None:
+        return {
+            "availability": "NOT_RUN",
+            "bundle_digest": None,
+            "run_id": None,
+            "process_commitment": None,
+            "socket_commitment": None,
+            "run_identity": None,
+        }
+    process_projection = [
+        {
+            "name": item["name"],
+            "identity": item["identity"],
+            "process_group": item["process_group"],
+        }
+        for item in processes_state
+    ]
+    process_commitment = _sha256_json(process_projection)
+    socket_commitment = _sha256_json(socket_identity) if socket_identity is not None else None
+    return {
+        "availability": "READY",
+        "bundle_digest": bundle_digest,
+        "run_id": run_id,
+        "process_commitment": process_commitment,
+        "socket_commitment": socket_commitment,
+        "run_identity": hashlib.sha256(
+            json.dumps(
+                {
+                    "bundle_digest": bundle_digest,
+                    "run_id": run_id,
+                    "process_commitment": process_commitment,
+                    "socket_commitment": socket_commitment,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("ascii")
+        ).hexdigest(),
+    }
+
+
+def _host_public_commitment(mode: str) -> dict[str, Any]:
+    if mode == "foundation-readonly":
+        return {"availability": "NOT_RUN", "commitment": None}
+    return {"availability": "UNAVAILABLE", "commitment": None}
+
+
+def _paired_device_identity(home: Path, mode: str) -> dict[str, Any]:
+    if mode == "foundation-readonly":
+        return {
+            "availability": "NOT_RUN",
+            "device_key_commitment": None,
+            "pairing_epoch": None,
+        }
+    path = _device_registry_path(home)
+    _validate_device_registry_artifacts(path, require_main=False)
+    if not path.exists():
+        return {
+            "availability": "UNPAIRED",
+            "device_key_commitment": None,
+            "pairing_epoch": None,
+        }
+    try:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+    except sqlite3.Error as error:
+        raise RuntimeError("PAIRED_DEVICE_IDENTITY_UNAVAILABLE") from error
+    try:
+        columns = tuple(
+            row[1]
+            for row in connection.execute("PRAGMA table_info(device_registry)")
+        )
+        if columns != PAIRING_DEVICE_REGISTRY_COLUMNS:
+            raise RuntimeError("PAIRED_DEVICE_IDENTITY_SCHEMA_MISMATCH")
+        row = connection.execute(PAIRING_DEVICE_REGISTRY_QUERY).fetchone()
+    except RuntimeError:
+        raise
+    except sqlite3.Error as error:
+        raise RuntimeError("PAIRED_DEVICE_IDENTITY_UNAVAILABLE") from error
+    finally:
+        connection.close()
+    if row is None:
+        return {
+            "availability": "UNPAIRED",
+            "device_key_commitment": None,
+            "pairing_epoch": None,
+        }
+    (
+        _row_id,
+        _principal_alias,
+        _device_alias,
+        activated_epoch,
+        signing_key_digest,
+        agreement_key_digest,
+        _state,
+        revoked_epoch,
+    ) = row
+    if (
+        type(activated_epoch) is not int
+        or activated_epoch <= 0
+        or revoked_epoch is not None
+        or not isinstance(signing_key_digest, bytes)
+        or not isinstance(agreement_key_digest, bytes)
+        or len(signing_key_digest) != 32
+        or len(agreement_key_digest) != 32
+    ):
+        raise RuntimeError("PAIRED_DEVICE_IDENTITY_SCHEMA_MISMATCH")
+    device_key_commitment = hashlib.sha256(
+        b"nomad.web.paired-device-commitment.v1\n"
+        + signing_key_digest
+        + agreement_key_digest
+    ).hexdigest()
+    return {
+        "availability": "READY",
+        "device_key_commitment": device_key_commitment,
+        "pairing_epoch": activated_epoch,
+    }
+
+
+def _compose_identity(
+    config: Any,
+    *,
+    mode: str,
+    bundle_digest: str | None,
+    run_id: str | None,
+    processes_state: list[dict[str, Any]],
+    socket_identity: dict[str, int] | None,
+) -> dict[str, Any]:
+    home = Path(_get(config, "home")).resolve()
+    return {
+        "installed": _installed_identity(config),
+        "running": _running_identity(
+            bundle_digest=bundle_digest,
+            run_id=run_id,
+            processes_state=processes_state,
+            socket_identity=socket_identity,
+        ),
+        "host_public_commitment": _host_public_commitment(mode),
+        "paired_device": _paired_device_identity(home, mode),
+    }
+
+
+def _assert_identity_match(
+    config: Any,
+    current: dict[str, Any],
+    *,
+    mode: str,
+    bundle_digest: str | None,
+    run_id: str | None,
+    processes_state: list[dict[str, Any]],
+    socket_identity: dict[str, int] | None,
+) -> None:
+    expected = _compose_identity(
+        config,
+        mode=mode,
+        bundle_digest=bundle_digest,
+        run_id=run_id,
+        processes_state=processes_state,
+        socket_identity=socket_identity,
+    )
+    if current.get("identity") != expected:
+        raise RuntimeError("RUNNING_IDENTITY_MISMATCH")
 
 
 def _run_host_identity_command(binary: Path, arguments: list[str], *, interactive: bool = False) -> str:
@@ -1030,6 +1247,15 @@ def _start_unlocked(
                     pass
             if agent_requested and existing["mode"] != "official-agent-local":
                 raise RuntimeError("MODE_CHANGE_REQUIRES_STOP")
+            _assert_identity_match(
+                config,
+                existing,
+                mode=existing["mode"],
+                bundle_digest=existing["bundle_digest"],
+                run_id=existing["run_id"],
+                processes_state=existing["processes"],
+                socket_identity=existing["product_host_socket_identity"],
+            )
             return _status_unlocked(config)
         for child, is_alive in reversed(list(zip(existing["processes"], lives))):
             if is_alive and not processes.stop(child):
@@ -1185,6 +1411,14 @@ def _start_unlocked(
             "product_host_socket_identity": product_host_socket_identity if agent_enabled else None,
             "processes": children,
         }
+        state["identity"] = _compose_identity(
+            config,
+            mode=state["mode"],
+            bundle_digest=state["bundle_digest"],
+            run_id=state["run_id"],
+            processes_state=state["processes"],
+            socket_identity=state["product_host_socket_identity"],
+        )
         write_run_state(config, state)
         return {**state, "state": "RUNNING"}
     except Exception:
@@ -1223,6 +1457,15 @@ def _start_remote_unlocked(
                 processes.close_fd(descriptor)
             if existing["mode"] != "remote-local-evidence" or existing["pairing_public_origin"] != public_origin:
                 raise RuntimeError("MODE_CHANGE_REQUIRES_STOP")
+            _assert_identity_match(
+                config,
+                existing,
+                mode=existing["mode"],
+                bundle_digest=existing["bundle_digest"],
+                run_id=existing["run_id"],
+                processes_state=existing["processes"],
+                socket_identity=existing["product_host_socket_identity"],
+            )
             return _status_unlocked(config)
         for child, ownership_state in reversed(list(zip(existing["processes"], ownership))):
             if ownership_state == "owned" and not processes.stop(child):
@@ -1440,6 +1683,14 @@ def _start_remote_unlocked(
             "workspace_binding_digest": workspace_digest,
             "product_host_socket_identity": product_host_socket_identity, "processes": children,
         }
+        state["identity"] = _compose_identity(
+            config,
+            mode=state["mode"],
+            bundle_digest=state["bundle_digest"],
+            run_id=state["run_id"],
+            processes_state=state["processes"],
+            socket_identity=state["product_host_socket_identity"],
+        )
         write_run_state(config, state)
         return {**state, "state": "RUNNING"}
     except Exception as primary:
@@ -1514,6 +1765,15 @@ def _status_unlocked(config: Any) -> dict[str, Any]:
     state = read_run_state(config)
     if not state:
         return _stopped()
+    _assert_identity_match(
+        config,
+        state,
+        mode=state["mode"],
+        bundle_digest=state["bundle_digest"],
+        run_id=state["run_id"],
+        processes_state=state["processes"],
+        socket_identity=state["product_host_socket_identity"],
+    )
     process_state = [{"name": item["name"], "pid": item["pid"], "alive": processes.alive(item)} for item in state["processes"]]
     return {**state, "state": "RUNNING" if all(item["alive"] for item in process_state) else "DEGRADED", "processes": process_state}
 
