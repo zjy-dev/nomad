@@ -23,6 +23,19 @@ REQUIRED_SCHEMAS = (
     "commands.schema.json",
     "snapshot.schema.json",
 )
+REQUIRED_SUPPORT_MATRIX_FIELDS = (
+    "schema",
+    "adapter_id",
+    "adapter_version",
+    "supported_versions",
+    "supported_actions",
+    "capability_schema",
+    "capability_issuance",
+    "no_capability",
+    "pending_input",
+    "unsupported",
+    "fail_closed",
+)
 REQUIRED_EVENT_FIELDS = (
     "event_type",
     "session_id",
@@ -105,6 +118,89 @@ def semantic_diff(expected: Any, actual: Any, prefix: str = "$") -> List[str]:
     return differences
 
 
+def validate_adapter_support_matrix(root: Path, findings: List[Finding]) -> None:
+    path = root / "adapter_support_matrix.json"
+    matrix = load_json(path, findings)
+    if not isinstance(matrix, dict):
+        return
+    absent = missing_fields(matrix, REQUIRED_SUPPORT_MATRIX_FIELDS)
+    if absent:
+        findings.append(Finding("E_MATRIX_FIELDS", str(path), f"missing {absent}"))
+        return
+    if matrix["schema"] != "nomad.adapter-support-matrix.v1":
+        findings.append(Finding("E_MATRIX_SCHEMA", str(path), "unexpected schema"))
+    if matrix["adapter_id"] != "opencode":
+        findings.append(Finding("E_MATRIX_ADAPTER", str(path), "only opencode is supported"))
+    if matrix["adapter_version"] != "1.18.16":
+        findings.append(Finding("E_MATRIX_VERSION", str(path), "adapter_version must be exact 1.18.16"))
+    if matrix["supported_versions"] != ["1.18.16"]:
+        findings.append(Finding("E_MATRIX_SUPPORTED_VERSIONS", str(path), "supported_versions must contain only the exact OpenCode version"))
+    if matrix["supported_actions"] != ["view", "reply", "deny", "Stop"]:
+        findings.append(Finding("E_MATRIX_ACTIONS", str(path), "supported_actions must be exactly [view, reply, deny, Stop]"))
+
+    capability = matrix["capability_issuance"]
+    if not isinstance(capability, dict):
+        findings.append(Finding("E_MATRIX_CAPABILITY", str(path), "capability_issuance must be an object"))
+    else:
+        if capability.get("view") is not True:
+            findings.append(Finding("E_MATRIX_CAPABILITY_VIEW", str(path), "view capability must remain true"))
+        if capability.get("reply") != "question_only":
+            findings.append(Finding("E_MATRIX_CAPABILITY_REPLY", str(path), "reply capability must be question_only"))
+        if capability.get("deny") != "permission_only":
+            findings.append(Finding("E_MATRIX_CAPABILITY_DENY", str(path), "deny capability must be permission_only"))
+        if capability.get("stop") != "busy_session_only":
+            findings.append(Finding("E_MATRIX_CAPABILITY_STOP", str(path), "stop capability must be busy_session_only"))
+        if capability.get("allow_once") is not False:
+            findings.append(Finding("E_MATRIX_CAPABILITY_ALLOW_ONCE", str(path), "allow_once must remain false"))
+
+    no_capability = matrix["no_capability"]
+    if not isinstance(no_capability, dict):
+        findings.append(Finding("E_MATRIX_NO_CAPABILITY", str(path), "no_capability must be an object"))
+    else:
+        if no_capability.get("semantics") != "snapshot_with_capability_null":
+            findings.append(Finding("E_MATRIX_NO_CAPABILITY_MODE", str(path), "NoCapability must map to snapshot_with_capability_null"))
+        if no_capability.get("view_retained") is not True:
+            findings.append(Finding("E_MATRIX_NO_CAPABILITY_VIEW", str(path), "NoCapability must retain view"))
+        if no_capability.get("capability_json") != "null":
+            findings.append(Finding("E_MATRIX_NO_CAPABILITY_JSON", str(path), "NoCapability capability_json must be null"))
+
+    pending_input = matrix["pending_input"]
+    if not isinstance(pending_input, dict):
+        findings.append(Finding("E_MATRIX_PENDING_INPUT", str(path), "pending_input must be an object"))
+    else:
+        if pending_input.get("summary_behavior") != "pending_question_summary_only":
+            findings.append(Finding("E_MATRIX_PENDING_SUMMARY", str(path), "pending question summary behavior is incorrect"))
+        if pending_input.get("provider_text_leaks_outside_adapter") is not False:
+            findings.append(Finding("E_MATRIX_PENDING_LEAK", str(path), "provider-specific text must not leak outside adapter"))
+
+    unsupported = matrix["unsupported"]
+    if not isinstance(unsupported, list):
+        findings.append(Finding("E_MATRIX_UNSUPPORTED", str(path), "unsupported must be a list"))
+    else:
+        required = {
+            "allow_once",
+            "provider_passthrough",
+            "non_exact_version",
+            "non_exact_shape",
+            "unmapped_official_lifecycle_to_durable_events",
+            "multiple_simultaneous_targets",
+        }
+        missing = sorted(required - set(unsupported))
+        if missing:
+            findings.append(Finding("E_MATRIX_UNSUPPORTED", str(path), f"missing {missing}"))
+
+    fail_closed = matrix["fail_closed"]
+    if not isinstance(fail_closed, dict):
+        findings.append(Finding("E_MATRIX_FAIL_CLOSED", str(path), "fail_closed must be an object"))
+    else:
+        if fail_closed.get("unsupported_version") != "ERR_INCOMPATIBLE_VERSION":
+            findings.append(Finding("E_MATRIX_FAIL_VERSION", str(path), "unsupported_version must fail closed with ERR_INCOMPATIBLE_VERSION"))
+        if fail_closed.get("unsupported_shape") != "ERR_INCOMPATIBLE_VERSION":
+            findings.append(Finding("E_MATRIX_FAIL_SHAPE", str(path), "unsupported_shape must fail closed with ERR_INCOMPATIBLE_VERSION"))
+        if fail_closed.get("unsupported_action_surface") != "ERR_SAFETY_BLOCKED":
+            findings.append(Finding("E_MATRIX_FAIL_ACTION", str(path), "unsupported action surface must fail closed with ERR_SAFETY_BLOCKED"))
+
+
 def validate_trace(trace_path: Path, snapshot_path: Path, findings: List[Finding]) -> None:
     trace = load_json(trace_path, findings)
     snapshot = load_json(snapshot_path, findings)
@@ -182,6 +278,7 @@ def validate_trace(trace_path: Path, snapshot_path: Path, findings: List[Finding
 
 def validate_contracts(root: Path, actual_snapshots: Optional[Path] = None) -> Dict[str, Any]:
     findings: List[Finding] = []
+    validate_adapter_support_matrix(root, findings)
     schema_dir = root / "schemas"
     trace_dir = root / "traces"
     schemas: Dict[str, Any] = {}
@@ -228,6 +325,7 @@ def validate_contracts(root: Path, actual_snapshots: Optional[Path] = None) -> D
 
     versions = sorted({value.get("version") for value in schemas.values() if value.get("version")})
     capabilities = {
+        "adapter_support_matrix": True,
         "schemas": sorted(schemas),
         "semantic_diff": actual_snapshots is not None,
         "trace_invariants": ["strict_seq", "unique_event_id", "durable_only", "snapshot_cursor"],

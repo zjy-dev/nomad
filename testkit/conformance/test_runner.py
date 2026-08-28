@@ -3,7 +3,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from run import canonical_snapshot_digest, semantic_diff, validate_contracts
+from run import (
+    canonical_snapshot_digest,
+    semantic_diff,
+    validate_adapter_support_matrix,
+    validate_contracts,
+)
 
 
 class ConformanceRunnerTest(unittest.TestCase):
@@ -18,7 +23,7 @@ class ConformanceRunnerTest(unittest.TestCase):
             report = validate_contracts(Path(directory))
         self.assertEqual("FAIL", report["status"])
         missing = [finding for finding in report["findings"] if finding["code"] == "E_MISSING"]
-        self.assertEqual(5, len(missing))
+        self.assertEqual(6, len(missing))
 
     def test_semantic_diff_is_deterministic(self):
         expected = {"b": 2, "a": {"x": [1, 2]}}
@@ -63,6 +68,32 @@ class ConformanceRunnerTest(unittest.TestCase):
         self.assertEqual(digest, canonical_snapshot_digest(reordered))
         reordered["state_summary"]["a"] = "changed"
         self.assertNotEqual(digest, canonical_snapshot_digest(reordered))
+
+    def test_repository_support_matrix_passes(self):
+        root = Path(__file__).resolve().parents[2] / "contracts"
+        findings = []
+        validate_adapter_support_matrix(root, findings)
+        self.assertEqual([], [finding.__dict__ for finding in findings])
+
+    def test_support_matrix_rejects_false_broad_support_claims(self):
+        repo = Path(__file__).resolve().parents[2] / "contracts"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            matrix = json.loads((repo / "adapter_support_matrix.json").read_text())
+            matrix["supported_versions"] = ["1.18.16", "2.0.0"]
+            matrix["supported_actions"] = ["view", "reply", "deny", "Stop", "allow_once"]
+            matrix["no_capability"]["semantics"] = "unavailable"
+            matrix["fail_closed"]["unsupported_action_surface"] = "ERR_INTERNAL"
+            (root / "adapter_support_matrix.json").write_text(
+                json.dumps(matrix, ensure_ascii=False, indent=2)
+            )
+            findings = []
+            validate_adapter_support_matrix(root, findings)
+        codes = {finding.code for finding in findings}
+        self.assertIn("E_MATRIX_SUPPORTED_VERSIONS", codes)
+        self.assertIn("E_MATRIX_ACTIONS", codes)
+        self.assertIn("E_MATRIX_NO_CAPABILITY_MODE", codes)
+        self.assertIn("E_MATRIX_FAIL_ACTION", codes)
 
 
 if __name__ == "__main__":

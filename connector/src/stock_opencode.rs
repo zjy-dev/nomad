@@ -755,9 +755,99 @@ fn validate_answers(answers: &[Vec<String>]) -> Result<(), ConnectorError> {
 }
 
 pub const STOCK_VERSION: &str = "1.18.16";
+const SUPPORT_MATRIX_SCHEMA: &str = "nomad.adapter-support-matrix.v1";
+const SUPPORT_MATRIX_ADAPTER_ID: &str = "opencode";
+const SUPPORT_MATRIX_CAPABILITY_SCHEMA: &str = "nomad.product-host.command-capability.v1";
+const SUPPORT_MATRIX_NO_CAPABILITY: &str = "snapshot_with_capability_null";
+const SUPPORT_MATRIX_PENDING_INPUT: &str = "pending_question_summary_only";
+const SUPPORT_MATRIX_UNSUPPORTED: &[&str] = &[
+    "allow_once",
+    "provider_passthrough",
+    "non_exact_version",
+    "non_exact_shape",
+    "unmapped_official_lifecycle_to_durable_events",
+    "multiple_simultaneous_targets",
+];
 const MAX_COUNT: u64 = 1_000_000;
 const MAX_PENDING: usize = 1000;
 const MAX_ID: usize = 512;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AdapterSupportMatrix {
+    pub schema: &'static str,
+    pub adapter_id: &'static str,
+    pub adapter_version: &'static str,
+    pub supported_versions: [&'static str; 1],
+    pub supported_actions: [&'static str; 4],
+    pub capability_schema: &'static str,
+    pub capability_issuance: CapabilityIssuanceRules,
+    pub no_capability: NoCapabilityRules,
+    pub pending_input: PendingInputRules,
+    pub unsupported: &'static [&'static str],
+    pub fail_closed: FailClosedRules,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CapabilityIssuanceRules {
+    pub view: bool,
+    pub reply: &'static str,
+    pub deny: &'static str,
+    pub stop: &'static str,
+    pub allow_once: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NoCapabilityRules {
+    pub semantics: &'static str,
+    pub view_retained: bool,
+    pub capability_json: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PendingInputRules {
+    pub summary_behavior: &'static str,
+    pub provider_text_leaks_outside_adapter: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FailClosedRules {
+    pub unsupported_version: &'static str,
+    pub unsupported_shape: &'static str,
+    pub unsupported_action_surface: &'static str,
+}
+
+pub fn adapter_support_matrix() -> AdapterSupportMatrix {
+    AdapterSupportMatrix {
+        schema: SUPPORT_MATRIX_SCHEMA,
+        adapter_id: SUPPORT_MATRIX_ADAPTER_ID,
+        adapter_version: STOCK_VERSION,
+        supported_versions: [STOCK_VERSION],
+        supported_actions: ["view", "reply", "deny", "Stop"],
+        capability_schema: SUPPORT_MATRIX_CAPABILITY_SCHEMA,
+        capability_issuance: CapabilityIssuanceRules {
+            view: true,
+            reply: "question_only",
+            deny: "permission_only",
+            stop: "busy_session_only",
+            allow_once: false,
+        },
+        no_capability: NoCapabilityRules {
+            semantics: SUPPORT_MATRIX_NO_CAPABILITY,
+            view_retained: true,
+            capability_json: "null",
+        },
+        pending_input: PendingInputRules {
+            summary_behavior: SUPPORT_MATRIX_PENDING_INPUT,
+            provider_text_leaks_outside_adapter: false,
+        },
+        unsupported: SUPPORT_MATRIX_UNSUPPORTED,
+        fail_closed: FailClosedRules {
+            unsupported_version: "ERR_INCOMPATIBLE_VERSION",
+            unsupported_shape: "ERR_INCOMPATIBLE_VERSION",
+            unsupported_action_surface: "ERR_SAFETY_BLOCKED",
+        },
+    }
+}
 #[derive(Deserialize)]
 struct StockEventEnvelope {
     id: String,
@@ -838,7 +928,7 @@ pub struct StockBlockedCommandResult {
 }
 impl StockCommandBoundary {
     pub fn execute(&self) -> Result<(), ConnectorError> {
-        Err(ConnectorError::Other(format!(
+        Err(ConnectorError::SafetyBlocked(format!(
             "BLOCKED_UNSUPPORTED: {self:?}: request shape is not contract-evidenced"
         )))
     }
@@ -1434,6 +1524,57 @@ mod tests {
             ),
             Err(ConnectorError::StaleRequest(_))
         ));
+    }
+
+    #[test]
+    fn support_matrix_fixture_matches_exact_adapter_contract() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../contracts/adapter_support_matrix.json"))
+                .unwrap();
+        assert_eq!(serde_json::to_value(adapter_support_matrix()).unwrap(), fixture);
+    }
+
+    #[test]
+    fn support_matrix_is_honest_about_exact_subset_and_fail_closed_codes() {
+        let matrix = adapter_support_matrix();
+        assert_eq!(matrix.schema, "nomad.adapter-support-matrix.v1");
+        assert_eq!(matrix.adapter_id, "opencode");
+        assert_eq!(matrix.adapter_version, STOCK_VERSION);
+        assert_eq!(matrix.supported_versions, [STOCK_VERSION]);
+        assert_eq!(matrix.supported_actions, ["view", "reply", "deny", "Stop"]);
+        assert!(matrix.capability_issuance.view);
+        assert_eq!(matrix.capability_issuance.reply, "question_only");
+        assert_eq!(matrix.capability_issuance.deny, "permission_only");
+        assert_eq!(matrix.capability_issuance.stop, "busy_session_only");
+        assert!(!matrix.capability_issuance.allow_once);
+        assert_eq!(matrix.no_capability.semantics, "snapshot_with_capability_null");
+        assert!(matrix.no_capability.view_retained);
+        assert_eq!(matrix.no_capability.capability_json, "null");
+        assert_eq!(matrix.pending_input.summary_behavior, "pending_question_summary_only");
+        assert!(!matrix.pending_input.provider_text_leaks_outside_adapter);
+        assert!(matrix.unsupported.contains(&"allow_once"));
+        assert!(matrix.unsupported.contains(&"provider_passthrough"));
+        assert!(matrix.unsupported.contains(&"non_exact_version"));
+        assert!(matrix.unsupported.contains(&"non_exact_shape"));
+        assert_eq!(matrix.fail_closed.unsupported_version, "ERR_INCOMPATIBLE_VERSION");
+        assert_eq!(matrix.fail_closed.unsupported_shape, "ERR_INCOMPATIBLE_VERSION");
+        assert_eq!(matrix.fail_closed.unsupported_action_surface, "ERR_SAFETY_BLOCKED");
+        assert_eq!(
+            ConnectorError::VersionMismatch {
+                expected: STOCK_VERSION.into(),
+                actual: "1.18.17".into(),
+            }
+            .error_code(),
+            matrix.fail_closed.unsupported_version
+        );
+        assert_eq!(
+            ConnectorError::ProtocolMismatch("shape".into()).error_code(),
+            matrix.fail_closed.unsupported_shape
+        );
+        assert_eq!(
+            StockCommandBoundary::Reply.execute().unwrap_err().error_code(),
+            matrix.fail_closed.unsupported_action_surface
+        );
     }
     #[test]
     fn unknown_outcomes_and_snapshots_do_not_expose_raw_identifiers() {

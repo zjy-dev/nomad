@@ -32,11 +32,13 @@ pub use crate::stock_event_adapter::{
     StockEventEnvelopeError, STOCK_EVENT_EVIDENCE_CLASS,
 };
 pub use crate::stock_opencode::{
-    current_release_authorization, CurrentReleaseAuthorization, M2ActionDigests,
-    M2CapabilityReceipts, RealLifecycleEvidence, StockBlockedCommandResult, StockCommand,
-    StockCommandBoundary, StockCommandHttp, StockCommandRequest, StockCommandResult,
-    StockCommandTransport, StockHttpRequest, StockObservationOutcome, StockOpenCodeAdapter,
-    StockReconciliation, StockReconciliationStatus, StockSnapshotFacts, UreqStockCommandHttp,
+    adapter_support_matrix, current_release_authorization, AdapterSupportMatrix,
+    CapabilityIssuanceRules, CurrentReleaseAuthorization, FailClosedRules, M2ActionDigests,
+    M2CapabilityReceipts, NoCapabilityRules, PendingInputRules, RealLifecycleEvidence,
+    StockBlockedCommandResult, StockCommand, StockCommandBoundary, StockCommandHttp,
+    StockCommandRequest, StockCommandResult, StockCommandTransport, StockHttpRequest,
+    StockObservationOutcome, StockOpenCodeAdapter, StockReconciliation,
+    StockReconciliationStatus, StockSnapshotFacts, UreqStockCommandHttp,
     VerifiedM2Capabilities, APPROVAL_EXPIRED_OR_INVALID, COMMAND_SHAPE_SOURCE,
     REAL_LIFECYCLE_EVIDENCE_REQUIRED, STOCK_VERSION,
 };

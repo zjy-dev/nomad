@@ -1,0 +1,44 @@
+{
+  "schema": "nomad.adapter-support-matrix.v1",
+  "adapter_id": "opencode",
+  "adapter_version": "1.18.16",
+  "supported_versions": [
+    "1.18.16"
+  ],
+  "supported_actions": [
+    "view",
+    "reply",
+    "deny",
+    "Stop"
+  ],
+  "capability_schema": "nomad.product-host.command-capability.v1",
+  "capability_issuance": {
+    "view": true,
+    "reply": "question_only",
+    "deny": "permission_only",
+    "stop": "busy_session_only",
+    "allow_once": false
+  },
+  "no_capability": {
+    "semantics": "snapshot_with_capability_null",
+    "view_retained": true,
+    "capability_json": "null"
+  },
+  "pending_input": {
+    "summary_behavior": "pending_question_summary_only",
+    "provider_text_leaks_outside_adapter": false
+  },
+  "unsupported": [
+    "allow_once",
+    "provider_passthrough",
+    "non_exact_version",
+    "non_exact_shape",
+    "unmapped_official_lifecycle_to_durable_events",
+    "multiple_simultaneous_targets"
+  ],
+  "fail_closed": {
+    "unsupported_version": "ERR_INCOMPATIBLE_VERSION",
+    "unsupported_shape": "ERR_INCOMPATIBLE_VERSION",
+    "unsupported_action_surface": "ERR_SAFETY_BLOCKED"
+  }
+}
