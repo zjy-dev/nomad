@@ -163,7 +163,8 @@ class PrebuiltBundleTests(unittest.TestCase):
         return result.returncode, json.loads(lines[-1]) if lines else {}
 
     def test_prebuilt_runtime_needs_no_build_toolchain(self) -> None:
-        _, doctor = self.call("doctor")
+        code, doctor = self.call("doctor", check=False)
+        self.assertEqual(code, 2)
         self.assertEqual(doctor["runtime_mode"], "prebuilt-bundle")
         self.assertEqual(set(doctor["tools"]), {"python3", "node"})
         _, started = self.call("start")
@@ -178,7 +179,10 @@ class PrebuiltBundleTests(unittest.TestCase):
         self.call("uninstall")
 
     def test_v2_manifest_has_ingress_and_exact_gateway_module_closure(self) -> None:
-        from tools.nomad_web.bundle import GATEWAY_MODULES, REQUIRED, SCHEMA, verify_bundle
+        from tools.nomad_web.bundle import (
+            GATEWAY_MODULES, REQUIRED, REQUIRED_PACKAGE,
+            REQUIRED_RUNNER_CLOSURE, SCHEMA, verify_bundle,
+        )
 
         manifest = verify_bundle(self.bundle)
         entries = {entry["path"]: entry for entry in manifest["files"]}
@@ -191,6 +195,11 @@ class PrebuiltBundleTests(unittest.TestCase):
         )
         self.assertEqual(entries["gateway/pairing-session.mjs"]["mode"], "0644")
         self.assertEqual(REQUIRED["bin/nomad-ingress"], 0o755)
+        self.assertTrue(REQUIRED_PACKAGE.issubset(entries))
+        self.assertTrue(REQUIRED_RUNNER_CLOSURE.issubset(entries))
+        self.assertTrue(
+            all(entries[name]["mode"] == "0644" for name in REQUIRED_RUNNER_CLOSURE)
+        )
         self.assertFalse(any("node_modules" in path.parts for path in self.bundle.rglob("*")))
         loaded = subprocess.run(
             [shutil.which("node"), "--input-type=module", "--eval",
@@ -269,7 +278,7 @@ class PrebuiltBundleTests(unittest.TestCase):
             [str(self.bundle / "bin" / "nomad-web"), "--json", "doctor"],
             cwd=hostile, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30,
         )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertEqual(json.loads(result.stdout)["runtime_mode"], "prebuilt-bundle")
         self.assertFalse(any(path.name == "__pycache__" for path in self.bundle.rglob("__pycache__")))
 

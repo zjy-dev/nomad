@@ -215,7 +215,16 @@ class ProductHostBootstrapTests(unittest.TestCase):
                 self.assertTrue(path.exists())
             finally: replacement.close(); path.unlink(); path.parent.rmdir()
     def test_state_schema_rejects_raw_session_or_password(self):
-        self.assertNotIn("server_password",state.RUN_KEYS); self.assertNotIn("session_id",state.RUN_KEYS); self.assertIn("session_alias",state.RUN_KEYS)
+        self.assertNotIn("server_password",state.RUN_KEYS); self.assertNotIn("session_id",state.RUN_KEYS); self.assertIn("session_alias",state.RUN_KEYS); self.assertIn("bundle_digest", state.RUN_KEYS); self.assertIn("bundle_digest", state.REMOTE_RUN_KEYS)
+    def test_selected_bundle_digest_is_verified_and_canonical_under_home(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary); home=root/"home"; home.mkdir(); digest="a"*64; bundle=home/"bundles"/digest; bundle.mkdir(parents=True)
+            other=root/"other"; other.mkdir()
+            config=SimpleNamespace(home=home)
+            with mock.patch.object(launcher,"verify_bundle",return_value={"bundle_digest":digest}):
+                self.assertEqual(launcher._selected_bundle_digest(config,bundle),digest)
+                with self.assertRaisesRegex(RuntimeError,"SELECTED_BUNDLE_BINDING_INVALID"):
+                    launcher._selected_bundle_digest(config,other)
     def test_binding_values_are_content_free_hashes(self):
         run="a"*64; session="ses_raw"; alias="sess-"+"e"*32; self.assertNotIn(session,alias); self.assertRegex(alias,r"^sess-[0-9a-f]{32}$")
         state_alias=hashlib.sha256(f"state:{run}".encode()).hexdigest(); self.assertNotEqual(state_alias,run); self.assertEqual(len(state_alias),64)
@@ -231,7 +240,7 @@ class ProductHostBootstrapTests(unittest.TestCase):
             host={"name":"product-host","pid":11,"process_group":11,"identity":"a"*64,"log":str(home/"logs/host.log")}
             agent={"name":"opencode","pid":12,"process_group":12,"identity":"b"*64,"log":str(home/"logs/agent.log"),"origin":"http://127.0.0.1:4096","_server_password":"canary","_workspace_binding_digest":"c"*64}
             stopped=[]
-            with mock.patch.object(launcher,"install_snapshot",return_value=bundle), mock.patch.object(launcher,"_spawn_product_host",return_value=host), mock.patch.object(launcher,"start_agent",return_value=agent), mock.patch.object(launcher,"_create_run_session",return_value="ses_raw"), mock.patch.object(launcher,"_bootstrap_host",side_effect=RuntimeError("HOST_BOOTSTRAP_ACK_MISSING")), mock.patch.object(launcher.processes,"stop",side_effect=lambda item: stopped.append(item["name"]) or True):
+            with mock.patch.object(launcher,"select_bundle_for_start",return_value=bundle), mock.patch.object(launcher,"_selected_bundle_digest",return_value="a"*64), mock.patch.object(launcher,"_spawn_product_host",return_value=host), mock.patch.object(launcher,"start_agent",return_value=agent), mock.patch.object(launcher,"_create_run_session",return_value="ses_raw"), mock.patch.object(launcher,"_bootstrap_host",side_effect=RuntimeError("HOST_BOOTSTRAP_ACK_MISSING")), mock.patch.object(launcher.processes,"stop",side_effect=lambda item: stopped.append(item["name"]) or True):
                 with self.assertRaisesRegex(RuntimeError,"HOST_BOOTSTRAP_ACK_MISSING"):
                     launcher._start_unlocked(config,provider_name="OPENAI_API_KEY",credential_fd=7,workspace=workspace)
             self.assertEqual(set(stopped),{"opencode","product-host"}); self.assertEqual(len(stopped),2); self.assertFalse(state.state_path(config).exists())
@@ -259,9 +268,10 @@ class ProductHostBootstrapTests(unittest.TestCase):
                     seen["gateway_key"] = raw
                     self.assertEqual(os.read(source_fd, 1), b"")
                 return {"name":name,"pid":99 if name=="gateway" else 98,"process_group":99 if name=="gateway" else 98,"identity":"d"*64,"log":str(log_path)}
-            with mock.patch.object(launcher,"install_snapshot",return_value=bundle), mock.patch.object(launcher,"_spawn_product_host",return_value=host), mock.patch.object(launcher,"start_agent",return_value=agent), mock.patch.object(launcher,"_create_run_session",return_value="ses_raw"), mock.patch.object(launcher,"_bootstrap_host",side_effect=fake_bootstrap), mock.patch.object(launcher.processes,"spawn",side_effect=fake_spawn), mock.patch.object(launcher,"_wait"), mock.patch.object(launcher,"_wait_official_session",return_value="sess-"+"e"*32) as session_ready, mock.patch.object(launcher.processes,"stop",return_value=True):
+            with mock.patch.object(launcher,"select_bundle_for_start",return_value=bundle), mock.patch.object(launcher,"_selected_bundle_digest",return_value="a"*64), mock.patch.object(launcher,"_spawn_product_host",return_value=host), mock.patch.object(launcher,"start_agent",return_value=agent), mock.patch.object(launcher,"_create_run_session",return_value="ses_raw"), mock.patch.object(launcher,"_bootstrap_host",side_effect=fake_bootstrap), mock.patch.object(launcher.processes,"spawn",side_effect=fake_spawn), mock.patch.object(launcher,"_wait"), mock.patch.object(launcher,"_wait_official_session",return_value="sess-"+"e"*32) as session_ready, mock.patch.object(launcher.processes,"stop",return_value=True):
                 result = launcher._start_unlocked(config,provider_name="OPENAI_API_KEY",credential_fd=7,workspace=workspace)
             self.assertEqual(result["state"],"RUNNING")
+            self.assertEqual(result["bundle_digest"], "a" * 64)
             session_ready.assert_called_once_with("http://127.0.0.1:14173/api/alpha/session")
             self.assertEqual(result["session_alias"], "sess-" + "e" * 32)
             self.assertEqual(

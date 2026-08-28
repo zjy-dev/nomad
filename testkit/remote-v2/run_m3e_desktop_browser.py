@@ -50,6 +50,13 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _runner_source_digest() -> str:
+    injected = globals().get("__runner_raw_sha256__")
+    if isinstance(injected, str) and re.fullmatch(r"[0-9a-f]{64}", injected):
+        return injected
+    return _sha256(Path(__file__))
+
+
 def _wait_text(page: Any, text: str, timeout: int) -> None:
     page.get_by_text(text, exact=False).first.wait_for(state="visible", timeout=timeout)
 
@@ -457,6 +464,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             browser = context.browser
             return {
                 "schema": SCHEMA,
+                "runner_raw_sha256": _runner_source_digest(),
                 "status": "DIAGNOSTIC_COMPLETE" if args.diagnostic_spki_sha256 else "PASS",
                 "browser": {
                     "product": "Google Chrome",
@@ -524,6 +532,7 @@ def main() -> int:
     except Exception as error:
         result = {
             "schema": SCHEMA,
+            "runner_raw_sha256": _runner_source_digest(),
             "status": "BLOCK",
             "code": str(error) if isinstance(error, BrowserEvidenceError) else type(error).__name__,
             "diagnostics": error.diagnostics if isinstance(error, BrowserEvidenceError) else {},

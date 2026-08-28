@@ -16,6 +16,7 @@ HOME_SCHEMA = "nomad.web-companion.home.v1"
 HOME_MARKER = ".nomad-web-home.json"
 RUN_KEYS = {
     "schema", "mode", "real_agent_enabled", "blocked_on",
+    "bundle_digest",
     "web_url", "agent_origin", "agent_version", "logs_dir", "relay_port", "gateway_port", "agent_port", "processes",
     "run_id", "session_alias", "workspace_binding_digest", "product_host_socket_identity",
 }
@@ -23,6 +24,7 @@ PROCESS_KEYS = {"name", "pid", "process_group", "identity", "log"}
 SOCKET_IDENTITY_KEYS = {"parent_dev", "parent_ino", "parent_uid", "parent_mode", "socket_dev", "socket_ino", "socket_uid", "socket_mode"}
 REMOTE_RUN_KEYS = {
     "schema", "mode", "real_agent_enabled", "remote_enabled",
+    "bundle_digest",
     "blocked_on", "desktop_url", "pairing_public_origin",
     "pairing_ready", "remote_mailbox_ready", "network_scope",
     "production_external", "agent_origin", "agent_version",
@@ -220,6 +222,13 @@ def validate_run_state(config: Any, value: Any) -> None:
     expected_blockers = (["PRODUCTION_DEVICE_IDENTITY"] if agent_enabled else ["B1_PROVIDER_CREDENTIAL", "PRODUCTION_DEVICE_IDENTITY"])
     if value["blocked_on"] != expected_blockers:
         raise RuntimeError("INVALID_STATE")
+    if value["bundle_digest"] is not None and (
+        not isinstance(value["bundle_digest"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", value["bundle_digest"]) is None
+    ):
+        raise RuntimeError("INVALID_STATE")
+    if agent_enabled and value["bundle_digest"] is None:
+        raise RuntimeError("INVALID_STATE")
     if value["relay_port"] != config.relay_port or value["gateway_port"] != config.gateway_port or value["agent_port"] != config.agent_port:
         raise RuntimeError("INVALID_STATE")
     if value["web_url"] != f"http://127.0.0.1:{config.gateway_port}/":
@@ -277,6 +286,8 @@ def _validate_remote_run_state(config: Any, value: dict[str, Any]) -> None:
         or value["remote_mailbox_ready"] is not True
         or value["network_scope"] != "lan_direct"
         or value["production_external"] is not False
+        or not isinstance(value["bundle_digest"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", value["bundle_digest"]) is None
         or not isinstance(value["blocked_on"], list)
         or not all(isinstance(item, str) and item for item in value["blocked_on"])
     ):

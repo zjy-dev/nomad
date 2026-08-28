@@ -52,6 +52,25 @@ class M3ELauncherTests(unittest.TestCase):
         os.close(write_fd)
         return read_fd
 
+    def test_start_fails_closed_on_explicit_current_conflict_before_spawn(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = root / "bundle"
+            bundle.mkdir()
+            config = self.config(root, bundle)
+            with (
+                mock.patch.object(
+                    launcher, "select_bundle_for_start",
+                    side_effect=RuntimeError("EXPLICIT_BUNDLE_CURRENT_CONFLICT"),
+                ) as select,
+                mock.patch.object(launcher, "_port_free", return_value=True),
+                mock.patch.object(processes, "spawn") as spawn,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "EXPLICIT_BUNDLE_CURRENT_CONFLICT"):
+                    launcher.start_foundation(config)
+            select.assert_called_once_with(config, bundle)
+            spawn.assert_not_called()
+
     def test_materialized_bundle_exposes_launcher_ingress_executable(self) -> None:
         from tools.nomad_web.bundle import verify_bundle
         from tools.nomad_web.materialize import materialize
@@ -200,7 +219,7 @@ class M3ELauncherTests(unittest.TestCase):
                 return {"name": "opencode", "pid": pid, "process_group": pid, "identity": f"{pid:064x}", "log": str(log_path), "origin": f"http://127.0.0.1:{port}", "_server_password": "agent-password-canary", "_workspace_binding_digest": "b" * 64}
 
             tls_context = object()
-            with mock.patch.object(launcher, "install_snapshot", return_value=bundle), mock.patch.object(launcher, "_validate_remote_inputs", return_value=("https://pair.example:8443", "192.0.2.10:8443", [])), mock.patch.object(launcher, "_listen_address_free", return_value=True), mock.patch.object(launcher, "_require_host_identity_ready"), mock.patch.object(launcher, "_tls_probe_context", return_value=tls_context), mock.patch.object(launcher, "_spawn_product_host_with_fds", side_effect=fake_host), mock.patch.object(launcher, "start_agent", side_effect=fake_agent), mock.patch.object(launcher, "_create_run_session", return_value="ses_raw"), mock.patch.object(launcher, "_bootstrap_host", side_effect=fake_bootstrap), mock.patch.object(processes, "spawn", side_effect=fake_spawn), mock.patch.object(launcher, "_wait_relay_role"), mock.patch.object(launcher, "_wait_gateway_route"), mock.patch.object(launcher, "_probe_public_negative_routes") as negative, mock.patch.object(processes, "ownership", return_value="owned"), mock.patch.object(launcher.secrets, "token_bytes", side_effect=lambda _size: next(raw_values)), mock.patch.object(launcher.secrets, "token_urlsafe", return_value="relay-admin-canary-value-0123456789"):
+            with mock.patch.object(launcher, "select_bundle_for_start", return_value=bundle), mock.patch.object(launcher, "_selected_bundle_digest", return_value="9" * 64), mock.patch.object(launcher, "_validate_remote_inputs", return_value=("https://pair.example:8443", "192.0.2.10:8443", [])), mock.patch.object(launcher, "_listen_address_free", return_value=True), mock.patch.object(launcher, "_require_host_identity_ready"), mock.patch.object(launcher, "_tls_probe_context", return_value=tls_context), mock.patch.object(launcher, "_spawn_product_host_with_fds", side_effect=fake_host), mock.patch.object(launcher, "start_agent", side_effect=fake_agent), mock.patch.object(launcher, "_create_run_session", return_value="ses_raw"), mock.patch.object(launcher, "_bootstrap_host", side_effect=fake_bootstrap), mock.patch.object(processes, "spawn", side_effect=fake_spawn), mock.patch.object(launcher, "_wait_relay_role"), mock.patch.object(launcher, "_wait_gateway_route"), mock.patch.object(launcher, "_probe_public_negative_routes") as negative, mock.patch.object(processes, "ownership", return_value="owned"), mock.patch.object(launcher.secrets, "token_bytes", side_effect=lambda _size: next(raw_values)), mock.patch.object(launcher.secrets, "token_urlsafe", return_value="relay-admin-canary-value-0123456789"):
                 result = launcher._start_remote_unlocked(config, provider_name="OPENAI_API_KEY", credential_fd=credential, workspace=workspace, public_origin="https://pair.example:8443", https_listen="192.0.2.10:8443", tls_cert_fd=cert, tls_key_fd=key)
 
             names = [item["name"] for item in result["processes"]]
@@ -215,6 +234,7 @@ class M3ELauncherTests(unittest.TestCase):
             self.assertEqual(secrets_by_child["join-gateway"][12], secrets_by_child["https-ingress"][12])
             self.assertEqual(host_seen["remote"]["relay_device_public_base_url"], "https://pair.example:8443")
             self.assertEqual(result["schema"], state.REMOTE_STATE_SCHEMA)
+            self.assertEqual(result["bundle_digest"], "9" * 64)
             self.assertEqual((result["network_scope"], result["production_external"]), ("lan_direct", False))
             negative.assert_called_once_with("https://pair.example:8443", "192.0.2.10:8443", tls_context)
             surface = (config.home / "run" / "status.json").read_bytes() + json.dumps(calls).encode()
@@ -321,7 +341,7 @@ class M3ELauncherTests(unittest.TestCase):
             for name in ("bin", "run", "logs"):
                 (config.home / name).mkdir(mode=0o700)
             credential = self.credential_fd(); cert = self.private_fd(root, "bad-cert.pem", b"not a certificate"); key = self.private_fd(root, "key.pem", b"not a key")
-            with mock.patch.object(launcher, "install_snapshot", return_value=bundle), mock.patch.object(launcher, "_listen_address_free", return_value=True), mock.patch.object(launcher, "_require_host_identity_ready"), mock.patch.object(processes, "spawn") as spawn:
+            with mock.patch.object(launcher, "select_bundle_for_start", return_value=bundle), mock.patch.object(launcher, "_selected_bundle_digest", return_value="a" * 64), mock.patch.object(launcher, "_listen_address_free", return_value=True), mock.patch.object(launcher, "_require_host_identity_ready"), mock.patch.object(processes, "spawn") as spawn:
                 with self.assertRaisesRegex(RuntimeError, "REMOTE_TLS_CERT_INVALID"):
                     launcher._start_remote_unlocked(config, provider_name="OPENAI_API_KEY", credential_fd=credential, workspace=workspace, public_origin="https://pair.example:8443", https_listen="192.0.2.10:8443", tls_cert_fd=cert, tls_key_fd=key)
                 spawn.assert_not_called()
@@ -336,7 +356,7 @@ class M3ELauncherTests(unittest.TestCase):
                 (config.home / name).mkdir(mode=0o700)
             credential = self.credential_fd(); cert = self.private_fd(root, "cert.pem", b"cert"); key = self.private_fd(root, "key.pem", b"key")
             completed = SimpleNamespace(returncode=1, stdout=b'{"status":"AUTH_REQUIRED"}\n', stderr=b"")
-            with mock.patch.object(launcher, "install_snapshot", return_value=bundle), mock.patch.object(launcher, "_listen_address_free", return_value=True), mock.patch.object(launcher.subprocess, "run", return_value=completed) as command, mock.patch.object(processes, "spawn") as relay_spawn, mock.patch.object(launcher, "start_agent") as agent_spawn:
+            with mock.patch.object(launcher, "select_bundle_for_start", return_value=bundle), mock.patch.object(launcher, "_selected_bundle_digest", return_value="a" * 64), mock.patch.object(launcher, "_listen_address_free", return_value=True), mock.patch.object(launcher.subprocess, "run", return_value=completed) as command, mock.patch.object(processes, "spawn") as relay_spawn, mock.patch.object(launcher, "start_agent") as agent_spawn:
                 with self.assertRaisesRegex(launcher.HostIdentityError, "HOST_IDENTITY_AUTH_REQUIRED") as raised:
                     launcher._start_remote_unlocked(config, provider_name="OPENAI_API_KEY", credential_fd=credential, workspace=root, public_origin="https://pair.example:8443", https_listen="192.0.2.10:8443", tls_cert_fd=cert, tls_key_fd=key)
                 self.assertEqual(raised.exception.next_step, "nomad-web authorize-host-identity")
@@ -387,7 +407,7 @@ class M3ELauncherTests(unittest.TestCase):
             host = bundle / "bin" / "nomad-product-host"; host.write_bytes(b"host"); os.chmod(host, 0o755)
             config = self.config(root, bundle)
             denied = SimpleNamespace(returncode=1, stdout=b'{"status":"USER_DENIED"}\n', stderr=b"")
-            with mock.patch.object(launcher, "install_snapshot", return_value=bundle), mock.patch.object(launcher.subprocess, "run", return_value=denied) as command, mock.patch.object(processes, "spawn") as spawn, mock.patch.object(launcher, "start_agent") as agent:
+            with mock.patch.object(launcher, "select_bundle_for_start", return_value=bundle), mock.patch.object(launcher, "_selected_bundle_digest", return_value="a" * 64), mock.patch.object(launcher.subprocess, "run", return_value=denied) as command, mock.patch.object(processes, "spawn") as spawn, mock.patch.object(launcher, "start_agent") as agent:
                 with self.assertRaisesRegex(launcher.HostIdentityError, "HOST_IDENTITY_USER_DENIED") as raised:
                     launcher.authorize_host_identity(config)
                 self.assertEqual(raised.exception.next_step, "nomad-web authorize-host-identity")

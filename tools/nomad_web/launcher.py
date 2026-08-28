@@ -25,7 +25,8 @@ from typing import Any
 
 from . import processes
 from .agent_runtime import _validate_credential_source, _verified_workspace, start_agent
-from .bundle import install_snapshot
+from .bundle import verify_bundle
+from .install_lifecycle import select_bundle_for_start
 from .state import HOME_MARKER, REMOTE_STATE_SCHEMA, STATE_SCHEMA, initialize_home, lifecycle_lock, read_run_state, state_path, validate_home, validate_runtime_dirs, write_run_state
 
 TOKEN_ENV = "NOMAD_ALPHA_RELAY_TOKEN"
@@ -70,6 +71,21 @@ def _get(config: Any, name: str) -> Any:
     if isinstance(config, dict):
         return config[name]
     raise RuntimeError(f"CONFIG_{name.upper()}_MISSING")
+
+
+def _selected_bundle_digest(config: Any, bundle: Path | None) -> str | None:
+    if bundle is None:
+        return None
+    canonical_home = Path(_get(config, "home")).resolve(strict=True)
+    canonical_bundle = Path(bundle).resolve(strict=True)
+    manifest = verify_bundle(canonical_bundle)
+    digest = manifest.get("bundle_digest")
+    if (
+        not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or canonical_bundle != (canonical_home / "bundles" / digest).resolve(strict=True)
+    ):
+        raise RuntimeError("SELECTED_BUNDLE_BINDING_INVALID")
+    return digest
 
 
 def _run_host_identity_command(binary: Path, arguments: list[str], *, interactive: bool = False) -> str:
@@ -119,10 +135,9 @@ def authorize_host_identity(config: Any) -> dict[str, Any]:
     with lifecycle_lock(config, create=True):
         if read_run_state(config) is not None:
             raise HostIdentityError("HOST_IDENTITY_AUTHORIZATION_REQUIRES_STOP")
-        bundle_root = getattr(config, "bundle_root", None)
-        if bundle_root is None:
+        bundle = select_bundle_for_start(config, getattr(config, "bundle_root", None))
+        if bundle is None:
             raise RuntimeError("PREBUILT_BUNDLE_REQUIRED")
-        bundle = install_snapshot(Path(bundle_root), Path(_get(config, "home")).resolve())
         binary = bundle / "bin" / "nomad-product-host"
         status = _run_host_identity_command(binary, ["authorize-host-identity"], interactive=True)
         error = HOST_IDENTITY_RESULTS[status][1]
@@ -997,8 +1012,12 @@ def _start_unlocked(
             except OSError:
                 pass
         raise RuntimeError("AGENT_START_INPUTS_INCOMPLETE")
+    bundle = select_bundle_for_start(config, getattr(config, "bundle_root", None))
+    bundle_digest = _selected_bundle_digest(config, bundle)
     existing = read_run_state(config)
     if existing:
+        if existing["bundle_digest"] != bundle_digest:
+            raise RuntimeError("RUNNING_BUNDLE_BINDING_MISMATCH")
         ownership = [processes.ownership(item) for item in existing["processes"]]
         if "mismatch" in ownership:
             raise RuntimeError("PROCESS_IDENTITY_MISMATCH")
@@ -1034,9 +1053,7 @@ def _start_unlocked(
         directory.mkdir(parents=True, exist_ok=True)
         os.chmod(directory, 0o700)
     validate_runtime_dirs(config)
-    bundle = getattr(config, "bundle_root", None)
     if bundle is not None:
-        bundle = install_snapshot(Path(bundle), home)
         relay_binary = bundle / "bin" / "nomad-relay"
         relay_cwd = bundle
         gateway_dir = bundle / "gateway"
@@ -1152,6 +1169,7 @@ def _start_unlocked(
             "schema": STATE_SCHEMA,
             "mode": "official-agent-local" if agent_enabled else "foundation-readonly",
             "real_agent_enabled": agent_enabled,
+            "bundle_digest": bundle_digest,
             "blocked_on": (["PRODUCTION_DEVICE_IDENTITY"] if agent_enabled else BLOCKERS),
             "web_url": f"http://127.0.0.1:{gateway_port}/",
             "agent_origin": f"http://127.0.0.1:{_get(config, 'agent_port')}" if agent_enabled else None,
@@ -1189,8 +1207,14 @@ def _start_remote_unlocked(
     config: Any, *, provider_name: str, credential_fd: int, workspace: Path,
     public_origin: str, https_listen: str, tls_cert_fd: int, tls_key_fd: int,
 ) -> dict[str, Any]:
+    bundle = select_bundle_for_start(config, getattr(config, "bundle_root", None))
+    if bundle is None:
+        raise RuntimeError("PREBUILT_BUNDLE_REQUIRED")
+    bundle_digest = _selected_bundle_digest(config, bundle)
     existing = read_run_state(config)
     if existing:
+        if existing["bundle_digest"] != bundle_digest:
+            raise RuntimeError("RUNNING_BUNDLE_BINDING_MISMATCH")
         ownership = [processes.ownership(item) for item in existing["processes"]]
         if "mismatch" in ownership:
             raise RuntimeError("PROCESS_IDENTITY_MISMATCH")
@@ -1225,10 +1249,6 @@ def _start_remote_unlocked(
         directory.mkdir(parents=True, exist_ok=True)
         os.chmod(directory, 0o700)
     validate_runtime_dirs(config)
-    bundle_root = getattr(config, "bundle_root", None)
-    if bundle_root is None:
-        raise RuntimeError("PREBUILT_BUNDLE_REQUIRED")
-    bundle = install_snapshot(Path(bundle_root), home)
     relay_binary = bundle / "bin" / "nomad-relay"
     host_binary = bundle / "bin" / "nomad-product-host"
     ingress_binary = bundle / "bin" / "nomad-ingress"
@@ -1406,6 +1426,7 @@ def _start_remote_unlocked(
         state = {
             "schema": REMOTE_STATE_SCHEMA, "mode": "remote-local-evidence",
             "real_agent_enabled": True, "remote_enabled": True,
+            "bundle_digest": bundle_digest,
             "blocked_on": ["PRODUCTION_EXTERNAL_TOPOLOGY", "PHYSICAL_PHONE_EVIDENCE", "PROVIDER_E3_EVIDENCE"],
             "desktop_url": f"http://127.0.0.1:{desktop_port}/", "pairing_public_origin": public_origin,
             "pairing_ready": True, "remote_mailbox_ready": True, "network_scope": "lan_direct",
@@ -1543,13 +1564,13 @@ def uninstall_foundation(config: Any) -> dict[str, Any]:
         if home == Path.home().resolve() or home == Path("/"):
             raise RuntimeError("UNSAFE_UNINSTALL_ROOT")
         validate_home(config)
-        allowed = {HOME_MARKER, "bin", "run", "logs", "bundles", DEVICE_REGISTRY_DIRNAME}
+        allowed = {HOME_MARKER, "bin", "run", "logs", "bundles", "install", DEVICE_REGISTRY_DIRNAME}
         if not {entry.name for entry in home.iterdir()}.issubset(allowed):
             raise RuntimeError("UNSAFE_NOMAD_WEB_HOME_CONTENTS")
         validate_runtime_dirs(config)
         root = home.resolve(strict=True)
         _cleanup_device_registry(_device_registry_path(home))
-        for name in ("run", "logs", "bin", "bundles", HOME_MARKER):
+        for name in ("run", "logs", "bin", "bundles", "install", HOME_MARKER):
             _safe_remove_tree(home / name, root=root)
         home.rmdir()
     return {"schema": STATE_SCHEMA, "state": "UNINSTALLED", "mode": "foundation-readonly", "real_agent_enabled": False, "blocked_on": BLOCKERS}

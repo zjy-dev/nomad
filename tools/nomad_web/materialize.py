@@ -34,7 +34,10 @@ def materialize(repo: Path, output: Path) -> dict[str, Any]:
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".nomad-web-bundle-", dir=output.parent) as temporary:
         root = Path(temporary) / "bundle"
-        for directory in (root / "bin", root / "agent", root / "gateway", root / "web", root / "lib" / "nomad_web"):
+        for directory in (
+            root / "bin", root / "agent", root / "gateway", root / "web",
+            root / "lib" / "nomad_web", root / "testkit" / "remote-v2",
+        ):
             directory.mkdir(parents=True, exist_ok=True)
         ingress_source = repo / "relay" / "cmd" / "nomad-ingress"
         if not ingress_source.is_dir():
@@ -60,6 +63,9 @@ def materialize(repo: Path, output: Path) -> dict[str, Any]:
         shutil.copytree(repo / "mobile-reference" / "dist", root / "web", dirs_exist_ok=True)
         for source in sorted((repo / "tools" / "nomad_web").glob("*.py")):
             shutil.copyfile(source, root / "lib" / "nomad_web" / source.name)
+        runner_source = repo / "testkit" / "remote-v2"
+        for name in ("run_m3e_product_slice.py", "run_m3e_desktop_browser.py"):
+            shutil.copyfile(runner_source / name, root / "testkit" / "remote-v2" / name)
         wrapper = root / "bin" / "nomad-web"
         wrapper.write_text(
             "#!/bin/sh\nset -eu\nBUNDLE=$(CDPATH= cd -- \"$(dirname -- \"$0\")/..\" && pwd)\n"

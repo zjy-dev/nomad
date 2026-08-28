@@ -6,12 +6,12 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
-import secrets
 import shutil
 import socket
 import sqlite3
@@ -23,17 +23,19 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Iterator, Mapping
+from typing import Any, Mapping
 
 
 SCHEMA = "nomad.m3e.real-product-slice-evidence.v1"
 MARKER = "M3E_REAL_PRODUCT_SLICE_PASS"
-DEFAULT_BUNDLE = Path("/tmp/nomad-e6d-final7-bundle")
-EXPECTED_BUNDLE_DIGEST = "683382f135833bef10ca8df700d3d06033c0663b3a0a38ff949739400d196423"
-REPO_ROOT = Path(__file__).resolve().parents[2]
+WORKSPACE_ROOT = Path.cwd().resolve()
 BROWSER_RUNNER = Path(__file__).with_name("run_m3e_desktop_browser.py")
 CHROME = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
 LAN_ADDRESS = "192.168.100.3"
+MAX_TLS_MATERIAL_BYTES = 1024 * 1024
+MAX_RUNNER_BYTES = 2 * 1024 * 1024
+PRODUCT_RUNNER_ENTRY = "testkit/remote-v2/run_m3e_product_slice.py"
+BROWSER_RUNNER_ENTRY = "testkit/remote-v2/run_m3e_desktop_browser.py"
 PROCESS_NAMES = [
     "relay-host", "relay-device", "opencode", "product-host",
     "desktop-gateway", "join-gateway", "https-ingress",
@@ -68,31 +70,109 @@ def canonical_json(value: Any) -> bytes:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--bundle", type=Path, default=DEFAULT_BUNDLE)
+    parser.add_argument("--bundle", type=Path, required=True)
     parser.add_argument("--evidence", type=Path)
     parser.add_argument("--keep-runtime", action="store_true")
     parser.add_argument("--preflight", action="store_true")
     parser.add_argument("--diagnostic-spki-bypass", action="store_true")
+    parser.add_argument("--parent-evidence-digest", type=_lower_sha256)
     return parser.parse_args()
+
+
+def _lower_sha256(value: str) -> str:
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise argparse.ArgumentTypeError("expected a lowercase SHA-256 digest")
+    return value
 
 
 def load_manifest(bundle: Path) -> dict[str, Any]:
     try:
-        value = json.loads((bundle / "manifest.json").read_bytes())
-    except (OSError, json.JSONDecodeError) as error:
-        raise SliceError("bundle_manifest_unavailable") from error
-    if value.get("bundle_digest") != EXPECTED_BUNDLE_DIGEST:
-        raise SliceError("bundle_digest_mismatch")
-    required = [
-        "bin/nomad-web", "bin/nomad-relay", "bin/nomad-product-host",
-        "bin/nomad-ingress", "agent/opencode", "gateway/server.mjs",
-        "web/index.html", "lib/nomad_web/launcher.py",
-    ]
-    if any(not (bundle / item).is_file() for item in required):
-        raise SliceError("bundle_file_missing")
+        package_root = str(Path(__file__).resolve().parents[2] / "lib")
+        if package_root not in sys.path:
+            sys.path.insert(0, package_root)
+        from nomad_web.bundle import verify_bundle
+
+        value = verify_bundle(bundle)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise SliceError("bundle_verification_failed") from error
     if value.get("agent_runtime", {}).get("provider_backed") is not False:
         raise SliceError("bundle_agent_classification_invalid")
     return value
+
+
+def source_binding() -> dict[str, str]:
+    return {
+        "product_runner_raw_sha256": runner_source_digest(),
+        "browser_runner_raw_sha256": browser_runner_snapshot()[1],
+    }
+
+
+def manifest_source_binding(manifest: Mapping[str, Any]) -> dict[str, str]:
+    files = manifest.get("files")
+    if not isinstance(files, list):
+        raise SliceError("runner_manifest_binding_invalid")
+    selected: dict[str, str] = {}
+    for item in files:
+        if not isinstance(item, dict) or item.get("path") not in {PRODUCT_RUNNER_ENTRY, BROWSER_RUNNER_ENTRY}:
+            continue
+        name, digest = item["path"], item.get("raw_sha256")
+        if name in selected or not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise SliceError("runner_manifest_binding_invalid")
+        selected[name] = digest
+    if set(selected) != {PRODUCT_RUNNER_ENTRY, BROWSER_RUNNER_ENTRY}:
+        raise SliceError("runner_manifest_binding_invalid")
+    return {
+        "product_runner_raw_sha256": selected[PRODUCT_RUNNER_ENTRY],
+        "browser_runner_raw_sha256": selected[BROWSER_RUNNER_ENTRY],
+    }
+
+
+def runner_source_digest() -> str:
+    injected = globals().get("__runner_raw_sha256__")
+    if isinstance(injected, str) and re.fullmatch(r"[0-9a-f]{64}", injected):
+        return injected
+    return _sha256_file(Path(__file__))
+
+
+_BROWSER_RUNNER_SNAPSHOT: tuple[bytes, str] | None = None
+
+
+def browser_runner_snapshot() -> tuple[bytes, str]:
+    global _BROWSER_RUNNER_SNAPSHOT
+    if _BROWSER_RUNNER_SNAPSHOT is not None:
+        return _BROWSER_RUNNER_SNAPSHOT
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(BROWSER_RUNNER, flags)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= MAX_RUNNER_BYTES:
+            raise SliceError("browser_runner_file_policy_invalid")
+        raw = bytearray()
+        offset = 0
+        while offset < info.st_size:
+            chunk = os.pread(descriptor, min(64 * 1024, info.st_size - offset), offset)
+            if not chunk:
+                raise SliceError("browser_runner_read_failed")
+            raw.extend(chunk)
+            offset += len(chunk)
+        after = os.fstat(descriptor)
+        if (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+            raise SliceError("browser_runner_changed")
+    finally:
+        os.close(descriptor)
+    _BROWSER_RUNNER_SNAPSHOT = bytes(raw), hashlib.sha256(raw).hexdigest()
+    return _BROWSER_RUNNER_SNAPSHOT
+
+
+def bundle_binding(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "digest": manifest["bundle_digest"],
+        "source_commit_oid": manifest["source_commit_oid"],
+        "launcher_version": manifest["launcher_version"],
+        "classification": manifest["classification"],
+    }
 
 
 def _bundle_business_process_count(bundle: Path) -> int:
@@ -155,19 +235,17 @@ def host_identity_preflight(bundle: Path) -> dict[str, Any]:
 
 def preflight(bundle: Path) -> dict[str, Any]:
     checks: dict[str, bool] = {}
+    manifest: dict[str, Any] | None = None
     try:
         manifest = load_manifest(bundle)
-        checks["exact_bundle"] = bundle.resolve() == DEFAULT_BUNDLE.resolve()
-        checks["bundle_digest"] = manifest["bundle_digest"] == EXPECTED_BUNDLE_DIGEST
+        checks["bundle_verified"] = True
         identity = host_identity_preflight(bundle)
     except Exception:
-        checks["exact_bundle"] = False
-        checks["bundle_digest"] = False
+        checks["bundle_verified"] = False
         identity = {"status": "NOT_RUN", "business_process_count": 0, "ready": False, "error_code": "BUNDLE_PREFLIGHT_FAILED"}
     checks["lan_address"] = _lan_present(LAN_ADDRESS)
     checks["chrome"] = CHROME.is_file()
     checks["openssl"] = shutil.which("openssl") is not None
-    checks["certutil"] = shutil.which("certutil") is not None
     checks["uv"] = shutil.which("uv") is not None
     checks["browser_runner"] = BROWSER_RUNNER.is_file()
     checks["host_identity_ready"] = identity["ready"]
@@ -175,7 +253,8 @@ def preflight(bundle: Path) -> dict[str, Any]:
         "schema": "nomad.m3e.real-product-slice-preflight.v1",
         "status": "READY" if all(checks.values()) else "BLOCKED",
         "checks": checks,
-        "bundle_digest": EXPECTED_BUNDLE_DIGEST if checks["bundle_digest"] else None,
+        "bundle": bundle_binding(manifest) if manifest is not None else None,
+        "source_binding": source_binding(),
         "network_scope": "lan_direct",
         "provider_e3": "NOT_RUN",
         "physical_phone": "NOT_RUN",
@@ -247,46 +326,84 @@ def run_checked(
     return result
 
 
-def create_certificates(root: Path) -> dict[str, Path]:
-    ca_key, ca_cert = root / "ca.key", root / "ca.pem"
-    leaf_key, leaf_csr, leaf_cert = root / "leaf.key", root / "leaf.csr", root / "leaf.pem"
-    leaf_extensions = root / "leaf.ext"
-    run_checked(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-                 "-keyout", str(ca_key), "-out", str(ca_cert), "-days", "1",
-                 "-subj", "/CN=Nomad E6D Ephemeral Test CA",
-                 "-addext", "basicConstraints=critical,CA:TRUE",
-                 "-addext", "keyUsage=critical,keyCertSign,cRLSign",
-                 "-addext", "subjectKeyIdentifier=hash"], stage="cert_ca")
-    run_checked(["openssl", "req", "-newkey", "rsa:2048", "-nodes",
-                 "-keyout", str(leaf_key), "-out", str(leaf_csr),
-                 "-subj", f"/CN={LAN_ADDRESS}",
-                 "-addext", f"subjectAltName=IP:{LAN_ADDRESS},IP:127.0.0.1,DNS:localhost",
-                 "-addext", "extendedKeyUsage=serverAuth",
-                 "-addext", "keyUsage=critical,digitalSignature,keyEncipherment"], stage="cert_csr")
-    extension_raw = (
-        f"subjectAltName=IP:{LAN_ADDRESS},IP:127.0.0.1,DNS:localhost\n"
-        "extendedKeyUsage=serverAuth\n"
-        "keyUsage=critical,digitalSignature,keyEncipherment\n"
-        "basicConstraints=critical,CA:FALSE\n"
-        "subjectKeyIdentifier=hash\n"
-        "authorityKeyIdentifier=keyid,issuer\n"
-    ).encode("ascii")
-    extension_fd = os.open(leaf_extensions, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+def read_tls_fd_control() -> tuple[int, int, int]:
+    raw = sys.stdin.buffer.readline(128)
+    match = re.fullmatch(rb"NOMAD_TLS_FDS_V1 ([0-9]+) ([0-9]+) ([0-9]+)\n", raw)
+    if match is None or sys.stdin.buffer.read(1) != b"":
+        raise SliceError("TLS_FD_CONTROL_INVALID")
+    descriptors = tuple(int(item) for item in match.groups())
+    if len(set(descriptors)) != 3:
+        raise SliceError("TLS_FD_CONTROL_INVALID")
+    return descriptors  # type: ignore[return-value]
+
+
+def _read_tls_fd(descriptor: int, *, private: bool) -> bytes:
     try:
-        os.write(extension_fd, extension_raw)
+        info = os.fstat(descriptor)
+        access = fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE
+    except OSError as error:
+        raise SliceError("TLS_FD_INVALID") from error
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_size <= 0
+        or info.st_size > MAX_TLS_MATERIAL_BYTES
+        or access != os.O_RDONLY
+        or (private and info.st_nlink > 0 and info.st_mode & 0o077)
+    ):
+        raise SliceError("TLS_FD_FILE_POLICY_INVALID")
+    before = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+    raw = bytearray()
+    offset = 0
+    while offset < info.st_size:
+        try:
+            chunk = os.pread(descriptor, min(64 * 1024, info.st_size - offset), offset)
+        except OSError as error:
+            raise SliceError("TLS_FD_READ_FAILED") from error
+        if not chunk:
+            raise SliceError("TLS_FD_READ_FAILED")
+        raw.extend(chunk)
+        offset += len(chunk)
+    after_info = os.fstat(descriptor)
+    after = (after_info.st_dev, after_info.st_ino, after_info.st_size, after_info.st_mtime_ns)
+    if before != after:
+        raise SliceError("TLS_FD_CHANGED")
+    return bytes(raw)
+
+
+def _private_write(path: Path, raw: bytes) -> None:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+    try:
+        offset = 0
+        while offset < len(raw):
+            written = os.write(descriptor, raw[offset:])
+            if written <= 0:
+                raise SliceError("TLS_SNAPSHOT_WRITE_FAILED")
+            offset += written
+        os.fsync(descriptor)
     finally:
-        os.close(extension_fd)
-    run_checked(["openssl", "x509", "-req", "-in", str(leaf_csr),
-                 "-CA", str(ca_cert), "-CAkey", str(ca_key), "-CAcreateserial",
-                 "-out", str(leaf_cert), "-days", "1",
-                 "-extfile", str(leaf_extensions)], stage="cert_sign")
-    for path in (ca_key, ca_cert, leaf_key, leaf_csr, leaf_cert, leaf_extensions):
-        os.chmod(path, 0o600)
-    verify = run_checked(["openssl", "verify", "-CAfile", str(ca_cert), str(leaf_cert)], stage="cert_verify")
-    san = run_checked(["openssl", "x509", "-in", str(leaf_cert), "-noout", "-text"], stage="cert_san")
-    if "192.168.100.3" not in san.stdout or "OK" not in verify.stdout:
-        raise SliceError("certificate_verification_failed")
-    return {"ca": ca_cert, "cert": leaf_cert, "key": leaf_key}
+        os.close(descriptor)
+
+
+def snapshot_and_validate_tls(root: Path, descriptors: tuple[int, int, int]) -> dict[str, Path]:
+    ca_raw = _read_tls_fd(descriptors[0], private=False)
+    cert_raw = _read_tls_fd(descriptors[1], private=False)
+    key_raw = _read_tls_fd(descriptors[2], private=True)
+    paths = {"ca": root / "operator-ca.pem", "cert": root / "operator-cert.pem", "key": root / "operator-key.pem"}
+    for name, raw in (("ca", ca_raw), ("cert", cert_raw), ("key", key_raw)):
+        _private_write(paths[name], raw)
+    verify = run_checked(
+        ["openssl", "verify", "-CAfile", str(paths["ca"]), str(paths["cert"])],
+        stage="operator_tls_chain",
+    )
+    if "OK" not in verify.stdout:
+        raise SliceError("operator_tls_chain_invalid")
+    run_checked(["openssl", "x509", "-in", str(paths["cert"]), "-noout", "-checkend", "0"], stage="operator_tls_expiry")
+    run_checked(["openssl", "x509", "-in", str(paths["cert"]), "-noout", "-checkip", LAN_ADDRESS], stage="operator_tls_san")
+    cert_public = run_checked(["openssl", "x509", "-in", str(paths["cert"]), "-pubkey", "-noout"], stage="operator_tls_cert_key").stdout
+    key_public = run_checked(["openssl", "pkey", "-in", str(paths["key"]), "-pubout"], stage="operator_tls_private_key").stdout
+    if not cert_public or cert_public != key_public:
+        raise SliceError("operator_tls_key_mismatch")
+    return paths
 
 
 def leaf_spki_sha256(certificate: Path) -> str:
@@ -307,18 +424,6 @@ def leaf_spki_sha256(certificate: Path) -> str:
     return base64.b64encode(hashlib.sha256(der.stdout).digest()).decode("ascii")
 
 
-@contextlib.contextmanager
-def temporary_chrome_trust(profile: Path, ca: Path) -> Iterator[None]:
-    profile.mkdir(mode=0o700, parents=True, exist_ok=False)
-    database = f"sql:{profile}"
-    run_checked(["certutil", "-N", "--empty-password", "-d", database], stage="trust_nss_create")
-    run_checked(["certutil", "-A", "-d", database, "-n", "Nomad E6D Ephemeral Test CA", "-t", "C,,", "-i", str(ca)], stage="trust_nss_import")
-    listed = run_checked(["certutil", "-L", "-d", database], stage="trust_nss_verify")
-    if "Nomad E6D Ephemeral Test CA" not in listed.stdout:
-        raise SliceError("chrome_nss_ca_import_failed")
-    yield
-
-
 def _credential_pipe() -> int:
     read_fd, write_fd = os.pipe()
     canary = b"TEST_ONLY_NOMAD_E6D_CANARY_NO_PROVIDER_CALLS"
@@ -334,7 +439,7 @@ def start_product(bundle: Path, env: Mapping[str, str], certs: Mapping[str, Path
     command = [
         str(bundle / "bin/nomad-web"), "--json", "start",
         "--provider", "OPENAI_API_KEY", "--credential-stdin",
-        "--workspace", str(REPO_ROOT), "--remote-local-evidence",
+        "--workspace", str(WORKSPACE_ROOT), "--remote-local-evidence",
         "--public-origin", public_origin, "--https-listen", https_listen,
         "--tls-cert-fd", str(cert_fd), "--tls-key-fd", str(key_fd),
     ]
@@ -432,8 +537,15 @@ def run_browser(
     desktop_url: str, public_origin: str, profile: Path, env: Mapping[str, str],
     diagnostic_spki_sha256: str | None = None,
 ) -> dict[str, Any]:
+    browser_raw, browser_digest = browser_runner_snapshot()
+    wrapper = (
+        "import hashlib,sys;raw=sys.stdin.buffer.read();"
+        "ns={'__name__':'__main__','__file__':'<verified-bundle-browser-runner>',"
+        "'__package__':None,'__runner_raw_sha256__':hashlib.sha256(raw).hexdigest()};"
+        "exec(compile(raw,'<verified-bundle-browser-runner>','exec'),ns,ns)"
+    )
     command = [
-        "uv", "run", "--with", "playwright==1.62.0", "python", str(BROWSER_RUNNER),
+        "uv", "run", "--with", "playwright==1.62.0", "python", "-I", "-B", "-c", wrapper,
         "--desktop-url", desktop_url, "--public-origin", public_origin,
         "--profile", str(profile), "--chrome", str(CHROME),
         "--timeout-ms", "20000",
@@ -442,15 +554,20 @@ def run_browser(
         command.extend(["--diagnostic-spki-sha256", diagnostic_spki_sha256])
     try:
         result = subprocess.run(
-            command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, env=dict(env), timeout=150, check=False,
+            command, input=browser_raw, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=dict(env), timeout=150, check=False,
         )
     except subprocess.TimeoutExpired as error:
         raise SliceError("browser_journey_timeout") from error
     try:
-        value = json.loads(result.stdout.strip().splitlines()[-1])
-    except (json.JSONDecodeError, IndexError) as error:
+        value = json.loads(result.stdout.decode("utf-8").strip().splitlines()[-1])
+    except (UnicodeDecodeError, json.JSONDecodeError, IndexError) as error:
         raise SliceError("browser_evidence_invalid") from error
+    if (
+        value.get("schema") != "nomad.m3e.desktop-browser-evidence.v1"
+        or value.get("runner_raw_sha256") != browser_digest
+    ):
+        raise SliceError("browser_source_binding_invalid")
     expected_status = "DIAGNOSTIC_COMPLETE" if diagnostic_spki_sha256 is not None else "PASS"
     if result.returncode != 0 or value.get("status") != expected_status:
         raise SliceError(
@@ -509,12 +626,18 @@ def runtime_database_summary(home: Path) -> dict[str, Any]:
 def write_evidence(path: Path, value: Mapping[str, Any]) -> None:
     path = path.absolute()
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     descriptor = os.open(path, flags, 0o600)
     try:
-        os.write(descriptor, canonical_json(value) + b"\n")
+        raw = canonical_json(value) + b"\n"
+        offset = 0
+        while offset < len(raw):
+            written = os.write(descriptor, raw[offset:])
+            if written <= 0:
+                raise OSError("evidence_write_failed")
+            offset += written
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
@@ -523,27 +646,49 @@ def write_evidence(path: Path, value: Mapping[str, Any]) -> None:
 def run_slice(
     bundle: Path, evidence_path: Path | None, keep_runtime: bool,
     diagnostic_spki_bypass: bool = False,
+    parent_evidence_digest: str | None = None,
+    tls_descriptors: tuple[int, int, int] | None = None,
 ) -> dict[str, Any]:
     manifest = load_manifest(bundle)
-    check = preflight(bundle)
-    if check["status"] != "READY":
-        identity = check["host_identity_preflight"]
-        evidence = {
-            "bundle_digest": check["bundle_digest"],
-            "host_identity_preflight": identity,
-            "processes": [], "process_count": 0,
-            "network_scope": "lan_direct", "provider_e3": "NOT_RUN",
-            "physical_phone": "NOT_RUN", "production_ready": False,
-            "content_free": True,
-        }
-        if "next_step" in check:
-            evidence["next_step"] = check["next_step"]
-        raise SliceError(
-            str(check.get("code", "PREFLIGHT_BLOCKED")),
-            {"business_process_count": identity["business_process_count"]},
-            evidence,
-        )
+    observed_source_binding = source_binding()
+    if observed_source_binding != manifest_source_binding(manifest):
+        raise SliceError("runner_source_binding_mismatch")
     root = private_root()
+    if tls_descriptors is None:
+        if not keep_runtime:
+            shutil.rmtree(root, ignore_errors=True)
+        raise SliceError("TLS_FDS_REQUIRED")
+    try:
+        certs = snapshot_and_validate_tls(root, tls_descriptors)
+    except BaseException:
+        if not keep_runtime:
+            shutil.rmtree(root, ignore_errors=True)
+        raise
+    try:
+        check = preflight(bundle)
+        if check["status"] != "READY":
+            identity = check["host_identity_preflight"]
+            evidence = {
+                "bundle": bundle_binding(manifest),
+                "source_binding": observed_source_binding,
+                "parent_evidence_digest": parent_evidence_digest,
+                "host_identity_preflight": identity,
+                "processes": [], "process_count": 0,
+                "network_scope": "lan_direct", "provider_e3": "NOT_RUN",
+                "physical_phone": "NOT_RUN", "production_ready": False,
+                "content_free": True, "diagnostic_tls_bypass": diagnostic_spki_bypass,
+            }
+            if "next_step" in check:
+                evidence["next_step"] = check["next_step"]
+            raise SliceError(
+                str(check.get("code", "PREFLIGHT_BLOCKED")),
+                {"business_process_count": identity["business_process_count"]},
+                evidence,
+            )
+    except BaseException:
+        if not keep_runtime:
+            shutil.rmtree(root, ignore_errors=True)
+        raise
     home = root / "home"
     ports = reserve_ports(9)
     public_port, relay, desktop, agent, join, host_v2, device_v2, admin, device_v1 = ports
@@ -559,21 +704,17 @@ def run_slice(
         "NO_PROXY": f"127.0.0.1,localhost,{LAN_ADDRESS}",
         "no_proxy": f"127.0.0.1,localhost,{LAN_ADDRESS}",
     })
-    certs = create_certificates(root)
     started = False
     primary_error: BaseException | None = None
     cleanup_error: str | None = None
     partial: dict[str, Any] = {
-        "bundle": {
-            "digest": manifest["bundle_digest"],
-            "source_commit_oid": manifest["source_commit_oid"],
-            "launcher_version": manifest["launcher_version"],
-            "classification": manifest["classification"],
-        },
+        "bundle": bundle_binding(manifest),
+        "source_binding": observed_source_binding,
+        "parent_evidence_digest": parent_evidence_digest,
         "processes": [], "process_count": 0, "tls_verified": False,
         "diagnostic_tls_bypass": diagnostic_spki_bypass,
         "tls": {
-            "ca_scope": "isolated_chrome_nss_profile", "san_lan_address": True,
+            "ca_scope": "operator_opened_normal_chrome_trust", "san_lan_address": True,
             "probe_client_verified": False, "normal_chrome_verification": False,
             "ignore_https_errors": False,
         },
@@ -605,20 +746,22 @@ def run_slice(
         partial["tls"]["probe_client_verified"] = True
         partial["public_negative_routes"] = negatives
         chrome_profile = root / "chrome-profile"
-        with temporary_chrome_trust(chrome_profile, certs["ca"]):
-            browser = run_browser(
-                state["desktop_url"], public_origin, chrome_profile, env,
-                leaf_spki_sha256(certs["cert"]) if diagnostic_spki_bypass else None,
-            )
+        chrome_profile.mkdir(mode=0o700, parents=True, exist_ok=False)
+        browser = run_browser(
+            state["desktop_url"], public_origin, chrome_profile, env,
+            leaf_spki_sha256(certs["cert"]) if diagnostic_spki_bypass else None,
+        )
         partial["tls"]["normal_chrome_verification"] = not diagnostic_spki_bypass
         partial["tls_verified"] = not diagnostic_spki_bypass
         evidence: dict[str, Any] = {
             "schema": SCHEMA,
             "status": "DIAGNOSTIC_COMPLETE" if diagnostic_spki_bypass else "PASS",
             "bundle": partial["bundle"],
+            "source_binding": partial["source_binding"],
+            "parent_evidence_digest": parent_evidence_digest,
             "processes": identities, "process_count": len(identities),
             "tls_verified": not diagnostic_spki_bypass, "tls": {
-                "ca_scope": "isolated_chrome_nss_profile",
+                "ca_scope": "operator_opened_normal_chrome_trust",
                 "san_lan_address": True,
                 "probe_client_verified": True,
                 "normal_chrome_verification": not diagnostic_spki_bypass,
@@ -635,8 +778,6 @@ def run_slice(
         }
         if not diagnostic_spki_bypass:
             evidence["marker"] = MARKER
-        if evidence_path is not None:
-            write_evidence(evidence_path, evidence)
         return evidence
     except BaseException as error:
         primary_error = error
@@ -681,19 +822,39 @@ def _sha256_file(path: Path) -> str:
 
 def main() -> int:
     args = parse_args()
+    try:
+        tls_descriptors = read_tls_fd_control()
+    except SliceError as error:
+        tls_descriptors = None
+        tls_control_error: SliceError | None = error
+    else:
+        tls_control_error = None
     if args.preflight:
-        result = preflight(args.bundle)
+        if tls_control_error is not None:
+            result = {"schema": "nomad.m3e.real-product-slice-preflight.v1", "status": "BLOCKED", "code": str(tls_control_error), "provider_e3": "NOT_RUN", "physical_phone": "NOT_RUN", "production_ready": False, "content_free": True}
+        else:
+            root = private_root()
+            try:
+                snapshot_and_validate_tls(root, tls_descriptors)  # type: ignore[arg-type]
+                result = preflight(args.bundle)
+            finally:
+                shutil.rmtree(root, ignore_errors=True)
         print(json.dumps(result, sort_keys=True, separators=(",", ":")))
         return 0 if result["status"] == "READY" else 2
     try:
+        if tls_control_error is not None:
+            raise tls_control_error
         result = run_slice(
-            args.bundle, args.evidence, args.keep_runtime, args.diagnostic_spki_bypass
+            args.bundle, args.evidence, args.keep_runtime, args.diagnostic_spki_bypass,
+            args.parent_evidence_digest, tls_descriptors,
         )
     except Exception as error:
         result = {
             "schema": SCHEMA, "status": "BLOCK",
             "code": str(error) if isinstance(error, SliceError) else type(error).__name__,
-            "bundle_digest": EXPECTED_BUNDLE_DIGEST, "network_scope": "lan_direct",
+            "source_binding": source_binding(),
+            "parent_evidence_digest": args.parent_evidence_digest,
+            "network_scope": "lan_direct",
             "provider_e3": "NOT_RUN", "physical_phone": "NOT_RUN",
             "production_ready": False, "content_free": True,
             "diagnostic_tls_bypass": args.diagnostic_spki_bypass,
@@ -706,6 +867,8 @@ def main() -> int:
             write_evidence(args.evidence, result)
         print(json.dumps(result, sort_keys=True, separators=(",", ":")))
         return 2
+    if args.evidence is not None:
+        write_evidence(args.evidence, result)
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
     return 0
 

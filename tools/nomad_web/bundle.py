@@ -42,12 +42,26 @@ REQUIRED = {
     "bin/nomad-ingress": 0o755,
 }
 REQUIRED_BY_SCHEMA = {SCHEMA_V1: REQUIRED_V1, SCHEMA: REQUIRED}
-REQUIRED_PACKAGE = {
+REQUIRED_PACKAGE_V1 = {
     f"lib/nomad_web/{name}" for name in (
         "__init__.py", "__main__.py", "bundle.py", "cli.py",
         "agent_runtime.py", "config.py", "doctor.py", "launcher.py", "materialize.py",
         "processes.py", "state.py",
     )
+}
+REQUIRED_PACKAGE = REQUIRED_PACKAGE_V1 | {
+    f"lib/nomad_web/{name}"
+    for name in ("evidence_resume.py", "install_lifecycle.py", "release_verify.py")
+}
+REQUIRED_RUNNER_CLOSURE = {
+    "testkit/remote-v2/run_m3e_product_slice.py",
+    "testkit/remote-v2/run_m3e_desktop_browser.py",
+}
+# Both accepted schemas carry the current Python CLI closure.  Schema v1/v2
+# distinguishes the native/gateway artifact set, not the launcher package.
+PACKAGE_BY_SCHEMA = {SCHEMA_V1: REQUIRED_PACKAGE, SCHEMA: REQUIRED_PACKAGE}
+RUNNERS_BY_SCHEMA = {
+    SCHEMA_V1: REQUIRED_RUNNER_CLOSURE, SCHEMA: REQUIRED_RUNNER_CLOSURE
 }
 TOP_KEYS = {"schema", "classification", "platform", "launcher_version", "source_commit_oid", "source_dirty", "build_tools", "agent_runtime", "files", "bundle_digest"}
 FILE_KEYS = {"path", "size_bytes", "raw_sha256", "mode"}
@@ -76,6 +90,8 @@ def verify_bundle(root: Path) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != TOP_KEYS or value["schema"] not in SUPPORTED_SCHEMAS:
         raise RuntimeError("INVALID_BUNDLE_MANIFEST")
     required = REQUIRED_BY_SCHEMA[value["schema"]]
+    required_package = PACKAGE_BY_SCHEMA[value["schema"]]
+    required_runners = RUNNERS_BY_SCHEMA[value["schema"]]
     if value["classification"] != "repo-local-prebuilt-not-production-authority" or value["platform"] != "darwin-arm64":
         raise RuntimeError("INVALID_BUNDLE_MANIFEST")
     if value["agent_runtime"] != AGENT_RUNTIME:
@@ -108,7 +124,14 @@ def verify_bundle(root: Path) -> dict[str, Any]:
         if not _safe_relative(name) or name in observed:
             raise RuntimeError("INVALID_BUNDLE_PATH")
         observed.add(name)
-        mode = required.get(name, 0o644 if name.startswith("web/") or name in REQUIRED_PACKAGE else None)
+        mode = required.get(
+            name,
+            0o644
+            if name.startswith("web/")
+            or name in required_package
+            or name in required_runners
+            else None,
+        )
         if (
             mode is None
             or type(entry["size_bytes"]) is not int
@@ -127,7 +150,13 @@ def verify_bundle(root: Path) -> dict[str, Any]:
     actual, directories = _walk(root)
     expected_files = observed | {MANIFEST}
     expected_dirs = {str(parent) for name in expected_files for parent in Path(name).parents if str(parent) != "."}
-    if actual != expected_files or directories != expected_dirs or not set(required).issubset(observed) or observed & REQUIRED_PACKAGE != REQUIRED_PACKAGE:
+    if (
+        actual != expected_files
+        or directories != expected_dirs
+        or not set(required).issubset(observed)
+        or observed & (REQUIRED_PACKAGE | REQUIRED_PACKAGE_V1) != required_package
+        or observed & REQUIRED_RUNNER_CLOSURE != required_runners
+    ):
         raise RuntimeError("BUNDLE_FILE_SET_MISMATCH")
     closure = gateway_module_closure(root / "gateway")
     expected_gateway_modules = GATEWAY_MODULES if value["schema"] == SCHEMA else GATEWAY_MODULES_V1

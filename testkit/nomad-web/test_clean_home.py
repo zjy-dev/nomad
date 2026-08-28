@@ -72,8 +72,10 @@ class NomadWebCleanHomeTests(unittest.TestCase):
         return result.returncode, json.loads(lines[-1]) if lines else {}
 
     def test_clean_home_lifecycle_is_readonly_and_secret_free(self) -> None:
-        _, doctor = self.run_cli("doctor")
+        code, doctor = self.run_cli("doctor", check=False)
+        self.assertEqual(code, 2)
         self.assertTrue(doctor["foundation_ready"])
+        self.assertEqual(doctor["release_readiness"], "BLOCK")
         self.assertFalse(doctor["production_ready"])
         _, started = self.run_cli("start")
         self.owned_processes.extend(started["processes"])
