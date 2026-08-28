@@ -137,7 +137,9 @@ export interface ResumeResult {
   error_message?: string | null;
 }
 
-// ---------- Commands (commands.schema.json) ----------
+// ---------- Shared public response enums ----------
+// CommandStatus and ErrorCode are shared by the public response-only
+// CommandSubmission model and legacy internal command results.
 
 export type CommandStatus =
   | 'RelayReceived'
@@ -162,6 +164,11 @@ export type ErrorCode =
   | 'ERR_SAFETY_BLOCKED'
   | 'ERR_PERMISSION_DENIED'
   | 'ERR_OUTCOME_UNKNOWN';
+
+// ---------- Legacy internal command models ----------
+// CommandResult, BaseCommand and the Command union below are retained only for
+// historical trace/mock/Host compatibility. They are not public First Real
+// User Web/Gateway request DTOs; those live in client/types.ts.
 
 export interface CommandResult {
   error_code: ErrorCode;

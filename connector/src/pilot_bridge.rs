@@ -1,4 +1,5 @@
-use crate::{AdapterCommandResult, ConnectorError, PilotCommand};
+use crate::opencode_adapter::{AdapterCommandResult, PilotCommand};
+use crate::ConnectorError;
 use serde_json::{json, Value};
 
 pub fn parse_pilot_command(payload: &Value) -> Result<PilotCommand, ConnectorError> {

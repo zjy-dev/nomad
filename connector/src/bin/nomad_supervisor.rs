@@ -1,4 +1,6 @@
-use nomad_connector::{native_supervisor_entrypoint, NATIVE_SUPERVISOR_BLOCKED};
+use nomad_connector::adapters::opencode::startup::{
+    native_supervisor_entrypoint, NATIVE_SUPERVISOR_BLOCKED,
+};
 
 fn main() {
     if native_supervisor_entrypoint().is_err() {

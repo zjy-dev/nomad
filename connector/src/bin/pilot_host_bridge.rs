@@ -1,8 +1,8 @@
-use nomad_connector::process_bridge::{AckPayload, RelayClient, RelayMessage, UreqRelayClient};
-use nomad_connector::{
-    parse_pilot_command, result_payload, CommandJournal, ConnectorError, PilotAdapter,
-    UreqOpenCodeClient,
+use nomad_connector::adapters::opencode::{
+    parse_pilot_command, result_payload, PilotAdapter, PilotCapture, UreqOpenCodeClient,
 };
+use nomad_connector::process_bridge::{AckPayload, RelayClient, RelayMessage, UreqRelayClient};
+use nomad_connector::{CommandJournal, ConnectorError};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::env;
@@ -244,7 +244,7 @@ fn publish_safe_capture(
     })
 }
 
-fn mobile_capture(capture: &nomad_connector::PilotCapture, aliases: &MobileAliases) -> Value {
+fn mobile_capture(capture: &PilotCapture, aliases: &MobileAliases) -> Value {
     json!({
         "session_id": aliases.session_id(&capture.snapshot.session_id),
         "snapshot_seq": capture.snapshot.snapshot_seq,

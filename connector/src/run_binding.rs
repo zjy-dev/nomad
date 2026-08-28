@@ -15,6 +15,7 @@
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::io::{Read, Write};
+use zeroize::Zeroize;
 
 pub const RUN_BINDING_VERSION: u8 = 1;
 const MAX_FRAME: usize = 1024;
@@ -378,14 +379,15 @@ pub(crate) fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(inner_pad);
     digest.update(message);
-    let inner_hash = digest.finalize();
+    let mut inner_hash: [u8; 32] = digest.finalize().into();
     let mut digest = Sha256::new();
     digest.update(outer_pad);
     digest.update(inner_hash);
     let result = digest.finalize().into();
-    normalized.fill(0);
-    inner_pad.fill(0);
-    outer_pad.fill(0);
+    normalized.zeroize();
+    inner_pad.zeroize();
+    outer_pad.zeroize();
+    inner_hash.zeroize();
     result
 }
 pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {

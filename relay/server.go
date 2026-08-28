@@ -21,14 +21,20 @@ import (
 
 // Server is the relay HTTP/WebSocket server.
 type Server struct {
-	db      *mailboxDB
-	httpSrv *http.Server
-	wsHub   *wsHub
-	addr    string
+	db    *mailboxDB
+	wsHub *wsHub
+	addr  string
+
+	lifecycleMu       sync.Mutex
+	httpSrv           *http.Server
+	shutdownRequested bool
 
 	testBridge        TestBridgeStorage
 	testBridgeToken   string
 	testBridgeEnabled bool
+	alphaLocal        bool
+	alphaLocalDevice  DeviceID
+	alphaToken        string
 }
 
 // NewServer creates a new relay server backed by the given mailbox DB.
@@ -38,6 +44,26 @@ func NewServer(db *mailboxDB, addr string) *Server {
 		wsHub: newWSHub(),
 		addr:  addr,
 	}
+}
+
+// SetLocalAlpha enables the local Alpha read boundary. It requires loopback
+// binding, the fixed local device fixture, and a dedicated non-empty token
+// injected at runtime.
+func (s *Server) SetLocalAlpha(token string) error {
+	if !IsLoopbackAddr(s.addr) {
+		return fmt.Errorf("relay: alpha-local requires loopback address, got %s", s.addr)
+	}
+	if strings.TrimSpace(token) == "" {
+		return fmt.Errorf("relay: alpha-local token is empty")
+	}
+	deviceID, _, err := AlphaLocalFixture()
+	if err != nil {
+		return err
+	}
+	s.alphaLocal = true
+	s.alphaLocalDevice = deviceID
+	s.alphaToken = token
+	return nil
 }
 
 // SetTestBridge enables the TEST-ONLY bridge endpoints.
@@ -50,7 +76,7 @@ func (s *Server) SetTestBridge(store TestBridgeStorage, token string) error {
 	if token == "" {
 		return fmt.Errorf("relay: test bridge token is empty")
 	}
-	if !isLoopbackAddr(s.addr) {
+	if !IsLoopbackAddr(s.addr) {
 		return fmt.Errorf("relay: test bridge requires loopback address, got %s", s.addr)
 	}
 	s.testBridge = store
@@ -59,8 +85,8 @@ func (s *Server) SetTestBridge(store TestBridgeStorage, token string) error {
 	return nil
 }
 
-// isLoopbackAddr checks whether the given address string binds to a loopback interface.
-func isLoopbackAddr(addr string) bool {
+// IsLoopbackAddr checks whether the given address string binds to a loopback interface.
+func IsLoopbackAddr(addr string) bool {
 	if addr == "" || addr == ":0" {
 		return false
 	}
@@ -106,7 +132,7 @@ func (s *Server) Start() error {
 		s.registerTestBridgeRoutes(mux)
 	}
 
-	s.httpSrv = &http.Server{
+	httpSrv := &http.Server{
 		Addr:         s.addr,
 		Handler:      mux,
 		ReadTimeout:  10 * time.Second,
@@ -118,14 +144,48 @@ func (s *Server) Start() error {
 	if err != nil {
 		return fmt.Errorf("relay: listen: %w", err)
 	}
+	s.lifecycleMu.Lock()
+	if s.shutdownRequested {
+		s.lifecycleMu.Unlock()
+		_ = ln.Close()
+		return nil
+	}
+	s.httpSrv = httpSrv
+	s.lifecycleMu.Unlock()
 
 	log.Printf("[relay] listening on %s", ln.Addr().String())
-	return s.httpSrv.Serve(ln)
+	return normalizeServerError(httpSrv.Serve(ln))
+}
+
+func normalizeServerError(err error) error {
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
 }
 
 // Shutdown gracefully stops the server.
 func (s *Server) Shutdown(ctx context.Context) error {
-	return s.httpSrv.Shutdown(ctx)
+	s.lifecycleMu.Lock()
+	s.shutdownRequested = true
+	httpSrv := s.httpSrv
+	s.lifecycleMu.Unlock()
+	if httpSrv == nil {
+		return nil
+	}
+	return httpSrv.Shutdown(ctx)
+}
+
+// Close immediately stops the server after a graceful shutdown timeout.
+func (s *Server) Close() error {
+	s.lifecycleMu.Lock()
+	s.shutdownRequested = true
+	httpSrv := s.httpSrv
+	s.lifecycleMu.Unlock()
+	if httpSrv == nil {
+		return nil
+	}
+	return httpSrv.Close()
 }
 
 // --- Handlers ---
@@ -147,17 +207,25 @@ func (s *Server) handleFrame(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	maxBody := make([]byte, MaxFrameSize+MinEnvelopeSize+1)
-	n, _ := r.Body.Read(maxBody)
-	if n == 0 {
+	limited := http.MaxBytesReader(w, r.Body, int64(MaxFrameSize+MinEnvelopeSize+1))
+	raw, err := io.ReadAll(limited)
+	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, ErrFrameTooLarge.Error(), http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "failed to read request body", http.StatusBadRequest)
+		return
+	}
+	if len(raw) == 0 {
 		http.Error(w, "empty body", http.StatusBadRequest)
 		return
 	}
-	if n > MaxFrameSize+MinEnvelopeSize {
+	if len(raw) > MaxFrameSize+MinEnvelopeSize {
 		http.Error(w, ErrFrameTooLarge.Error(), http.StatusRequestEntityTooLarge)
 		return
 	}
-	raw := maxBody[:n]
 
 	env, err := Unmarshal(raw)
 	if err != nil {
@@ -166,6 +234,10 @@ func (s *Server) handleFrame(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := env.Validate(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if s.alphaLocal && env.DeviceID != s.alphaLocalDevice {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -213,6 +285,9 @@ func (s *Server) handleFramesList(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if !s.authorizeAlphaLocalRead(w, r) {
+		return
+	}
 
 	deviceHex := r.URL.Query().Get("device")
 	if deviceHex == "" {
@@ -226,6 +301,10 @@ func (s *Server) handleFramesList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	copy(deviceID[:], decoded)
+	if s.alphaLocal && deviceID != s.alphaLocalDevice {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 
 	if _, err := s.db.GetDevice(deviceID); err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
@@ -259,6 +338,9 @@ func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if !s.authorizeAlphaLocalRead(w, r) {
+		return
+	}
 
 	var req struct {
 		Device   string   `json:"device"`
@@ -277,6 +359,10 @@ func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	copy(deviceID[:], decoded)
+	if s.alphaLocal && deviceID != s.alphaLocalDevice {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 
 	if _, err := s.db.GetDevice(deviceID); err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
@@ -311,6 +397,10 @@ func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeviceRegister(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.alphaLocal {
+		http.Error(w, "READ_ONLY_ALPHA", http.StatusForbidden)
 		return
 	}
 
@@ -356,6 +446,10 @@ func (s *Server) handleDeviceDeregister(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if s.alphaLocal {
+		http.Error(w, "READ_ONLY_ALPHA", http.StatusForbidden)
+		return
+	}
 
 	var req struct {
 		DeviceID string `json:"device_id"`
@@ -388,7 +482,35 @@ func (s *Server) handleDeviceDeregister(w http.ResponseWriter, r *http.Request) 
 
 // handleWebSocket upgrades to WebSocket for live frame notifications.
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeAlphaLocalRead(w, r) {
+		return
+	}
+	if s.alphaLocal {
+		deviceHex := r.URL.Query().Get("device")
+		if deviceHex != fmt.Sprintf("%x", s.alphaLocalDevice[:]) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+	}
 	s.wsHub.serveHTTP(w, r)
+}
+
+func (s *Server) authorizeAlphaLocalRead(w http.ResponseWriter, r *http.Request) bool {
+	if !s.alphaLocal {
+		return true
+	}
+	const prefix = "Bearer "
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, prefix) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	provided := strings.TrimPrefix(auth, prefix)
+	if subtle.ConstantTimeCompare([]byte(provided), []byte(s.alphaToken)) != 1 {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	return true
 }
 
 // --- TEST-ONLY Bridge Handlers ---

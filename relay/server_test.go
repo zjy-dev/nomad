@@ -9,11 +9,51 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 )
+
+func TestGracefulServerCloseIsNotAnError(t *testing.T) {
+	if err := normalizeServerError(http.ErrServerClosed); err != nil {
+		t.Fatalf("graceful close returned %v", err)
+	}
+	want := fmt.Errorf("listen failed")
+	if got := normalizeServerError(want); got != want {
+		t.Fatalf("non-graceful error changed to %v", got)
+	}
+}
+
+func TestServerShutdownBeforeStartIsNilSafeAndPreventsListening(t *testing.T) {
+	db, err := NewMailboxDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	server := NewServer(db, addr)
+	if err := server.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown before start: %v", err)
+	}
+	if err := server.Start(); err != nil {
+		t.Fatalf("start after shutdown: %v", err)
+	}
+	probe, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("server retained listener after pre-start shutdown: %v", err)
+	}
+	probe.Close()
+}
 
 // TestDeviceRegisterAndFrameFlow exercises the full register->frame->deliver->ack HTTP flow.
 func TestDeviceRegisterAndFrameFlow(t *testing.T) {
@@ -364,4 +404,126 @@ func TestFrameRateLimitOverHTTP(t *testing.T) {
 		t.Errorf("expected 429 rate limited, got %d", resp.StatusCode)
 	}
 	resp.Body.Close()
+}
+
+func TestHandleFrameReadsFragmentedBodyAndPreservesExactMaxEnvelope(t *testing.T) {
+	db, err := NewMailboxDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	srv := NewServer(db, "127.0.0.1:0")
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/frame", srv.handleFrame)
+	mux.HandleFunc("/v1/frames", srv.handleFramesList)
+	mux.HandleFunc("/v1/devices/register", srv.handleDeviceRegister)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	deviceID := GenerateTestDeviceID()
+	regBody := map[string]interface{}{
+		"device_id":  fmt.Sprintf("%x", deviceID[:]),
+		"pubkey_hex": fmt.Sprintf("%x", []byte(pub)),
+	}
+	regJSON, _ := json.Marshal(regBody)
+	resp, err := http.Post(ts.URL+"/v1/devices/register", "application/json", bytes.NewReader(regJSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	payload := bytes.Repeat([]byte{0x5a}, MaxFrameSize)
+	env := NewEnvelope(deviceID, FlagRequest, payload)
+	if err := env.Sign(priv); err != nil {
+		t.Fatal(err)
+	}
+	raw := env.Marshal()
+	if len(raw) != MaxFrameSize+MinEnvelopeSize {
+		t.Fatalf("expected exact max envelope size %d, got %d", MaxFrameSize+MinEnvelopeSize, len(raw))
+	}
+
+	reader, writer := io.Pipe()
+	go func() {
+		defer writer.Close()
+		mid := len(raw) / 2
+		_, _ = writer.Write(raw[:mid])
+		time.Sleep(20 * time.Millisecond)
+		_, _ = writer.Write(raw[mid:])
+	}()
+	resp, err = http.Post(ts.URL+"/v1/frame", "application/octet-stream", reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("fragmented exact-max frame: expected 202, got %d: %s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+
+	resp, err = http.Get(ts.URL + "/v1/frames?device=" + fmt.Sprintf("%x", deviceID[:]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var frames []struct {
+		Payload string `json:"payload"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&frames); err != nil {
+		t.Fatal(err)
+	}
+	if len(frames) != 1 {
+		t.Fatalf("expected 1 frame, got %d", len(frames))
+	}
+	decoded, err := hex.DecodeString(frames[0].Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(decoded, payload) {
+		t.Fatalf("payload changed through fragmented read")
+	}
+}
+
+func TestHandleFrameOversizeRejectedBeforeSignatureVerification(t *testing.T) {
+	db, err := NewMailboxDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	srv := NewServer(db, "127.0.0.1:0")
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/frame", srv.handleFrame)
+	mux.HandleFunc("/v1/devices/register", srv.handleDeviceRegister)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	deviceID := GenerateTestDeviceID()
+	regBody := map[string]interface{}{
+		"device_id":  fmt.Sprintf("%x", deviceID[:]),
+		"pubkey_hex": fmt.Sprintf("%x", []byte(pub)),
+	}
+	regJSON, _ := json.Marshal(regBody)
+	resp, err := http.Post(ts.URL+"/v1/devices/register", "application/json", bytes.NewReader(regJSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	env := NewEnvelope(deviceID, FlagRequest, bytes.Repeat([]byte{0x33}, MaxFrameSize))
+	if err := env.Sign(priv); err != nil {
+		t.Fatal(err)
+	}
+	raw := append(env.Marshal(), 0x99)
+	resp, err = http.Post(ts.URL+"/v1/frame", "application/octet-stream", bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("oversize frame: expected 413, got %d: %s", resp.StatusCode, body)
+	}
 }

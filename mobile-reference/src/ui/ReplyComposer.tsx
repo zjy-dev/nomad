@@ -1,12 +1,12 @@
-import { useState } from 'react';
-import type { Command, CommandResult, CommandStatus } from '../contracts/types';
+import { useRef, useState } from 'react';
+import type { CommandLifecycleStatus, PublicCommandResult, PublicReplyCommandRequest, PublicStopCommandRequest } from '../client/types';
 
 export interface DraftState {
   text: string;
-  status: 'idle' | 'drafting' | 'sending' | 'sent' | 'failed';
+  status: 'idle' | 'drafting' | 'sending' | 'sent' | 'unknown' | 'failed';
   requestId: string | null;
-  commandStatus: CommandStatus | null;
-  result: CommandResult | null;
+  commandStatus: CommandLifecycleStatus | null;
+  result: PublicCommandResult | null;
   error: string | null;
   createdAt: string;
   sentAt: string | null;
@@ -28,21 +28,26 @@ export function makeDraft(initialText = ''): DraftState {
 interface ReplyComposerProps {
   draft: DraftState;
   onChange: (text: string) => void;
-  onSubmit: (content: string, requestId: string) => Promise<CommandResult>;
+  onSubmit: (content: string, requestId: string) => Promise<PublicCommandResult>;
   onClear: () => void;
   disabled?: boolean;
+  capabilityDisabled?: boolean;
+  disabledReason?: string;
 }
 
-export function ReplyComposer({ draft, onChange, onSubmit, onClear, disabled }: ReplyComposerProps) {
+export function ReplyComposer({ draft, onChange, onSubmit, onClear, disabled, capabilityDisabled = false, disabledReason }: ReplyComposerProps) {
   const [submitting, setSubmitting] = useState(false);
+  const submittingRef = useRef(false);
 
   async function handleSubmit() {
-    if (!draft.text.trim() || submitting) return;
+    if (!draft.text.trim() || submittingRef.current || disabled || capabilityDisabled) return;
     const requestId = `cli_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    submittingRef.current = true;
     setSubmitting(true);
     try {
       await onSubmit(draft.text, requestId);
     } finally {
+      submittingRef.current = false;
       setSubmitting(false);
     }
   }
@@ -60,13 +65,13 @@ export function ReplyComposer({ draft, onChange, onSubmit, onClear, disabled }: 
         onChange={(e) => onChange(e.target.value)}
         placeholder="Type your reply to the agent…"
         aria-label="Reply to agent"
-        disabled={disabled}
+        disabled={disabled || capabilityDisabled}
       />
       <div className="btn-row" style={{ marginTop: 10 }}>
         <button
           className="btn btn--primary"
           onClick={handleSubmit}
-          disabled={disabled || submitting || !draft.text.trim()}
+          disabled={disabled || capabilityDisabled || submitting || !draft.text.trim()}
           aria-label="Send reply"
         >
           {submitting ? 'Sending…' : 'Send reply'}
@@ -75,6 +80,7 @@ export function ReplyComposer({ draft, onChange, onSubmit, onClear, disabled }: 
           Discard
         </button>
       </div>
+      {capabilityDisabled && disabledReason && <div className="command-status" role="status">{disabledReason}</div>}
       <DraftStatusRow draft={draft} />
     </div>
   );
@@ -83,8 +89,10 @@ export function ReplyComposer({ draft, onChange, onSubmit, onClear, disabled }: 
 function DraftStatusRow({ draft }: { draft: DraftState }) {
   const items: Array<{ label: string; cls: string; highlight?: boolean }> = [];
   items.push({ label: 'Saved on this phone', cls: 'draft-stage' });
-  if (draft.status === 'sending') items.push({ label: 'Sending to Relay', cls: 'draft-stage draft-stage--current' });
-  if (draft.status === 'sent' && draft.result) {
+  if (draft.status === 'sending') items.push({ label: 'Sending to local Gateway', cls: 'draft-stage draft-stage--current' });
+  if (draft.status === 'unknown' && draft.result) {
+    items.push({ label: 'Result unknown; not retried', cls: 'draft-stage draft-stage--current' });
+  } else if (draft.status === 'sent' && draft.result) {
     // INV-003-2: RELAY-RECEIVED is always shown when the relay has acknowledged.
     // HOST-ACCEPTED is ONLY shown when the explicit commandStatus says so —
     // never inferred from error_code === 'OK'.
@@ -92,12 +100,16 @@ function DraftStatusRow({ draft }: { draft: DraftState }) {
     if (cs === null || cs === 'RelayReceived') {
       items.push({ label: 'Relay received', cls: 'draft-stage draft-stage--current' });
     } else if (cs === 'HostAccepted') {
-      items.push({ label: 'Relay received', cls: 'draft-stage' });
+      items.push({ label: 'Sent to local Gateway', cls: 'draft-stage' });
       items.push({ label: 'Host accepted', cls: 'draft-stage draft-stage--current' });
-    } else if (cs === 'Executing') {
-      items.push({ label: 'Relay received', cls: 'draft-stage' });
+    } else if (cs === 'Dispatching' || cs === 'Executing') {
+      items.push({ label: 'Sent to local Gateway', cls: 'draft-stage' });
       items.push({ label: 'Host accepted', cls: 'draft-stage' });
-      items.push({ label: 'Agent is continuing', cls: 'draft-stage draft-stage--current' });
+      items.push({ label: 'Host is dispatching; outcome not final', cls: 'draft-stage draft-stage--current' });
+    } else if (cs === 'DispatchAcknowledged') {
+      items.push({ label: 'Sent to local Gateway', cls: 'draft-stage' });
+      items.push({ label: 'Host accepted', cls: 'draft-stage' });
+      items.push({ label: 'Agent endpoint acknowledged; waiting for authoritative state', cls: 'draft-stage draft-stage--current' });
     } else if (cs === 'Completed') {
       items.push({ label: 'Relay received', cls: 'draft-stage' });
       items.push({ label: 'Host accepted', cls: 'draft-stage' });
@@ -109,9 +121,6 @@ function DraftStatusRow({ draft }: { draft: DraftState }) {
     } else if (cs === 'Stale') {
       items.push({ label: 'Relay received', cls: 'draft-stage' });
       items.push({ label: 'State changed — review again', cls: 'draft-stage draft-stage--current' });
-    } else if (cs === 'OutcomeUnknown') {
-      items.push({ label: 'Relay received', cls: 'draft-stage' });
-      items.push({ label: 'Host result unknown', cls: 'draft-stage draft-stage--current' });
     } else {
       items.push({ label: 'Relay received', cls: 'draft-stage' });
       items.push({ label: 'Waiting for Host result', cls: 'draft-stage draft-stage--current' });
@@ -133,45 +142,28 @@ function DraftStatusRow({ draft }: { draft: DraftState }) {
 
 export function makeReplyCommand(
   sessionId: string,
-  seq: number,
+  observedSeq: number,
   turnId: string | null,
   content: string,
   requestId: string
-): Command {
+): PublicReplyCommandRequest {
   return {
     command_type: 'reply',
     request_id: requestId,
     session_id: sessionId,
-    seq,
+    observed_seq: observedSeq,
     turn_id: turnId,
     content,
   };
 }
 
-export function makeStopCommand(sessionId: string, seq: number, targetTurnId: string, requestId: string): Command {
+export function makeStopCommand(sessionId: string, observedSeq: number, targetTurnId: string, requestId: string): PublicStopCommandRequest {
   return {
     command_type: 'stop',
     request_id: requestId,
     session_id: sessionId,
-    seq,
+    observed_seq: observedSeq,
     target_turn_id: targetTurnId,
-  };
-}
-
-export function makeInterruptAndSendCommand(
-  sessionId: string,
-  seq: number,
-  interruptTurnId: string,
-  newContent: string,
-  requestId: string
-): Command {
-  return {
-    command_type: 'interrupt_and_send',
-    request_id: requestId,
-    session_id: sessionId,
-    seq,
-    interrupt_turn_id: interruptTurnId,
-    new_content: newContent,
   };
 }
 

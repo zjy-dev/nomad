@@ -1,4 +1,4 @@
-use nomad_connector::{
+use nomad_connector::adapters::opencode::startup::{
     nomad_host_entrypoint, HOST_PREREQUISITES_BLOCKED, HOST_PREREQUISITES_VERIFIED,
 };
 

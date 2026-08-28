@@ -6,14 +6,16 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { DraftState, makeDraft } from './ReplyComposer';
+import { DraftState, makeDraft, makeReplyCommand, makeStopCommand } from './ReplyComposer';
 
 function labels(draft: DraftState): string[] {
   const items: string[] = [];
   if (draft.requestId) items.push('request');
   items.push('LOCAL-DRAFT');
   if (draft.status === 'sending') items.push('RELAY-SENDING');
-  if (draft.status === 'sent' && draft.result) {
+  if (draft.status === 'unknown' && draft.result) {
+    items.push('OUTCOME-UNKNOWN');
+  } else if (draft.status === 'sent' && draft.result) {
     const cs = draft.commandStatus;
     if (cs === null || cs === 'RelayReceived') {
       items.push('RELAY-RECEIVED');
@@ -24,6 +26,9 @@ function labels(draft: DraftState): string[] {
       items.push('RELAY-RECEIVED');
       items.push('HOST-ACCEPTED');
       items.push('EXECUTING');
+    } else if (cs === 'DispatchAcknowledged') {
+      items.push('HOST-ACCEPTED');
+      items.push('DISPATCH-ACKNOWLEDGED');
     } else if (cs === 'Completed') {
       items.push('RELAY-RECEIVED');
       items.push('HOST-ACCEPTED');
@@ -35,9 +40,6 @@ function labels(draft: DraftState): string[] {
     } else if (cs === 'Stale') {
       items.push('RELAY-RECEIVED');
       items.push('STALE');
-    } else if (cs === 'OutcomeUnknown') {
-      items.push('RELAY-RECEIVED');
-      items.push('OUTCOME-UNKNOWN');
     } else {
       items.push('RELAY-RECEIVED');
       items.push(`STATUS:${cs}`);
@@ -50,6 +52,13 @@ function labels(draft: DraftState): string[] {
 }
 
 describe('DraftState lifecycle — INV-003-2', () => {
+  it('uses the currently observed sequence without incrementing it', () => {
+    expect(makeReplyCommand('s', 7, 't', 'hello', 'r')).toEqual(expect.objectContaining({ observed_seq: 7 }));
+    expect(makeStopCommand('s', 7, 't', 'r')).toEqual(expect.objectContaining({ observed_seq: 7 }));
+    expect(makeReplyCommand('s', 7, 't', 'hello', 'r')).not.toHaveProperty('seq');
+    expect(makeStopCommand('s', 7, 't', 'r')).not.toHaveProperty('seq');
+  });
+
   it('idle draft shows only LOCAL-DRAFT', () => {
     const d = makeDraft('hello');
     const out = labels(d);
@@ -171,14 +180,24 @@ describe('DraftState lifecycle — INV-003-2', () => {
   it('OutcomeUnknown stage does not imply HostAccepted', () => {
     const d: DraftState = {
       ...makeDraft('hello'),
-      status: 'sent',
+      status: 'unknown',
       requestId: 'req-8',
       commandStatus: 'OutcomeUnknown',
       result: { error_code: 'ERR_OUTCOME_UNKNOWN', error_message: null },
     };
     const out = labels(d);
-    expect(out).toContain('RELAY-RECEIVED');
     expect(out).toContain('OUTCOME-UNKNOWN');
+    expect(out).not.toContain('RELAY-RECEIVED');
     expect(out).not.toContain('HOST-ACCEPTED');
+  });
+
+  it('DispatchAcknowledged remains non-terminal and is not rendered as Completed', () => {
+    const d: DraftState = {
+      ...makeDraft('hello'), status: 'sent', requestId: 'req-9', commandStatus: 'DispatchAcknowledged',
+      result: { error_code: 'OK', error_message: null },
+    };
+    const out = labels(d);
+    expect(out).toContain('DISPATCH-ACKNOWLEDGED');
+    expect(out).not.toContain('COMPLETED');
   });
 });

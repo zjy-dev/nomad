@@ -1,18 +1,19 @@
 import type { ViewState } from '../contracts/reducer';
 import { canSubmitSafeOperations } from '../contracts/reducer';
 
-export function StatusChips({ state }: { state: ViewState }) {
+export function StatusChips({ state, readOnly = false }: { state: ViewState; readOnly?: boolean }) {
   const online = state.session.host_connectivity === 'Online';
   const freshness = state.session.client_freshness;
   return (
     <div className="status-strip" aria-label="Connection safety status">
       <span className={`status-cell status-cell--${online ? 'ok' : 'danger'}`} role="status"><b>{online ? '✓' : '×'}</b><span><strong>{online ? 'Online' : 'Offline'}</strong><small>{online ? 'Host reachable' : 'Host unreachable'}</small></span></span>
-      <span className={`status-cell status-cell--${freshness === 'Live' ? 'ok' : freshness === 'Reconnecting' ? 'warn' : 'danger'}`} role="status"><b>{freshness === 'Live' ? '✓' : freshness === 'Reconnecting' ? '↻' : '!'}</b><span><strong>{freshness}</strong><small>{freshness === 'Live' ? 'State verified' : freshness === 'Reconnecting' ? 'Checking state' : 'State not verified'}</small></span></span>
+      <span className={`status-cell status-cell--${freshness === 'Live' ? 'ok' : freshness === 'Reconnecting' ? 'warn' : 'danger'}`} role="status"><b>{freshness === 'Live' ? '✓' : freshness === 'Reconnecting' ? '↻' : '!'}</b><span><strong>{freshness}</strong><small>{freshness === 'Live' ? (readOnly ? 'Read-only state verified' : 'State verified') : freshness === 'Reconnecting' ? 'Checking state' : 'State not verified'}</small></span></span>
     </div>
   );
 }
 
-export function SafetyGateBanner({ state }: { state: ViewState }) {
+export function SafetyGateBanner({ state, readOnly = false }: { state: ViewState; readOnly?: boolean }) {
+  if (readOnly) return <div className="callout"><strong className="callout-title">Read-only capability</strong><div className="callout-body">This Alpha can display and refresh local session state. It cannot send commands.</div></div>;
   const gate = canSubmitSafeOperations(state);
   if (gate.ok) return null;
   return <div className="perm-block" role="alert"><strong>Actions are paused</strong><div>{friendlyGateReason(state)}</div></div>;

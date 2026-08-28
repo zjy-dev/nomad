@@ -1,0 +1,42 @@
+{
+  "iteration": 6,
+  "milestone": "M3-E secure product pairing",
+  "status": "in_progress",
+  "last_seen": "2026-08-28T06:35:00Z",
+  "completed": [
+    "M3 local multi-process encrypted mechanical slice frozen",
+    "Host Keychain identity P1 rework independently PASS/FREEZE",
+    "Host pairing coordinator E1 independently PASS/FREEZE with 12 focused tests",
+    "Relay v2 lifecycle and provisioning independently PASS/FREEZE",
+    "Gateway desktop/join route split independently PASS/FREEZE with 98/98 tests",
+    "Browser vault/pairing independently PASS/FREEZE; Chromium and WebKit close/reopen evidence PASS",
+    "Relay v2 lifecycle and provisioning uncached test/race/vet PASS",
+    "Product Host E2b bootstrap frozen at sha256 4a48949e8ae09427e6dab24b2748a730191984a49a4f3024da147b621a07cd1e with 31/31 focused tests",
+    "Browser remote runtime and UI exact-retry chain independently PASS/FREEZE with 287/287 full Web tests",
+    "E1.3 replacement-intent independently PASS/FREEZE at sha256 b29b7c9ff25497bcc624a8976bd76b9d44f2bc86baa2ce95ea829179c3ab0745",
+    "E2/E2c Product Host, disposition, durable poison, and lifecycle supervision independently PASS/FREEZE"
+    ,"E6-A launcher composition independently PASS/FREEZE after uninstall, readiness, TLS verification, and relay DB mode rework"
+    ,"E6-B HTTPS ingress independently PASS/FREEZE"
+    ,"E6-C bundle closure independently PASS/FREEZE after binary-name and ESM lexer rework"
+    ,"Host identity preflight/authorize contract implemented and independently audited"
+    ,"Desktop pairing CSRF independently decoupled from Agent command capability; Gateway 100/100 and Web 213/213 PASS"
+    ,"View-only remote projection independently PASS/FREEZE with capability optional and stale capability cleared"
+    ,"E6 bundle dependency closure and ingress binary naming independently PASS/FREEZE"
+    ,"E6 launcher private Relay DB modes and primary-error rollback handling covered by real initialization tests"
+    ,"E6 launcher/ingress/bundle passed independent audits; final bundle closure and installer path verified"
+    ,"Host identity preflight/authorize K1-K3 independently PASS/FREEZE; nomad-web suite 79/79 PASS"
+  ],
+  "active": [
+    "E6-D strict real-process and desktop-browser acceptance after user Keychain and Chrome trust authorization"
+  ],
+  "blocked_or_not_run": [
+    "Physical iPhone Safari acceptance NOT_RUN",
+    "Real Provider E3 NOT_RUN",
+    "Clean-machine install NOT_RUN",
+    "Developer ID signing and notarization NOT_RUN",
+    "Current strict bundle run BLOCKED: HOST_IDENTITY_USER_DENIED before any business process; foreground TTY authorization was explicitly denied",
+    "macOS Chrome normal trust for an ephemeral LAN CA is unavailable without user trust approval; exact-SPKI runs are diagnostic-only"
+  ],
+  "stale_count": 0,
+  "production_ready": false
+}

@@ -1,0 +1,45 @@
+{
+  "iteration": 3,
+  "status": "local_readonly_alpha_slice_complete_external_pilot_inputs_required",
+  "last_seen": "2026-08-25T01:26:39+08:00",
+  "current_gate": "P4_B1_B5_external_inputs",
+  "completed_gates": [
+    "P4_product_plan",
+    "P4_architecture_dispatch",
+    "P4_A0_readiness_doctor",
+    "P4_A1_agent_boundary_audit",
+    "P4_A4_operator_handoff",
+    "P4_local_alpha_A1_relay",
+    "P4_local_alpha_A1_fixed_device_reaudit",
+    "P4_local_alpha_A2_host_projector_gateway",
+    "P4_local_alpha_A2_independent_audit",
+    "P4_local_alpha_A3_mobile_default_wiring",
+    "P4_local_alpha_real_multiprocess_acceptance",
+    "P4_local_alpha_real_browser_acceptance",
+    "P4_local_alpha_final_product_audit"
+  ],
+  "pending_gates": [
+    "P4_B1_temporary_provider_credential",
+    "P4_B2_developer_id_host",
+    "P4_B3_sshsig_trust_krl_approval",
+    "P4_B4_protected_cas_publication",
+    "P4_B5_locked_official_opencode",
+    "P4_C1_production_supervisor_composition",
+    "P4_C2_real_four_hop_controlled_pilot"
+  ],
+  "test_counts": {
+    "readiness_doctor_focused": 10,
+    "relay_full": "PASS",
+    "relay_race": "PASS",
+    "connector_full": 123,
+    "gateway_node": 29,
+    "mobile_vitest": 104,
+    "readiness_and_alpha_python": 11,
+    "alpha_multiprocess": "PASS",
+    "alpha_browser": "PASS"
+  },
+  "agent_neutral_boundary": "defer_large_refactor_until_second_real_adapter",
+  "local_alpha_scope": "localhost_only_readonly_non_production_non_pilot",
+  "stale_count": 0,
+  "external_blocker": "provider_credential_developer_id_sshsig_trust_protected_cas_and_official_opencode_evidence_required"
+}

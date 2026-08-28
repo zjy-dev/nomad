@@ -1,6 +1,8 @@
+use nomad_connector::adapters::opencode::{
+    current_release_authorization, APPROVAL_EXPIRED_OR_INVALID,
+};
 use nomad_connector::{
-    current_release_authorization, parse_release_container, ConnectorError,
-    HistoricalReleaseEvidence, ReleaseBundleError, APPROVAL_EXPIRED_OR_INVALID,
+    parse_release_container, ConnectorError, HistoricalReleaseEvidence, ReleaseBundleError,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};

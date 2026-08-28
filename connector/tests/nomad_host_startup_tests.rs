@@ -1,4 +1,6 @@
-use nomad_connector::{HOST_PREREQUISITES_BLOCKED, HOST_PREREQUISITES_VERIFIED};
+use nomad_connector::adapters::opencode::startup::{
+    HOST_PREREQUISITES_BLOCKED, HOST_PREREQUISITES_VERIFIED,
+};
 use std::fs;
 use std::process::Command;
 

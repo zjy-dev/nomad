@@ -1,3 +1,4 @@
+use nomad_connector::adapters::opencode as url_gate;
 use nomad_connector::*;
 use std::path::Path;
 

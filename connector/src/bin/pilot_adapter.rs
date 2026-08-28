@@ -1,8 +1,8 @@
-use nomad_connector::process_bridge::{RelayClient, RelayMessage, UreqRelayClient};
-use nomad_connector::{
-    CommandJournal, OpenCodeClient, PilotAdapter, PilotCommand, UreqOpenCodeClient,
-    EXPECTED_VERSION,
+use nomad_connector::adapters::opencode::{
+    OpenCodeClient, PilotAdapter, PilotCapture, PilotCommand, UreqOpenCodeClient, EXPECTED_VERSION,
 };
+use nomad_connector::process_bridge::{RelayClient, RelayMessage, UreqRelayClient};
+use nomad_connector::CommandJournal;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::env;
@@ -118,7 +118,7 @@ fn print_json(value: &Value) -> Result<(), nomad_connector::ConnectorError> {
 }
 
 fn publish_checkpoint(
-    capture: &nomad_connector::PilotCapture,
+    capture: &PilotCapture,
     relay_url: String,
     relay_token: String,
     channel: String,

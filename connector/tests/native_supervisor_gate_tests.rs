@@ -1,4 +1,4 @@
-use nomad_connector::NATIVE_SUPERVISOR_BLOCKED;
+use nomad_connector::adapters::opencode::startup::NATIVE_SUPERVISOR_BLOCKED;
 use std::fs;
 use std::process::{Command, Output};
 

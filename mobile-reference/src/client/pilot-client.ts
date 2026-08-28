@@ -1,7 +1,8 @@
 import { recoverFromSnapshot } from '../contracts/reducer';
-import type { Command } from '../contracts/types';
 import { createMockHost } from '../mock/api';
-import type { SessionClient, SessionView, TraceLabClient, TraceSummary } from './types';
+import type { PublicCommandRequest, SessionClient, SessionView, TraceLabClient, TraceSummary } from './types';
+
+type InternalCommand = Parameters<ReturnType<typeof createMockHost>['submitCommand']>[0];
 
 const PILOT_TRACE = 'trace-004-permission-competition';
 
@@ -22,8 +23,11 @@ export class PilotSessionClient implements SessionClient, TraceLabClient {
     return this.loadTrace(this.currentTraceId, this.currentTraceId === PILOT_TRACE ? 'pilot' : 'trace-lab');
   }
 
-  async submitCommand(command: Command) {
-    return this.host.submitCommand(command);
+  async submitCommand(command: PublicCommandRequest) {
+    if (!isExactPublicCommand(command)) {
+      return { status: 'Rejected' as const, result: { error_code: 'ERR_SAFETY_BLOCKED' as const, error_message: 'Unsupported public command.' } };
+    }
+    return this.host.submitCommand(toInternalCommand(command));
   }
 
   async getCommandStatus(sessionId: string, requestId: string) {
@@ -86,6 +90,69 @@ export class PilotSessionClient implements SessionClient, TraceLabClient {
       provenance,
     };
   }
+}
+
+function toInternalCommand(command: PublicCommandRequest): InternalCommand {
+  switch (command.command_type) {
+    case 'reply':
+      return {
+        command_type: 'reply', request_id: command.request_id, session_id: command.session_id,
+        seq: command.observed_seq, turn_id: command.turn_id, content: command.content,
+      };
+    case 'deny':
+      return {
+        command_type: 'permission_decision', request_id: command.request_id, session_id: command.session_id,
+        seq: command.observed_seq, permission_id: command.permission_id, decision: 'deny',
+        action_hash: command.action_hash, expires_at: command.expires_at,
+      };
+    case 'stop':
+      return {
+        command_type: 'stop', request_id: command.request_id, session_id: command.session_id,
+        seq: command.observed_seq, target_turn_id: command.target_turn_id,
+      };
+  }
+}
+
+function isExactPublicCommand(command: unknown): command is PublicCommandRequest {
+  if (!isPlainDataObject(command)) return false;
+  const value = command as Record<string, unknown>;
+  if (!boundedString(value.request_id, 128) || !boundedString(value.session_id, 64) || !Number.isSafeInteger(value.observed_seq) || Number(value.observed_seq) < 0) return false;
+  switch (value.command_type) {
+    case 'reply':
+      return exactFields(value, ['command_type', 'request_id', 'session_id', 'observed_seq', 'content'], ['turn_id'])
+        && boundedString(value.content, 65536)
+        && (!Object.hasOwn(value, 'turn_id') || value.turn_id === null || boundedString(value.turn_id, 64));
+    case 'deny':
+      return exactFields(value, ['command_type', 'request_id', 'session_id', 'observed_seq', 'permission_id', 'action_hash', 'expires_at'])
+        && boundedString(value.permission_id, 128) && boundedString(value.action_hash, 128)
+        && strictUtcSecond(value.expires_at);
+    case 'stop':
+      return exactFields(value, ['command_type', 'request_id', 'session_id', 'observed_seq', 'target_turn_id'])
+        && boundedString(value.target_turn_id, 64);
+    default:
+      return false;
+  }
+}
+
+function exactFields(value: Record<string, unknown>, required: string[], optional: string[] = []): boolean {
+  const allowed = new Set([...required, ...optional]);
+  return required.every((field) => Object.hasOwn(value, field)) && Object.keys(value).every((field) => allowed.has(field));
+}
+
+function isPlainDataObject(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function boundedString(value: unknown, maximum: number): value is string {
+  return typeof value === 'string' && [...value].length >= 1 && [...value].length <= maximum;
+}
+
+function strictUtcSecond(value: unknown): value is string {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(value)) return false;
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds) && new Date(milliseconds).toISOString() === value.replace('Z', '.000Z');
 }
 
 function humanizeScenario(traceId: string): string {

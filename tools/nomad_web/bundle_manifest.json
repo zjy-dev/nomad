@@ -1,0 +1,21 @@
+{
+  "schema": "nomad.web-companion.bundle.v2",
+  "classification": "repo-local launcher; not developer-id; not notarized; not production authority",
+  "relay_target": "relay/cmd/relay",
+  "ingress_target": "relay/cmd/nomad-ingress",
+  "gateway_entrypoint": "mobile-reference/pilot-gateway/server.mjs",
+  "gateway_runtime_modules": [
+    "mobile-reference/pilot-gateway/alpha-store.mjs",
+    "mobile-reference/pilot-gateway/command-security.mjs",
+    "mobile-reference/pilot-gateway/pairing-session.mjs",
+    "mobile-reference/pilot-gateway/product-host-client.mjs",
+    "mobile-reference/pilot-gateway/relay-client.mjs",
+    "mobile-reference/pilot-gateway/server.mjs",
+    "mobile-reference/pilot-gateway/view.mjs"
+  ],
+  "mobile_dist": "mobile-reference/dist",
+  "required_environment_names": ["NOMAD_WEB_HOME"],
+  "optional_provider_environment_names": ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY", "OPENROUTER_API_KEY", "DEEPSEEK_API_KEY"],
+  "default_loopback_ports": {"relay": 18089, "gateway": 14173},
+  "capabilities": {"view": true, "reply": false, "deny": false, "stop": false, "allow_once": false}
+}

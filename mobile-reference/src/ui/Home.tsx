@@ -1,27 +1,34 @@
-import type { SessionView } from '../client/types';
+import type { ActionView, SessionView } from '../client/types';
 import { canSubmitSafeOperations } from '../contracts/reducer';
 import { StatusChips, SafetyGateBanner } from './StatusChips';
 
 interface HomeProps {
   view: SessionView;
-  onStop: () => void;
+  readOnly?: boolean;
+  onStop?: () => void;
   onOpenActivity: () => void;
-  onOpenAction: () => void;
+  onOpenAction?: () => void;
+  onOpenChanges: () => void;
   onReload: () => void;
+  actionView?: ActionView;
 }
 
-export function Home({ view, onStop, onOpenActivity, onOpenAction, onReload }: HomeProps) {
+export function Home({ view, readOnly = false, onStop, onOpenActivity, onOpenAction, onOpenChanges, onReload, actionView }: HomeProps) {
   const { state, display } = view;
   const turn = state.session.turn_state;
   const gate = canSubmitSafeOperations(state);
   const needsInput = turn === 'NeedsInput';
   const needsPermission = turn === 'NeedsPermission';
   const needsYou = needsInput || needsPermission;
-  const canStop = gate.ok && state.session.turn_id !== null && ['Running', 'NeedsInput', 'NeedsPermission'].includes(turn);
-  const heading = !gate.ok
+  const canStop = actionView
+    ? actionView.stop.enabled
+    : gate.ok && state.session.turn_id !== null && ['Running', 'NeedsInput', 'NeedsPermission'].includes(turn);
+  const heading = readOnly
+    ? 'Read-only Alpha'
+    : !gate.ok
     ? 'Check this task'
     : needsInput
-      ? 'The agent needs your answer'
+      ? actionView && !actionView.reply.enabled ? 'Reply context is not available yet' : 'The agent needs your answer'
       : needsPermission
         ? 'The agent is waiting before a change'
         : turn === 'Running'
@@ -34,26 +41,32 @@ export function Home({ view, onStop, onOpenActivity, onOpenAction, onReload }: H
 
   return (
     <div className="stack">
-      <StatusChips state={state} />
-      <SafetyGateBanner state={state} />
+      <StatusChips state={state} readOnly={readOnly} />
+      <SafetyGateBanner state={state} readOnly={readOnly} />
 
       <section className={`command-hero ${needsYou ? 'command-hero--attention' : ''}`} aria-labelledby="task-status-title">
-        <span className="eyebrow">{needsYou ? 'NEEDS YOU' : 'CURRENT TASK'}</span>
+        <span className="eyebrow">{readOnly ? 'LOCAL OBSERVATION' : needsYou ? 'NEEDS YOU' : 'CURRENT TASK'}</span>
         <h1 id="task-status-title">{heading}</h1>
         <p>
-          {needsInput && 'A reply is required before work can continue.'}
-          {needsPermission && 'Review what the Host knows. This Pilot can only deny the request or stop the task.'}
-          {turn === 'Running' && 'The agent is continuing on your Mac. You can leave it running or stop it.'}
-          {turn === 'Completed' && 'The Host reported a completed turn. Review activity or verified changes when available.'}
-          {turn === 'Cancelled' && 'The Host accepted the stop request. Work already written to disk was not undone.'}
-          {!['NeedsInput', 'NeedsPermission', 'Running', 'Completed', 'Cancelled'].includes(turn) && 'Review the latest activity before deciding what to do.'}
+          {readOnly && 'Observe the latest local Host state. Reply, deny, Stop, and other command actions are not available in this Alpha.'}
+          {!readOnly && needsInput && (actionView ? actionView.reply.explanation : 'A reply is required before work can continue.')}
+          {!readOnly && needsPermission && (actionView ? 'The Host reports one protected action pending. Review the content-safe action scope before deciding.' : 'Review what the Host knows. This Pilot can only deny the request or stop the task.')}
+          {!readOnly && turn === 'Running' && 'The agent is continuing on your Mac. You can leave it running or stop it.'}
+          {!readOnly && turn === 'Completed' && 'The Host reported a completed turn. Review activity or verified changes when available.'}
+          {!readOnly && turn === 'Cancelled' && 'The Host accepted the stop request. Work already written to disk was not undone.'}
+          {!readOnly && !['NeedsInput', 'NeedsPermission', 'Running', 'Completed', 'Cancelled'].includes(turn) && 'Review the latest activity before deciding what to do.'}
         </p>
         <div className="hero-actions">
-          {needsPermission && <button className="btn btn--primary" onClick={onOpenAction}>Review request</button>}
-          {needsInput && <a className="btn btn--primary" href="#reply-title">Write a reply</a>}
-          {!needsYou && <button className="btn btn--primary" onClick={onOpenActivity}>View activity</button>}
-          {state.session.turn_id && <button className="btn btn--danger-secondary" disabled={!canStop} onClick={onStop}>Stop task</button>}
+          {!readOnly && needsPermission && onOpenAction && <button className="btn btn--primary" onClick={onOpenAction}>Review request</button>}
+          {!readOnly && needsInput && !actionView && <a className="btn btn--primary" href="#reply-title">Write a reply</a>}
+          {!readOnly && needsInput && actionView && !actionView.reply.enabled && <button className="btn btn--primary" disabled aria-describedby="home-reply-disabled-reason">Reply unavailable</button>}
+          {!readOnly && needsInput && actionView?.reply.enabled && <a className="btn btn--primary" href="#reply-title">Write a reply</a>}
+          {(readOnly || !needsYou) && <button className="btn btn--primary" onClick={onOpenActivity}>View activity</button>}
+          {!readOnly && (actionView?.stop.visible || state.session.turn_id !== null) && onStop && <button className="btn btn--danger-secondary" disabled={!canStop} aria-describedby={!canStop && actionView?.stop.disabledReason ? 'home-stop-disabled-reason' : undefined} onClick={onStop}>Stop task</button>}
         </div>
+        {actionView?.reply.visible && !actionView.reply.enabled && <div className="command-status" role="status" id="home-reply-disabled-reason">{actionView.reply.disabledReason}</div>}
+        {actionView?.stop.visible && <div className="muted">{actionView.stop.scope}</div>}
+        {actionView?.stop.visible && !actionView.stop.enabled && actionView.stop.disabledReason && <div className="command-status" role="status" id="home-stop-disabled-reason">{actionView.stop.disabledReason}</div>}
       </section>
 
       <section className="section" aria-labelledby="last-activity-title">
@@ -69,8 +82,9 @@ export function Home({ view, onStop, onOpenActivity, onOpenAction, onReload }: H
         <div className="section-header"><h2 className="section-title" id="controls-title">Now available</h2></div>
         <div className="control-grid">
           <button onClick={onOpenActivity}><span>Activity</span><small>See what happened</small></button>
-          <button onClick={onOpenAction} disabled={!needsPermission}><span>Action</span><small>{needsPermission ? 'Deny or stop safely' : 'Nothing waiting'}</small></button>
+          {!readOnly && onOpenAction && <button onClick={onOpenAction} disabled={!needsPermission}><span>Action</span><small>{needsPermission ? 'Deny or stop safely' : 'Nothing waiting'}</small></button>}
           <button onClick={onReload}><span>Refresh</span><small>Verify the latest state</small></button>
+          {readOnly && <button onClick={onOpenChanges}><span>Changes</span><small>See availability status</small></button>}
         </div>
       </section>
 

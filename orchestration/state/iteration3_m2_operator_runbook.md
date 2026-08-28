@@ -11,7 +11,18 @@ This procedure runs one real Provider-backed task with locked official OpenCode 
 
 ## Six-path preflight
 
-From the repository root, all six paths must be absent:
+From the repository root, first run the read-only Phase 4 readiness doctor:
+
+```bash
+python3 testkit/pilot/readiness_doctor.py --json
+```
+
+Exit `0` means only `READY_FOR_OPERATOR_PREFLIGHT`; it is not production
+authorization and does not satisfy Developer ID, SSHSIG, protected-CAS, or
+real-evidence gates. Exit `1` reports content-free per-gate states that must be
+resolved without overriding or deleting existing evidence.
+
+Then confirm that all six evidence paths are absent:
 
 ```bash
 test ! -e testkit/stock-opencode/real-task/lifecycle-certificate.json

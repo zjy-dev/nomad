@@ -1,0 +1,33 @@
+{
+  "marker": "TEST_ONLY_VECTOR",
+  "projection": {
+    "canonical_json": "{\"direction\":\"host_to_device\",\"epoch\":7,\"kind\":\"projection\",\"mailbox_id\":\"mbx-abababababababababababababababababababababababababababababababab\",\"message_id\":\"msg-cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\",\"payload\":{\"capability\":{\"allow_once\":false,\"capability_id\":\"capability_00000001\",\"deny\":{\"action_hash\":\"sha256:8d9d416e75ebcd7f0d94f0b9d722bb95b4ea8b087b8672e937bc75e0759b62bf\",\"expires_at\":\"2026-08-27T00:00:30Z\",\"permission_alias\":\"permission-33333333333333333333333333333333\"},\"expires_at\":\"2026-08-27T00:00:30Z\",\"issued_at\":\"2026-08-27T00:00:00Z\",\"next_command_seq\":19,\"reply\":{\"input_alias\":\"input-22222222222222222222222222222222\",\"summary\":{\"answer_mode\":\"free_text\",\"prompt\":\"Provide a short reply for: deployment region.\",\"question_count\":1,\"response_hint\":\"single_short_reply\",\"schema\":\"nomad.product-host.pending-question-summary.v1\"},\"turn_alias\":\"turn-11111111111111111111111111111111\"},\"schema\":\"nomad.product-host.command-capability.v1\",\"snapshot_digest\":\"sha256:8d9d416e75ebcd7f0d94f0b9d722bb95b4ea8b087b8672e937bc75e0759b62bf\",\"snapshot_seq\":7,\"stop\":{\"turn_alias\":\"turn-11111111111111111111111111111111\"},\"view\":true},\"schema\":\"nomad.remote.projection.v1\",\"snapshot\":{\"digest\":\"sha256:8d9d416e75ebcd7f0d94f0b9d722bb95b4ea8b087b8672e937bc75e0759b62bf\",\"host_instance_id\":\"host-0123456789abcdef0123456789abcdef\",\"schema\":\"nomad.product-host.snapshot.v1\",\"snapshot\":{\"diff_file_count\":0,\"evidence_class\":\"official_registry_shape_only_not_provider_lifecycle\",\"pending_input_alias\":\"input-11111111111111111111111111111111\",\"pending_permission_alias\":null,\"session_alias\":\"sess-0123456789abcdef0123456789abcdef\",\"turn_state\":\"NeedsInput\",\"updated_at\":\"2026-08-27T00:00:00.000Z\",\"writable\":false},\"snapshot_seq\":7}},\"schema\":\"nomad.remote.application-envelope.v1\",\"sequence\":21}",
+    "frame_binding": {
+      "mailbox_id": "mbx-abababababababababababababababababababababababababababababababab",
+      "direction": "host_to_device",
+      "epoch": 7,
+      "sequence": 21,
+      "message_id": "msg-cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+    }
+  },
+  "command": {
+    "canonical_json": "{\"direction\":\"device_to_host\",\"epoch\":7,\"kind\":\"command\",\"mailbox_id\":\"mbx-abababababababababababababababababababababababababababababababab\",\"message_id\":\"msg-efefefefefefefefefefefefefefefef\",\"payload\":{\"command\":{\"action\":\"reply\",\"capability_id\":\"capability_00000001\",\"command_seq\":19,\"content\":\"hello from device\",\"expected_snapshot_digest\":\"sha256:8d9d416e75ebcd7f0d94f0b9d722bb95b4ea8b087b8672e937bc75e0759b62bf\",\"expected_snapshot_seq\":7,\"expires_at\":\"2026-08-27T00:00:30Z\",\"input_alias\":\"input-22222222222222222222222222222222\",\"issued_at\":\"2026-08-27T00:00:00Z\",\"nonce\":\"nonce_0000000001\",\"request_id\":\"request_00000001\",\"schema\":\"nomad.gateway.command.v1\",\"turn_alias\":\"turn-11111111111111111111111111111111\"},\"schema\":\"nomad.remote.command.v1\"},\"schema\":\"nomad.remote.application-envelope.v1\",\"sequence\":22}",
+    "frame_binding": {
+      "mailbox_id": "mbx-abababababababababababababababababababababababababababababababab",
+      "direction": "device_to_host",
+      "epoch": 7,
+      "sequence": 22,
+      "message_id": "msg-efefefefefefefefefefefefefefefef"
+    }
+  },
+  "receipt": {
+    "canonical_json": "{\"direction\":\"host_to_device\",\"epoch\":7,\"kind\":\"receipt\",\"mailbox_id\":\"mbx-abababababababababababababababababababababababababababababababab\",\"message_id\":\"msg-01010101010101010101010101010101\",\"payload\":{\"receipt\":{\"accepted_at\":\"2026-08-27T00:00:01Z\",\"action\":\"reply\",\"error_code\":\"OK\",\"idempotent_replay\":false,\"receipt_id\":\"receipt_00000001\",\"request_id\":\"request_00000001\",\"schema\":\"nomad.gateway.command-receipt.v1\",\"snapshot_digest\":\"sha256:8d9d416e75ebcd7f0d94f0b9d722bb95b4ea8b087b8672e937bc75e0759b62bf\",\"snapshot_seq\":7,\"status\":\"DispatchAcknowledged\"},\"schema\":\"nomad.remote.receipt.v1\"},\"schema\":\"nomad.remote.application-envelope.v1\",\"sequence\":23}",
+    "frame_binding": {
+      "mailbox_id": "mbx-abababababababababababababababababababababababababababababababab",
+      "direction": "host_to_device",
+      "epoch": 7,
+      "sequence": 23,
+      "message_id": "msg-01010101010101010101010101010101"
+    }
+  }
+}

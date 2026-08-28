@@ -15,6 +15,7 @@ native_composed_transport_test_helper = ["native_transport_test_helper", "native
 native_audit_proxy_test_helper = []
 native_sse_proxy_test_helper = []
 native_sse_reconnect_test_helper = ["native_audit_proxy_test_helper", "native_sse_proxy_test_helper"]
+remote_v2_test_helper = []
 
 [[bin]]
 name = "nomad-connector"
@@ -33,6 +34,10 @@ name = "pilot-adapter"
 path = "src/bin/pilot_adapter.rs"
 
 [[bin]]
+name = "alpha-projector"
+path = "src/bin/alpha_projector.rs"
+
+[[bin]]
 name = "actual-launch-adopter"
 path = "src/bin/actual_launch_adopter.rs"
 required-features = ["actual_launch_test_helper"]
@@ -44,6 +49,10 @@ path = "src/bin/nomad_host.rs"
 [[bin]]
 name = "nomad-supervisor"
 path = "src/bin/nomad_supervisor.rs"
+
+[[bin]]
+name = "nomad-product-host"
+path = "src/bin/nomad_product_host.rs"
 
 [[bin]]
 name = "native-proxy-peer"
@@ -65,16 +74,29 @@ name = "native-sse-reconnect"
 path = "src/bin/native_sse_reconnect.rs"
 required-features = ["native_sse_reconnect_test_helper"]
 
+[[bin]]
+name = "nomad-remote-v2-mechanical"
+path = "src/bin/nomad_remote_v2_mechanical.rs"
+required-features = ["remote_v2_test_helper"]
+
 [dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+p256 = { version = "0.13", features = ["ecdh", "ecdsa", "pkcs8"] }
+hkdf = "0.12"
+aes-gcm = "0.10"
 url = "2"
 thiserror = "1"
 ureq = "2"
-time = { version = "0.3", features = ["parsing"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
 libc = "0.2"
+ed25519-dalek = { version = "2", features = ["zeroize"] }
+getrandom = "0.2"
+zeroize = "1"
+base64 = "0.22"
+security-framework = "3.7"
 
 [dev-dependencies]
 tempfile = "3"

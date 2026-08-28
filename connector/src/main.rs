@@ -1,3 +1,4 @@
+use nomad_connector::adapters::opencode;
 use nomad_connector::dedup::ReplyDedup;
 use nomad_connector::error::ConnectorError;
 use nomad_connector::journal::CommandJournal;
@@ -5,18 +6,17 @@ use nomad_connector::permission::PermissionService;
 use nomad_connector::projection::*;
 use nomad_connector::snapshot;
 use nomad_connector::stop_interrupt::StopInterruptService;
-use nomad_connector::url_gate;
 
 fn main() {
     println!("Nomad Connector Host Core");
 
     // HC-003: URL/version gate
-    match url_gate::validate_loopback("http://127.0.0.1:4096") {
+    match opencode::validate_loopback("http://127.0.0.1:4096") {
         Ok(()) => println!("Loopback URL gate: PASS"),
         Err(e) => println!("Loopback URL gate: FAIL - {e}"),
     }
-    match url_gate::check_version(url_gate::EXPECTED_VERSION) {
-        Ok(()) => println!("Version check: PASS ({})", url_gate::EXPECTED_VERSION),
+    match opencode::check_version(opencode::EXPECTED_VERSION) {
+        Ok(()) => println!("Version check: PASS ({})", opencode::EXPECTED_VERSION),
         Err(e) => println!("Version check: FAIL - {e}"),
     }
 

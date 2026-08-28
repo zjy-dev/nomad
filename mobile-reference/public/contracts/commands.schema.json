@@ -1,149 +1,64 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "nomad/contract/commands/v1",
-  "title": "Nomad Command and Approval Lifecycle",
+  "title": "Nomad Public Web Command Requests",
   "version": "1.0.0",
-  "description": "Client command, Relay receipt, Host acceptance and final result schemas. No encryption fields. Source: CON-003, PRD SP-03, MB-05.",
-  "definitions": {
-    "command_status": {
-      "type": "string",
-      "enum": [
-        "RelayReceived",
-        "HostAccepted",
-        "Executing",
-        "Completed",
-        "Rejected",
-        "Expired",
-        "Stale",
-        "Incompatible",
-        "Revoked",
-        "OutcomeUnknown"
-      ]
-    },
-    "error_code": {
-      "type": "string",
-      "enum": [
-        "OK",
-        "ERR_REQUEST_EXPIRED",
-        "ERR_REQUEST_STALE",
-        "ERR_INCOMPATIBLE_VERSION",
-        "ERR_REQUEST_REVOKED",
-        "ERR_DUPLICATE_REQUEST",
-        "ERR_HOST_OFFLINE",
-        "ERR_SAFETY_BLOCKED",
-        "ERR_PERMISSION_DENIED",
-        "ERR_OUTCOME_UNKNOWN"
-      ]
-    }
-  },
+  "description": "First Real User public Web/Gateway request DTOs: reply, deny, and stop. Responses use the separate CommandSubmission type. Historical internal commands are outside this public contract.",
   "oneOf": [
     {
       "title": "Reply command",
       "type": "object",
-      "required": ["command_type", "request_id", "session_id", "seq", "content"],
+      "required": ["command_type", "request_id", "session_id", "observed_seq", "content"],
       "additionalProperties": false,
       "properties": {
         "command_type": { "const": "reply" },
         "request_id": {
           "type": "string",
+          "minLength": 1,
           "maxLength": 128,
           "description": "Client-generated idempotency key. Same request_id MUST NOT produce more than one Host acceptance."
         },
-        "session_id": { "type": "string", "maxLength": 64 },
-        "seq": { "type": "integer", "minimum": 1 },
-        "turn_id": { "type": ["string", "null"], "maxLength": 64 },
-        "content": { "type": "string", "maxLength": 65536 },
-        "status": { "$ref": "#/definitions/command_status" },
-        "result": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "accepted_at_seq": { "type": ["integer", "null"] },
-            "event_id": { "type": ["string", "null"] },
-            "error_code": { "$ref": "#/definitions/error_code" },
-            "error_message": { "type": ["string", "null"] }
-          }
-        }
+        "session_id": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "observed_seq": { "type": "integer", "minimum": 0, "maximum": 9007199254740991, "description": "Client's currently observed durable sequence, used only as a freshness/CAS precondition. It does not allocate or predict a Host/durable sequence." },
+        "turn_id": { "type": ["string", "null"], "minLength": 1, "maxLength": 64 },
+        "content": { "type": "string", "minLength": 1, "maxLength": 65536 }
+      }
+    },
+    {
+      "title": "Deny command",
+      "type": "object",
+      "required": ["command_type", "request_id", "session_id", "observed_seq", "permission_id", "action_hash", "expires_at"],
+      "additionalProperties": false,
+      "properties": {
+        "command_type": { "const": "deny" },
+        "request_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "session_id": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "observed_seq": { "type": "integer", "minimum": 0, "maximum": 9007199254740991, "description": "Client's currently observed durable sequence, used only as a freshness/CAS precondition. It does not allocate or predict a Host/durable sequence." },
+        "permission_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "action_hash": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "expires_at": { "type": "string", "format": "date-time", "minLength": 20, "maxLength": 20, "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" }
       }
     },
     {
       "title": "Stop command",
       "type": "object",
-      "required": ["command_type", "request_id", "session_id", "seq", "target_turn_id"],
+      "required": ["command_type", "request_id", "session_id", "observed_seq", "target_turn_id"],
       "additionalProperties": false,
       "properties": {
         "command_type": { "const": "stop" },
-        "request_id": { "type": "string", "maxLength": 128 },
-        "session_id": { "type": "string", "maxLength": 64 },
-        "seq": { "type": "integer", "minimum": 1 },
-        "target_turn_id": { "type": "string", "maxLength": 64 },
-        "status": { "$ref": "#/definitions/command_status" },
-        "result": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "accepted_at_seq": { "type": ["integer", "null"] },
-            "event_id": { "type": ["string", "null"] },
-            "error_code": { "$ref": "#/definitions/error_code" },
-            "error_message": { "type": ["string", "null"] }
-          }
-        }
-      }
-    },
-    {
-      "title": "Interrupt-and-send command",
-      "type": "object",
-      "required": ["command_type", "request_id", "session_id", "seq", "interrupt_turn_id", "new_content"],
-      "additionalProperties": false,
-      "properties": {
-        "command_type": { "const": "interrupt_and_send" },
-        "request_id": { "type": "string", "maxLength": 128 },
-        "session_id": { "type": "string", "maxLength": 64 },
-        "seq": { "type": "integer", "minimum": 1 },
-        "interrupt_turn_id": { "type": "string", "maxLength": 64 },
-        "new_content": { "type": "string", "maxLength": 65536 },
-        "status": { "$ref": "#/definitions/command_status" },
-        "result": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "stopped_at_seq": { "type": ["integer", "null"] },
-            "new_event_id": { "type": ["string", "null"] },
-            "error_code": { "$ref": "#/definitions/error_code" },
-            "error_message": { "type": ["string", "null"] }
-          }
-        }
-      }
-    },
-    {
-      "title": "Permission decision command",
-      "type": "object",
-      "required": ["command_type", "request_id", "session_id", "seq", "permission_id", "decision", "action_hash", "expires_at"],
-      "additionalProperties": false,
-      "properties": {
-        "command_type": { "const": "permission_decision" },
-        "request_id": { "type": "string", "maxLength": 128 },
-        "session_id": { "type": "string", "maxLength": 64 },
-        "seq": { "type": "integer", "minimum": 1 },
-        "permission_id": { "type": "string", "maxLength": 128 },
-        "decision": { "type": "string", "enum": ["allow_once", "deny"] },
-        "action_hash": { "type": "string", "maxLength": 128 },
-        "expires_at": { "type": "string", "format": "date-time" },
-        "status": { "$ref": "#/definitions/command_status" },
-        "result": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "resolved_at_seq": { "type": ["integer", "null"] },
-            "event_id": { "type": ["string", "null"] },
-            "error_code": { "$ref": "#/definitions/error_code" },
-            "error_message": { "type": ["string", "null"] }
-          }
-        }
+        "request_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "session_id": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "observed_seq": { "type": "integer", "minimum": 0, "maximum": 9007199254740991, "description": "Client's currently observed durable sequence, used only as a freshness/CAS precondition. It does not allocate or predict a Host/durable sequence." },
+        "target_turn_id": { "type": "string", "minLength": 1, "maxLength": 64 }
       }
     }
   ],
   "invariants": [
+    {
+      "id": "INV-003-0",
+      "severity": "MUST",
+      "rule": "observed_seq is only the client's freshness/CAS precondition and MUST equal the currently observed last_applied_seq. It MUST NOT allocate, predict, or claim a Host or durable event sequence."
+    },
     {
       "id": "INV-003-1",
       "severity": "MUST",
@@ -167,12 +82,7 @@
     {
       "id": "INV-003-5",
       "severity": "MUST",
-      "rule": "permission_decision MUST bind: permission_id, action_hash, expires_at, session_id and seq. Mismatch on any of these returns ERR_REQUEST_STALE or ERR_REQUEST_REVOKED."
-    },
-    {
-      "id": "INV-003-6",
-      "severity": "MUST",
-      "rule": "interrupt_and_send MUST NOT allow old turn and new turn to both modify files concurrently. The interrupt is confirmed (turn.stopping/turn.cancelled) before the new message is accepted."
+      "rule": "deny MUST bind: permission_id, action_hash, expires_at, session_id and observed_seq. Missing or mismatched bindings return ERR_REQUEST_STALE, ERR_REQUEST_REVOKED, or ERR_SAFETY_BLOCKED."
     }
   ],
   "state_machine": {

@@ -1,4 +1,4 @@
-use nomad_connector::{
+use nomad_connector::adapters::opencode::{
     M2ActionDigests, M2CapabilityReceipts, RealLifecycleEvidence, VerifiedM2Capabilities,
     COMMAND_SHAPE_SOURCE, REAL_LIFECYCLE_EVIDENCE_REQUIRED,
 };
