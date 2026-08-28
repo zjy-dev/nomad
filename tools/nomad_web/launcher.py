@@ -1783,6 +1783,23 @@ def stop_foundation(config: Any) -> dict[str, Any]:
         return _stop_unlocked(config) if owned else _stopped()
 
 
+def reset_remote_access(config: Any) -> dict[str, Any]:
+    with lifecycle_lock(config, create=False) as owned:
+        home = Path(_get(config, "home")).absolute()
+        if owned:
+            _stop_unlocked(config)
+        _cleanup_device_registry(_device_registry_path(home))
+    return {
+        "schema": "nomad.web-companion.remote-access-reset.v1",
+        "state": "STOPPED",
+        "mode": "foundation-readonly",
+        "remote_access": "CLEARED",
+        "install_state": "PRESERVED",
+        "host_identity_disposition": "retained",
+        "production_ready": False,
+    }
+
+
 def _stop_unlocked(config: Any) -> dict[str, Any]:
     state = read_run_state(config)
     if state:
@@ -1834,3 +1851,16 @@ def uninstall_foundation(config: Any) -> dict[str, Any]:
             _safe_remove_tree(home / name, root=root)
         home.rmdir()
     return {"schema": STATE_SCHEMA, "state": "UNINSTALLED", "mode": "foundation-readonly", "real_agent_enabled": False, "blocked_on": BLOCKERS}
+
+
+def uninstall_lifecycle(config: Any) -> dict[str, Any]:
+    uninstall_foundation(config)
+    return {
+        "schema": "nomad.web-companion.uninstall-result.v1",
+        "state": "UNINSTALLED",
+        "mode": "foundation-readonly",
+        "remote_access": "CLEARED",
+        "install_state": "REMOVED",
+        "host_identity_disposition": "retained",
+        "production_ready": False,
+    }

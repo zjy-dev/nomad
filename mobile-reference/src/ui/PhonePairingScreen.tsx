@@ -1,11 +1,25 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import type { BrowserVaultSession } from '../remote/browser-vault';
-import { BrowserVaultError } from '../remote/browser-vault';
-import type { PairingConfirmResult, PairingJoinStartResult } from '../remote/pairing-client';
-import { PairingClientError } from '../remote/pairing-client';
-import { RemoteSessionError, type RemoteSessionPort as RuntimeRemoteSessionPort, type RemoteSessionSnapshot } from '../remote/paired-session';
-import { RemoteSessionPanel, type RemoteSessionPort } from './RemoteSessionPanel';
-import { createRemoteSessionClient, recoverPendingRemoteCommand, type RemoteSessionFactory } from './remote-session-client';
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { BrowserVaultSession } from "../remote/browser-vault";
+import { BrowserVaultError } from "../remote/browser-vault";
+import type {
+  PairingConfirmResult,
+  PairingJoinStartResult,
+} from "../remote/pairing-client";
+import { PairingClientError } from "../remote/pairing-client";
+import {
+  RemoteSessionError,
+  type RemoteSessionPort as RuntimeRemoteSessionPort,
+  type RemoteSessionSnapshot,
+} from "../remote/paired-session";
+import {
+  RemoteSessionPanel,
+  type RemoteSessionPort,
+} from "./RemoteSessionPanel";
+import {
+  createRemoteSessionClient,
+  recoverPendingRemoteCommand,
+  type RemoteSessionFactory,
+} from "./remote-session-client";
 
 export interface PhonePairingClientPort {
   startFromCurrentLocation(): Promise<PairingJoinStartResult>;
@@ -25,26 +39,40 @@ interface PhonePairingScreenProps {
 }
 
 type PhoneViewState =
-  | { kind: 'loading' }
-  | { kind: 'join-waiting' }
-  | { kind: 'compare'; join: PairingJoinStartResult }
-  | { kind: 'persisting'; code: string }
-  | { kind: 'connecting'; session: BrowserVaultSession; message: string }
-  | { kind: 'paired'; session: BrowserVaultSession; remoteClient: RemoteSessionPort | null; message: string; canRetryConnection: boolean }
-  | { kind: 'expired'; message: string }
-  | { kind: 'lost-key'; message: string }
-  | { kind: 'revoked'; message: string }
-  | { kind: 'storage-unavailable'; message: string }
-  | { kind: 'error'; message: string };
+  | { kind: "loading" }
+  | { kind: "join-waiting" }
+  | { kind: "compare"; join: PairingJoinStartResult }
+  | { kind: "persisting"; code: string }
+  | { kind: "connecting"; session: BrowserVaultSession; message: string }
+  | {
+      kind: "paired";
+      session: BrowserVaultSession;
+      remoteClient: RemoteSessionPort | null;
+      message: string;
+      canRetryConnection: boolean;
+    }
+  | { kind: "expired"; message: string }
+  | { kind: "lost-key"; message: string }
+  | { kind: "replaced"; message: string }
+  | { kind: "cancelled"; message: string }
+  | { kind: "stale-cookie"; message: string }
+  | { kind: "revoked"; message: string }
+  | { kind: "storage-unavailable"; message: string }
+  | { kind: "error"; message: string };
 
 const MAX_BROWSER_TIMEOUT_MS = 60_000;
 const CONNECT_RETRY_DELAYS_MS = [150, 300, 600] as const;
-const REMOTE_CONNECTING_MESSAGE = 'Checking the secure remote session…';
-const REMOTE_NOT_CONNECTED_MESSAGE = 'Secure session not connected';
-const REMOTE_RETRY_MESSAGE = 'Secure session not connected. Retry connect to check again.';
+const REMOTE_CONNECTING_MESSAGE = "Checking the secure remote session…";
+const REMOTE_NOT_CONNECTED_MESSAGE = "Secure session not connected";
+const REMOTE_RETRY_MESSAGE =
+  "Secure session not connected. Retry connect to check again.";
 
-export function PhonePairingScreen({ pairingClient, vault, remoteSessionFactory = null }: PhonePairingScreenProps) {
-  const [state, setState] = useState<PhoneViewState>({ kind: 'loading' });
+export function PhonePairingScreen({
+  pairingClient,
+  vault,
+  remoteSessionFactory = null,
+}: PhonePairingScreenProps) {
+  const [state, setState] = useState<PhoneViewState>({ kind: "loading" });
   const [busy, setBusy] = useState<string | null>(null);
   const [expired, setExpired] = useState(false);
   const headingRef = useRef<HTMLHeadingElement | null>(null);
@@ -65,7 +93,11 @@ export function PhonePairingScreen({ pairingClient, vault, remoteSessionFactory 
       try {
         const restored = await vault.restorePairedDevice();
         if (!active) return;
-        setState({ kind: 'connecting', session: restored, message: REMOTE_CONNECTING_MESSAGE });
+        setState({
+          kind: "connecting",
+          session: restored,
+          message: REMOTE_CONNECTING_MESSAGE,
+        });
         await attachRemoteSession(restored, active);
         return;
       } catch (reason) {
@@ -77,13 +109,13 @@ export function PhonePairingScreen({ pairingClient, vault, remoteSessionFactory 
         }
       }
 
-      if (window.location.pathname.startsWith('/j/')) {
-        setState({ kind: 'join-waiting' });
+      if (window.location.pathname.startsWith("/j/")) {
+        setState({ kind: "join-waiting" });
         try {
           const join = await pairingClient.startFromCurrentLocation();
           if (!active) return;
           setExpired(false);
-          setState({ kind: 'compare', join });
+          setState({ kind: "compare", join });
         } catch (reason) {
           if (!active) return;
           setState(mapPairingFailure(reason));
@@ -91,15 +123,18 @@ export function PhonePairingScreen({ pairingClient, vault, remoteSessionFactory 
         return;
       }
 
-      setState({ kind: 'join-waiting' });
+      setState({ kind: "join-waiting" });
     }
   }, [pairingClient, remoteSessionFactory, vault]);
 
-  async function attachRemoteSession(session: BrowserVaultSession, active = true) {
+  async function attachRemoteSession(
+    session: BrowserVaultSession,
+    active = true,
+  ) {
     if (!remoteSessionFactory) {
       if (active) {
         setState({
-          kind: 'paired',
+          kind: "paired",
           session,
           remoteClient: null,
           message: REMOTE_NOT_CONNECTED_MESSAGE,
@@ -121,7 +156,7 @@ export function PhonePairingScreen({ pairingClient, vault, remoteSessionFactory 
         return;
       }
       setState({
-        kind: 'paired',
+        kind: "paired",
         session,
         remoteClient: null,
         message: REMOTE_NOT_CONNECTED_MESSAGE,
@@ -138,7 +173,10 @@ export function PhonePairingScreen({ pairingClient, vault, remoteSessionFactory 
     runtimeSessionRef.current = null;
   }
 
-  function bindRuntime(session: BrowserVaultSession, runtime: RuntimeRemoteSessionPort) {
+  function bindRuntime(
+    session: BrowserVaultSession,
+    runtime: RuntimeRemoteSessionPort,
+  ) {
     clearRuntimeBinding();
     runtimeRef.current = runtime;
     runtimeClientRef.current = createRemoteSessionClient(runtime);
@@ -156,35 +194,47 @@ export function PhonePairingScreen({ pairingClient, vault, remoteSessionFactory 
     if (runtimeRef.current !== runtime) {
       return;
     }
-    if (snapshot.connection === 'revoked') {
+    if (snapshot.connection === "revoked") {
       clearRuntimeBinding();
-      setState({ kind: 'revoked', message: 'Phone access removed. Pair again from your Mac to continue.' });
-      return;
-    }
-    if (snapshot.connection === 'key_lost') {
-      clearRuntimeBinding();
-      setState({ kind: 'lost-key', message: 'This browser lost its secure device keys. Pair again from your Mac to continue.' });
-      return;
-    }
-    if (snapshot.connection === 'live' && snapshot.last_good_projection !== null) {
       setState({
-        kind: 'paired',
+        kind: "revoked",
+        message: "Phone access removed. Pair again from your Mac to continue.",
+      });
+      return;
+    }
+    if (snapshot.connection === "key_lost") {
+      clearRuntimeBinding();
+      setState({
+        kind: "lost-key",
+        message:
+          "This browser lost its secure device keys. Pair again from your Mac to continue.",
+      });
+      return;
+    }
+    if (
+      snapshot.connection === "live" &&
+      snapshot.last_good_projection !== null
+    ) {
+      setState({
+        kind: "paired",
         session,
         remoteClient: runtimeClientRef.current,
-        message: 'Remote session connected.',
+        message: "Remote session connected.",
         canRetryConnection: false,
       });
       return;
     }
-    setState((current) => current.kind === 'paired'
-      ? {
-          kind: 'paired',
-          session,
-          remoteClient: null,
-          message: remoteMessageForSnapshot(snapshot),
-          canRetryConnection: true,
-        }
-      : current);
+    setState((current) =>
+      current.kind === "paired"
+        ? {
+            kind: "paired",
+            session,
+            remoteClient: null,
+            message: remoteMessageForSnapshot(snapshot),
+            canRetryConnection: true,
+          }
+        : current,
+    );
   }
 
   async function connectRuntime(
@@ -193,12 +243,18 @@ export function PhonePairingScreen({ pairingClient, vault, remoteSessionFactory 
     active = true,
   ) {
     const initial = runtime.getSnapshot();
-    if (initial.pending_command !== null && initial.pending_command.status !== 'OutcomeUnknown') {
+    if (
+      initial.pending_command !== null &&
+      initial.pending_command.status !== "OutcomeUnknown"
+    ) {
       try {
         await recoverPendingRemoteCommand(runtime);
       } catch (reason) {
         if (!active) return;
-        if (!(reason instanceof RemoteSessionError) || reason.code !== 'REMOTE_COMMAND_PENDING') {
+        if (
+          !(reason instanceof RemoteSessionError) ||
+          reason.code !== "REMOTE_COMMAND_PENDING"
+        ) {
           const remoteState = mapRemoteFailure(reason, session);
           if (remoteState) {
             clearRuntimeBinding();
@@ -208,26 +264,41 @@ export function PhonePairingScreen({ pairingClient, vault, remoteSessionFactory 
         }
       }
     }
-    for (let attempt = 0; attempt <= CONNECT_RETRY_DELAYS_MS.length; attempt += 1) {
+    for (
+      let attempt = 0;
+      attempt <= CONNECT_RETRY_DELAYS_MS.length;
+      attempt += 1
+    ) {
       try {
         const snapshot = await runtime.poll();
         if (!active) return;
-        if (snapshot.connection === 'revoked') {
+        if (snapshot.connection === "revoked") {
           clearRuntimeBinding();
-          setState({ kind: 'revoked', message: 'Phone access removed. Pair again from your Mac to continue.' });
-          return;
-        }
-        if (snapshot.connection === 'key_lost') {
-          clearRuntimeBinding();
-          setState({ kind: 'lost-key', message: 'This browser lost its secure device keys. Pair again from your Mac to continue.' });
-          return;
-        }
-        if (snapshot.connection === 'live' && snapshot.last_good_projection !== null) {
           setState({
-            kind: 'paired',
+            kind: "revoked",
+            message:
+              "Phone access removed. Pair again from your Mac to continue.",
+          });
+          return;
+        }
+        if (snapshot.connection === "key_lost") {
+          clearRuntimeBinding();
+          setState({
+            kind: "lost-key",
+            message:
+              "This browser lost its secure device keys. Pair again from your Mac to continue.",
+          });
+          return;
+        }
+        if (
+          snapshot.connection === "live" &&
+          snapshot.last_good_projection !== null
+        ) {
+          setState({
+            kind: "paired",
             session,
             remoteClient: runtimeClientRef.current,
-            message: 'Remote session connected.',
+            message: "Remote session connected.",
             canRetryConnection: false,
           });
           return;
@@ -247,7 +318,7 @@ export function PhonePairingScreen({ pairingClient, vault, remoteSessionFactory 
       }
     }
     setState({
-      kind: 'paired',
+      kind: "paired",
       session,
       remoteClient: null,
       message: REMOTE_RETRY_MESSAGE,
@@ -261,8 +332,12 @@ export function PhonePairingScreen({ pairingClient, vault, remoteSessionFactory 
     if (runtime === null || session === null) {
       return;
     }
-    setBusy('retry-connect');
-    setState({ kind: 'connecting', session, message: REMOTE_CONNECTING_MESSAGE });
+    setBusy("retry-connect");
+    setState({
+      kind: "connecting",
+      session,
+      message: REMOTE_CONNECTING_MESSAGE,
+    });
     try {
       await connectRuntime(session, runtime);
     } finally {
@@ -270,25 +345,31 @@ export function PhonePairingScreen({ pairingClient, vault, remoteSessionFactory 
     }
   }
 
-  const countdownTarget = state.kind === 'compare'
-    ? state.join.expiresAt
-    : state.kind === 'paired' || state.kind === 'connecting'
-      ? state.session.bundle.issued_at
-      : null;
-  const comparisonCode = state.kind === 'compare'
-    ? state.join.comparisonCode
-    : state.kind === 'paired' || state.kind === 'connecting'
-      ? state.session.comparisonCode
-      : state.kind === 'persisting'
-        ? state.code
+  const countdownTarget =
+    state.kind === "compare"
+      ? state.join.expiresAt
+      : state.kind === "paired" || state.kind === "connecting"
+        ? state.session.bundle.issued_at
         : null;
-  const pairedFacts = useMemo(() => state.kind === 'paired' || state.kind === 'connecting'
-    ? [
-        ['Device Alias', state.session.bundle.device_alias],
-        ['Mailbox', state.session.bundle.mailbox_id],
-        ['Epoch', String(state.session.bundle.pairing_epoch)],
-      ]
-    : [], [state]);
+  const comparisonCode =
+    state.kind === "compare"
+      ? state.join.comparisonCode
+      : state.kind === "paired" || state.kind === "connecting"
+        ? state.session.comparisonCode
+        : state.kind === "persisting"
+          ? state.code
+          : null;
+  const pairedFacts = useMemo(
+    () =>
+      state.kind === "paired" || state.kind === "connecting"
+        ? [
+            ["Device Alias", state.session.bundle.device_alias],
+            ["Mailbox", state.session.bundle.mailbox_id],
+            ["Epoch", String(state.session.bundle.pairing_epoch)],
+          ]
+        : [],
+    [state],
+  );
   const confirmDisabled = busy !== null || expired;
 
   useEffect(() => {
@@ -296,12 +377,15 @@ export function PhonePairingScreen({ pairingClient, vault, remoteSessionFactory 
   }, [state.kind]);
 
   useEffect(() => {
-    if (state.kind !== 'compare') return;
+    if (state.kind !== "compare") return;
     let timer: number | null = null;
 
     const expire = () => {
       setExpired(true);
-      setState({ kind: 'expired', message: 'Pairing expired. Return to your Mac and start pairing again.' });
+      setState({
+        kind: "expired",
+        message: "Pairing expired. Return to your Mac and start pairing again.",
+      });
       void pairingClient.abortPending().catch(() => {});
     };
 
@@ -312,7 +396,10 @@ export function PhonePairingScreen({ pairingClient, vault, remoteSessionFactory 
         return;
       }
       // Re-arm within the browser timeout ceiling so far-future expiries do not overflow.
-      timer = window.setTimeout(arm, Math.min(deadline, MAX_BROWSER_TIMEOUT_MS));
+      timer = window.setTimeout(
+        arm,
+        Math.min(deadline, MAX_BROWSER_TIMEOUT_MS),
+      );
     };
 
     arm();
@@ -322,18 +409,25 @@ export function PhonePairingScreen({ pairingClient, vault, remoteSessionFactory 
   }, [pairingClient, state]);
 
   async function handleConfirm() {
-    if (state.kind !== 'compare') return;
+    if (state.kind !== "compare") return;
     if (Date.parse(state.join.expiresAt) <= Date.now()) {
       setExpired(true);
-      setState({ kind: 'expired', message: 'Pairing expired. Return to your Mac and start pairing again.' });
+      setState({
+        kind: "expired",
+        message: "Pairing expired. Return to your Mac and start pairing again.",
+      });
       await pairingClient.abortPending().catch(() => {});
       return;
     }
-    setBusy('confirm');
-    setState({ kind: 'persisting', code: state.join.comparisonCode });
+    setBusy("confirm");
+    setState({ kind: "persisting", code: state.join.comparisonCode });
     try {
       const confirmed = await pairingClient.confirm();
-      setState({ kind: 'connecting', session: confirmed.session, message: REMOTE_CONNECTING_MESSAGE });
+      setState({
+        kind: "connecting",
+        session: confirmed.session,
+        message: REMOTE_CONNECTING_MESSAGE,
+      });
       await attachRemoteSession(confirmed.session);
     } catch (reason) {
       setState(mapPairingFailure(reason));
@@ -344,61 +438,107 @@ export function PhonePairingScreen({ pairingClient, vault, remoteSessionFactory 
 
   async function handleCancel() {
     await pairingClient.abortPending().catch(() => {});
-    setState({ kind: 'expired', message: 'Pairing expired. Return to your Mac and start pairing again.' });
+    setState({
+      kind: "expired",
+      message: "Pairing expired. Return to your Mac and start pairing again.",
+    });
   }
 
   return (
     <main className="pairing-phone-shell">
-      <section className="pairing-phone-card" aria-labelledby="phone-pairing-title">
+      <section
+        className="pairing-phone-card"
+        aria-labelledby="phone-pairing-title"
+      >
         <span className="eyebrow">Phone Browser</span>
-        <h1 id="phone-pairing-title" ref={headingRef} tabIndex={-1}>{titleForState(state)}</h1>
+        <h1 id="phone-pairing-title" ref={headingRef} tabIndex={-1}>
+          {titleForState(state)}
+        </h1>
         <p className="pairing-phone-copy">{copyForState(state)}</p>
 
         {comparisonCode && (
-          <div className="pairing-code-block pairing-code-block--phone" aria-live="polite" aria-atomic="true">
+          <div
+            className="pairing-code-block pairing-code-block--phone"
+            aria-live="polite"
+            aria-atomic="true"
+          >
             <span className="eyebrow">Comparison Code</span>
             <strong>{comparisonCode}</strong>
-            {state.kind === 'compare' && <small>Only confirm if this code matches your Mac</small>}
+            {state.kind === "compare" && (
+              <small>Only confirm if this code matches your Mac</small>
+            )}
           </div>
         )}
 
-        {state.kind === 'compare' && countdownTarget && (
+        {state.kind === "compare" && countdownTarget && (
           <div className="pairing-phone-expiry">
             <CountdownText expiresAt={countdownTarget} />
           </div>
         )}
 
-        {state.kind === 'persisting' && <div className="command-status" role="status" aria-live="polite">Persisting secure browser state…</div>}
-        {state.kind === 'loading' && <div className="command-status" role="status">Checking secure browser state…</div>}
-        {state.kind === 'connecting' && (
+        {state.kind === "persisting" && (
+          <div className="command-status" role="status" aria-live="polite">
+            Persisting secure browser state…
+          </div>
+        )}
+        {state.kind === "loading" && (
+          <div className="command-status" role="status">
+            Checking secure browser state…
+          </div>
+        )}
+        {state.kind === "connecting" && (
           <>
             <dl className="pairing-facts">
               {pairedFacts.map(([label, value]) => (
-                <div key={label}><dt>{label}</dt><dd>{value}</dd></div>
+                <div key={label}>
+                  <dt>{label}</dt>
+                  <dd>{value}</dd>
+                </div>
               ))}
             </dl>
-            <div className="command-status" role="status" aria-live="polite">{state.message}</div>
+            <div className="command-status" role="status" aria-live="polite">
+              {state.message}
+            </div>
           </>
         )}
-        {state.kind === 'paired' && (
+        {state.kind === "paired" && (
           <>
             <dl className="pairing-facts">
               {pairedFacts.map(([label, value]) => (
-                <div key={label}><dt>{label}</dt><dd>{value}</dd></div>
+                <div key={label}>
+                  <dt>{label}</dt>
+                  <dd>{value}</dd>
+                </div>
               ))}
             </dl>
             {state.remoteClient ? (
-              <RemoteSessionPanel port={state.remoteClient} reason={state.message} />
+              <RemoteSessionPanel
+                port={state.remoteClient}
+                reason={state.message}
+              />
             ) : (
-              <section className="section remote-session-shell" aria-labelledby="remote-session-title">
-                <div className="section-header"><h2 className="section-title" id="remote-session-title">Remote Session</h2></div>
+              <section
+                className="section remote-session-shell"
+                aria-labelledby="remote-session-title"
+              >
+                <div className="section-header">
+                  <h2 className="section-title" id="remote-session-title">
+                    Remote Session
+                  </h2>
+                </div>
                 <div className="perm-block" role="status" aria-live="polite">
                   <strong>Secure session not connected</strong>
                   <div>{state.message}</div>
                 </div>
                 {state.canRetryConnection && (
                   <div className="hero-actions">
-                    <button className="btn btn--primary" onClick={() => { void handleRetryConnect(); }} disabled={busy !== null}>
+                    <button
+                      className="btn btn--primary"
+                      onClick={() => {
+                        void handleRetryConnect();
+                      }}
+                      disabled={busy !== null}
+                    >
                       Retry connect
                     </button>
                   </div>
@@ -408,10 +548,27 @@ export function PhonePairingScreen({ pairingClient, vault, remoteSessionFactory 
           </>
         )}
 
-        {state.kind === 'compare' && (
+        {state.kind === "compare" && (
           <div className="hero-actions">
-            <button className="btn btn--ghost" onClick={() => { void handleCancel(); }} disabled={busy !== null}>Cancel</button>
-            <button className="btn btn--primary" onClick={() => { void handleConfirm(); }} disabled={confirmDisabled} aria-disabled={confirmDisabled}>Confirm</button>
+            <button
+              className="btn btn--ghost"
+              onClick={() => {
+                void handleCancel();
+              }}
+              disabled={busy !== null}
+            >
+              Cancel
+            </button>
+            <button
+              className="btn btn--primary"
+              onClick={() => {
+                void handleConfirm();
+              }}
+              disabled={confirmDisabled}
+              aria-disabled={confirmDisabled}
+            >
+              Confirm
+            </button>
           </div>
         )}
       </section>
@@ -421,49 +578,60 @@ export function PhonePairingScreen({ pairingClient, vault, remoteSessionFactory 
 
 function titleForState(state: PhoneViewState): string {
   switch (state.kind) {
-    case 'loading':
-      return 'Checking this browser';
-    case 'join-waiting':
-      return 'Confirm this Mac';
-    case 'compare':
-      return 'Confirm this Mac';
-    case 'persisting':
-      return 'Persisting secure device state';
-    case 'connecting':
-      return 'Connecting secure session';
-    case 'paired':
-      return state.remoteClient ? 'Remote session connected' : 'Secure session not connected';
-    case 'expired':
-      return 'Pairing expired';
-    case 'lost-key':
-      return 'Secure keys were lost';
-    case 'revoked':
-      return 'Phone access removed';
-    case 'storage-unavailable':
-      return 'Storage unavailable';
-    case 'error':
-      return 'Pairing unavailable';
+    case "loading":
+      return "Checking this browser";
+    case "join-waiting":
+      return "Confirm this Mac";
+    case "compare":
+      return "Confirm this Mac";
+    case "persisting":
+      return "Persisting secure device state";
+    case "connecting":
+      return "Connecting secure session";
+    case "paired":
+      return state.remoteClient
+        ? "Remote session connected"
+        : "Secure session not connected";
+    case "expired":
+      return "Pairing expired";
+    case "lost-key":
+      return "Secure keys were lost";
+    case "replaced":
+      return "Pairing replaced";
+    case "cancelled":
+      return "Pairing cancelled";
+    case "stale-cookie":
+      return "Pairing session expired";
+    case "revoked":
+      return "Phone access removed";
+    case "storage-unavailable":
+      return "Storage unavailable";
+    case "error":
+      return "Pairing unavailable";
   }
 }
 
 function copyForState(state: PhoneViewState): string {
   switch (state.kind) {
-    case 'loading':
-      return 'Checking whether this browser already holds the secure device state Nomad needs.';
-    case 'join-waiting':
-      return 'Open the one-time pairing link from your Mac to continue.';
-    case 'compare':
-      return 'Only confirm if this code matches your Mac';
-    case 'persisting':
-      return 'This browser is writing the secure device state needed to survive refresh safely.';
-    case 'connecting':
-    case 'paired':
+    case "loading":
+      return "Checking whether this browser already holds the secure device state Nomad needs.";
+    case "join-waiting":
+      return "Open the one-time pairing link from your Mac to continue.";
+    case "compare":
+      return "Only confirm if this code matches your Mac";
+    case "persisting":
+      return "This browser is writing the secure device state needed to survive refresh safely.";
+    case "connecting":
+    case "paired":
       return state.message;
-    case 'expired':
-    case 'lost-key':
-    case 'revoked':
-    case 'storage-unavailable':
-    case 'error':
+    case "expired":
+    case "lost-key":
+    case "replaced":
+    case "cancelled":
+    case "stale-cookie":
+    case "revoked":
+    case "storage-unavailable":
+    case "error":
       return state.message;
   }
 }
@@ -477,38 +645,78 @@ function CountdownText({ expiresAt }: { expiresAt: string }) {
   }, []);
 
   const seconds = Math.max(0, Math.ceil((Date.parse(expiresAt) - now) / 1000));
-  return <span>This code expires in about {Math.ceil(seconds / 60)} minutes</span>;
+  return (
+    <span>This code expires in about {Math.ceil(seconds / 60)} minutes</span>
+  );
 }
 
 function mapRestoreFailure(reason: unknown): PhoneViewState | null {
   if (!(reason instanceof BrowserVaultError)) {
     return null;
   }
-  if (reason.code === 'BROWSER_VAULT_EMPTY') {
+  if (reason.code === "BROWSER_VAULT_EMPTY") {
     return null;
   }
-  if (reason.code === 'BROWSER_VAULT_UNAVAILABLE') {
-    return { kind: 'storage-unavailable', message: 'This browser cannot keep the secure data Nomad needs. Open in a normal Safari tab and try again.' };
+  if (reason.code === "BROWSER_VAULT_UNAVAILABLE") {
+    return {
+      kind: "storage-unavailable",
+      message:
+        "This browser cannot keep the secure data Nomad needs. Open in a normal Safari tab and try again.",
+    };
   }
-  if (reason.code === 'BROWSER_VAULT_KEY_LOST' || reason.code === 'BROWSER_VAULT_RESTORE_FAILED') {
-    return { kind: 'lost-key', message: 'This browser lost its secure device keys. Pair again from your Mac to continue.' };
+  if (
+    reason.code === "BROWSER_VAULT_KEY_LOST" ||
+    reason.code === "BROWSER_VAULT_RESTORE_FAILED"
+  ) {
+    return {
+      kind: "lost-key",
+      message:
+        "This browser lost its secure device keys. Pair again from your Mac to continue.",
+    };
   }
-  return { kind: 'error', message: reason.message };
+  return { kind: "error", message: reason.message };
 }
 
-function mapRemoteFailure(reason: unknown, session: BrowserVaultSession): PhoneViewState | null {
+function mapRemoteFailure(
+  reason: unknown,
+  session: BrowserVaultSession,
+): PhoneViewState | null {
   if (!(reason instanceof RemoteSessionError)) {
     return null;
   }
-  if (reason.code === 'DEVICE_REVOKED') {
-    return { kind: 'revoked', message: 'Phone access removed. Pair again from your Mac to continue.' };
-  }
-  if (reason.code === 'KEY_LOST' || reason.code === 'VAULT_RESTORE_FAILED') {
-    return { kind: 'lost-key', message: 'This browser lost its secure device keys. Pair again from your Mac to continue.' };
-  }
-  if (reason.code === 'REMOTE_PROJECTION_UNAVAILABLE' || reason.code === 'PAIRED_SESSION_STORE_REQUIRED') {
+  if (reason.code === "DEVICE_REVOKED") {
     return {
-      kind: 'paired',
+      kind: "revoked",
+      message: "Phone access removed. Pair again from your Mac to continue.",
+    };
+  }
+  if (reason.code === "PAIRING_REPLACED") {
+    return {
+      kind: "replaced",
+      message:
+        "Another browser or device replaced this pairing. Use the newest pairing link from your Mac.",
+    };
+  }
+  if (reason.code === "PAIRING_CANCELLED") {
+    return {
+      kind: "cancelled",
+      message:
+        "Pairing was cancelled on your Mac. Start again if you still want phone access.",
+    };
+  }
+  if (reason.code === "KEY_LOST" || reason.code === "VAULT_RESTORE_FAILED") {
+    return {
+      kind: "lost-key",
+      message:
+        "This browser lost its secure device keys. Pair again from your Mac to continue.",
+    };
+  }
+  if (
+    reason.code === "REMOTE_PROJECTION_UNAVAILABLE" ||
+    reason.code === "PAIRED_SESSION_STORE_REQUIRED"
+  ) {
+    return {
+      kind: "paired",
       session,
       remoteClient: null,
       message: REMOTE_RETRY_MESSAGE,
@@ -516,7 +724,7 @@ function mapRemoteFailure(reason: unknown, session: BrowserVaultSession): PhoneV
     };
   }
   return {
-    kind: 'paired',
+    kind: "paired",
     session,
     remoteClient: null,
     message: REMOTE_NOT_CONNECTED_MESSAGE,
@@ -526,36 +734,73 @@ function mapRemoteFailure(reason: unknown, session: BrowserVaultSession): PhoneV
 
 function mapPairingFailure(reason: unknown): PhoneViewState {
   if (reason instanceof BrowserVaultError) {
-    if (reason.code === 'BROWSER_VAULT_UNAVAILABLE') {
-      return { kind: 'storage-unavailable', message: 'This browser cannot keep the secure data Nomad needs. Open in a normal Safari tab and try again.' };
+    if (reason.code === "BROWSER_VAULT_UNAVAILABLE") {
+      return {
+        kind: "storage-unavailable",
+        message:
+          "This browser cannot keep the secure data Nomad needs. Open in a normal Safari tab and try again.",
+      };
     }
-    if (reason.code === 'BROWSER_VAULT_KEY_LOST' || reason.code === 'BROWSER_VAULT_RESTORE_FAILED') {
-      return { kind: 'lost-key', message: 'This browser lost its secure device keys. Pair again from your Mac to continue.' };
+    if (
+      reason.code === "BROWSER_VAULT_KEY_LOST" ||
+      reason.code === "BROWSER_VAULT_RESTORE_FAILED"
+    ) {
+      return {
+        kind: "lost-key",
+        message:
+          "This browser lost its secure device keys. Pair again from your Mac to continue.",
+      };
     }
   }
   if (reason instanceof PairingClientError) {
-    if (['JOIN_SECRET_REQUIRED', 'INVALID_JOIN_SECRET', 'INVALID_JOIN_ID', 'PAIRING_EXPIRED'].includes(reason.code)) {
-      return { kind: 'expired', message: 'Pairing expired. Return to your Mac and start pairing again.' };
+    if (
+      [
+        "JOIN_SECRET_REQUIRED",
+        "INVALID_JOIN_SECRET",
+        "INVALID_JOIN_ID",
+        "PAIRING_EXPIRED",
+      ].includes(reason.code)
+    ) {
+      return {
+        kind: "expired",
+        message: "Pairing expired. Return to your Mac and start pairing again.",
+      };
     }
-    if (reason.code === 'PAIRING_HTTP_ERROR') {
-      return { kind: 'error', message: 'Pairing request was not accepted by the local Gateway.' };
+    if (reason.code === "PAIRING_NOT_STARTED") {
+      return {
+        kind: "stale-cookie",
+        message:
+          "This pairing tab no longer has a live session. Return to your Mac and start pairing again.",
+      };
     }
-    if (reason.code === 'INVALID_PAIRING_RESPONSE' || reason.code === 'PAIRING_INVALID_RESPONSE') {
-      return { kind: 'error', message: 'Pairing response was incompatible.' };
+    if (reason.code === "PAIRING_HTTP_ERROR") {
+      return {
+        kind: "error",
+        message: "Pairing request was not accepted by the local Gateway.",
+      };
+    }
+    if (
+      reason.code === "INVALID_PAIRING_RESPONSE" ||
+      reason.code === "PAIRING_INVALID_RESPONSE"
+    ) {
+      return { kind: "error", message: "Pairing response was incompatible." };
     }
   }
   return {
-    kind: 'error',
-    message: reason instanceof Error ? reason.message : 'Pairing is unavailable in this browser.',
+    kind: "error",
+    message:
+      reason instanceof Error
+        ? reason.message
+        : "Pairing is unavailable in this browser.",
   };
 }
 
 function remoteMessageForSnapshot(snapshot: RemoteSessionSnapshot): string {
-  if (snapshot.connection === 'reconnecting') {
-    return 'Secure session reconnecting. Retry connect to check again.';
+  if (snapshot.connection === "reconnecting") {
+    return "Secure session reconnecting. Retry connect to check again.";
   }
-  if (snapshot.connection === 'unavailable') {
-    return 'Secure session unavailable. Retry connect to check again.';
+  if (snapshot.connection === "unavailable") {
+    return "Secure session unavailable. Retry connect to check again.";
   }
   return REMOTE_RETRY_MESSAGE;
 }
