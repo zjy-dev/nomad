@@ -12,7 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from tools.nomad_web import cli, launcher, processes, state
+from tools.nomad_web import cli, install_lifecycle, launcher, processes, state
 from tools.nomad_web.config import Config
 
 
@@ -27,6 +27,16 @@ def ports(count: int) -> list[int]:
     while len(result) < count:
         result.add(free_port())
     return list(result)
+
+
+def materialized_bundle(root: Path) -> Path:
+    from tools.nomad_web.bundle import verify_bundle
+    from tools.nomad_web.materialize import materialize
+
+    bundle = root / "bundle"
+    materialize(Path(__file__).resolve().parents[2], bundle)
+    verify_bundle(bundle)
+    return bundle
 
 
 class M3ELauncherTests(unittest.TestCase):
@@ -72,14 +82,8 @@ class M3ELauncherTests(unittest.TestCase):
             spawn.assert_not_called()
 
     def test_materialized_bundle_exposes_launcher_ingress_executable(self) -> None:
-        from tools.nomad_web.bundle import verify_bundle
-        from tools.nomad_web.materialize import materialize
-
-        repo = Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as temporary:
-            bundle = Path(temporary) / "bundle"
-            materialize(repo, bundle)
-            verify_bundle(bundle)
+            bundle = materialized_bundle(Path(temporary))
             ingress = bundle / "bin" / "nomad-ingress"
             info = ingress.lstat()
             self.assertTrue(stat.S_ISREG(info.st_mode))
@@ -372,6 +376,66 @@ class M3ELauncherTests(unittest.TestCase):
                 launcher.uninstall_foundation(config)
             self.assertTrue(config.home.is_dir())
             self.assertTrue(all(artifact.read_bytes() == b"persistent" for artifact in artifacts))
+
+    def test_uninstall_lifecycle_accepts_verified_installed_home_without_runtime_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = materialized_bundle(root)
+            config = self.config(root, bundle)
+
+            with mock.patch.object(
+                install_lifecycle,
+                "_host_identity_blocker",
+                return_value="HOST_IDENTITY_AUTH_REQUIRED",
+            ):
+                install_result = cli.install(config, bundle)
+            self.assertEqual(install_result["state"], "INSTALLED")
+            self.assertEqual(install_result["onboarding"]["state"], "INSTALLED_BLOCKED_HOST_IDENTITY")
+            self.assertFalse((config.home / "bin").exists())
+            self.assertFalse((config.home / "run").exists())
+            self.assertFalse((config.home / "logs").exists())
+            self.assertTrue((config.home / "install").is_dir())
+            self.assertTrue((config.home / "bundles").is_dir())
+
+            reset = launcher.reset_remote_access(config)
+            self.assertEqual(reset["schema"], "nomad.web-companion.remote-access-reset.v1")
+            self.assertEqual(reset["state"], "STOPPED")
+            self.assertEqual(reset["remote_access"], "CLEARED")
+            self.assertEqual(reset["install_state"], "PRESERVED")
+            self.assertEqual(reset["host_identity_disposition"], "retained")
+            self.assertTrue(config.home.is_dir())
+            self.assertFalse((config.home / "bin").exists())
+            self.assertFalse((config.home / "run").exists())
+            self.assertFalse((config.home / "logs").exists())
+
+            uninstall = launcher.uninstall_lifecycle(config)
+            self.assertEqual(uninstall["schema"], "nomad.web-companion.uninstall-result.v1")
+            self.assertEqual(uninstall["state"], "UNINSTALLED")
+            self.assertEqual(uninstall["remote_access"], "CLEARED")
+            self.assertEqual(uninstall["install_state"], "REMOVED")
+            self.assertEqual(uninstall["host_identity_disposition"], "retained")
+            self.assertFalse(uninstall["production_ready"])
+            self.assertFalse(config.home.exists())
+
+    def test_uninstall_lifecycle_still_rejects_present_runtime_dir_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = materialized_bundle(root)
+            config = self.config(root, bundle)
+            with mock.patch.object(
+                install_lifecycle,
+                "_host_identity_blocker",
+                return_value="HOST_IDENTITY_AUTH_REQUIRED",
+            ):
+                cli.install(config, bundle)
+
+            external = root / "external"
+            external.mkdir(mode=0o700)
+            (config.home / "run").symlink_to(external, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "UNSAFE_LAUNCHER_DIRECTORY"):
+                launcher.uninstall_lifecycle(config)
+            self.assertTrue((config.home / "run").is_symlink())
+            self.assertTrue(config.home.exists())
 
     def test_gateway_route_probe_rejects_wrong_route_table_response(self) -> None:
         class Headers:

@@ -291,16 +291,23 @@ class FakeController:
     def __init__(self, executable: Path, port: int, config: dict[str, Any], log_path: Path):
         parent, child = socket.socketpair()
         self.channel = parent
-        self.process = subprocess.Popen(
-            [sys.executable, str(executable), "--fake", "--port", str(port), "--control-fd", str(child.fileno())],
-            cwd=REPO,
-            env=processes.minimal_env({"PYTHONDONTWRITEBYTECODE": "1"}),
-            stdin=subprocess.DEVNULL,
-            stdout=log_path.open("xb"),
-            stderr=subprocess.STDOUT,
-            pass_fds=(child.fileno(),),
-            start_new_session=True,
-        )
+        self.log_handle = log_path.open("xb")
+        try:
+            self.process = subprocess.Popen(
+                [sys.executable, str(executable), "--fake", "--port", str(port), "--control-fd", str(child.fileno())],
+                cwd=REPO,
+                env=processes.minimal_env({"PYTHONDONTWRITEBYTECODE": "1"}),
+                stdin=subprocess.DEVNULL,
+                stdout=self.log_handle,
+                stderr=subprocess.STDOUT,
+                pass_fds=(child.fileno(),),
+                start_new_session=True,
+            )
+        except Exception:
+            self.log_handle.close()
+            child.close()
+            self.channel.close()
+            raise
         child.close()
         self.record = {
             "name": "fake-opencode-shape",
@@ -329,19 +336,20 @@ class FakeController:
         return self.call({"op": "inspect"})
 
     def stop(self) -> None:
-        if self.process.poll() is not None:
+        try:
+            if self.process.poll() is None:
+                try:
+                    self.call({"op": "stop"})
+                except (OSError, SmokeFailure):
+                    pass
             self.channel.close()
-            return
-        try:
-            self.call({"op": "stop"})
-        except (OSError, SmokeFailure):
-            pass
-        self.channel.close()
-        try:
-            self.process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            os.killpg(self.process.pid, 9)
-            self.process.wait(timeout=5)
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(self.process.pid, 9)
+                self.process.wait(timeout=5)
+        finally:
+            self.log_handle.close()
 
 
 class CDP:
@@ -446,10 +454,9 @@ class CDP:
             if not request_id:
                 continue
             try:
-                raw = self.call("Network.getResponseBody", {"requestId": request_id})
-                body = raw.get("body", "")
-                if raw.get("base64Encoded"):
-                    body = base64.b64decode(body).decode()
+                body = read_response_body(cdp=self, request_id=request_id, timeout=1.0)
+                if body is None:
+                    continue
                 parsed = json.loads(body)
                 return {
                     "session_id": parsed.get("session", {}).get("session_id"),
@@ -466,18 +473,23 @@ class Chrome:
         if not executable.is_file():
             fail("CHROME_MISSING")
         self.port = free_port()
-        self.process = subprocess.Popen(
-            [
-                str(executable), "--headless=new", "--disable-gpu", "--no-first-run",
-                "--no-default-browser-check", "--disable-background-networking",
-                "--disable-component-update", "--disable-default-apps", "--disable-extensions",
-                "--disable-sync", "--metrics-recording-only", "--no-proxy-server",
-                f"--remote-debugging-port={self.port}", f"--user-data-dir={root / 'chrome-profile'}",
-                "--remote-allow-origins=*", "about:blank",
-            ],
-            cwd=REPO, env=processes.minimal_env({}), stdin=subprocess.DEVNULL,
-            stdout=log_path.open("xb"), stderr=subprocess.STDOUT, start_new_session=True,
-        )
+        self.log_handle = log_path.open("xb")
+        try:
+            self.process = subprocess.Popen(
+                [
+                    str(executable), "--headless=new", "--disable-gpu", "--no-first-run",
+                    "--no-default-browser-check", "--disable-background-networking",
+                    "--disable-component-update", "--disable-default-apps", "--disable-extensions",
+                    "--disable-sync", "--metrics-recording-only", "--no-proxy-server",
+                    f"--remote-debugging-port={self.port}", f"--user-data-dir={root / 'chrome-profile'}",
+                    "--remote-allow-origins=*", "about:blank",
+                ],
+                cwd=REPO, env=processes.minimal_env({}), stdin=subprocess.DEVNULL,
+                stdout=self.log_handle, stderr=subprocess.STDOUT, start_new_session=True,
+            )
+        except Exception:
+            self.log_handle.close()
+            raise
         self.record = {
             "name": "chrome", "pid": self.process.pid, "process_group": self.process.pid,
             "identity": processes.process_identity(self.process.pid), "log": str(log_path),
@@ -486,7 +498,7 @@ class Chrome:
 
     def page(self, url: str, width: int, height: int, mobile: bool) -> CDP:
         request = urllib.request.Request(
-            f"http://127.0.0.1:{self.port}/json/new?{urllib.parse.quote(url, safe=':/')}", method="PUT"
+            f"http://127.0.0.1:{self.port}/json/new?about:blank", method="PUT"
         )
         with NO_PROXY.open(request, timeout=5) as response:
             target = json.load(response)
@@ -501,13 +513,16 @@ class Chrome:
         return cdp
 
     def stop(self) -> None:
-        if self.process.poll() is None:
-            os.killpg(self.process.pid, 15)
-            try:
-                self.process.wait(timeout=8)
-            except subprocess.TimeoutExpired:
-                os.killpg(self.process.pid, 9)
-                self.process.wait(timeout=5)
+        try:
+            if self.process.poll() is None:
+                os.killpg(self.process.pid, 15)
+                try:
+                    self.process.wait(timeout=8)
+                except subprocess.TimeoutExpired:
+                    os.killpg(self.process.pid, 9)
+                    self.process.wait(timeout=5)
+        finally:
+            self.log_handle.close()
 
 
 def free_port() -> int:
@@ -548,6 +563,253 @@ def wait_eval(cdp: CDP, expression: str, timeout: float) -> Any:
             pass
         time.sleep(0.05)
     fail("BROWSER_STATE_TIMEOUT")
+
+
+def _legacy_command_observer_install_script() -> str:
+    key = json.dumps(COMMAND_OBSERVER_KEY)
+    return f"""(() => {{
+      const __nomadC3ObserverPhase = "install";
+      const key = {key};
+      const state = window[key] || (window[key] = {{}});
+      const observe = async (input, init, invoke) => {{
+        let request;
+        try {{
+          request = input instanceof Request ? input : new Request(input, init);
+        }} catch {{
+          return await invoke();
+        }}
+        const token = state.active_token;
+        let url;
+        try {{
+          url = new URL(request.url, window.location.href);
+        }} catch {{
+          return await invoke();
+        }}
+        const isTarget = Boolean(
+          token &&
+          url.origin === window.location.origin &&
+          url.pathname === "/api/commands" &&
+          request.method.toUpperCase() === "POST"
+        );
+        const isCapability = Boolean(
+          url.origin === window.location.origin &&
+          url.pathname === "/api/commands/capability" &&
+          request.method.toUpperCase() === "GET"
+        );
+        if (isCapability) {{
+          const response = await invoke();
+          state.capability_response_count += 1;
+          return response;
+        }}
+        if (!isTarget) {{
+          return await invoke();
+        }}
+        const headers = {{}};
+        for (const [raw, canonical] of [["accept", "Accept"], ["content-type", "Content-Type"], ["x-nomad-csrf", "X-Nomad-CSRF"]]) {{
+          const value = request.headers.get(raw);
+          if (value !== null) {{
+            headers[canonical] = value;
+          }}
+        }}
+        // Start body capture without delaying the original request.  The Host
+        // capability is snapshot-bound, so even an observer must not insert an
+        // avoidable scheduling point before dispatch.
+        const requestBodyPromise = request.clone().text().catch(() => "");
+        state.request_count += 1;
+        try {{
+          const responsePromise = invoke();
+          const requestBody = await requestBodyPromise;
+          const response = await responsePromise;
+          state.response_count += 1;
+          let responseBody = "";
+          try {{
+            responseBody = await response.clone().text();
+          }} catch {{}}
+          if (state.active_token === token && state.capture === null && state.error === null) {{
+            state.capture = {{
+              request_body: requestBody,
+              headers,
+              status: Number(response.status || 0),
+              response_body: responseBody,
+            }};
+          }}
+          return response;
+        }} catch (error) {{
+          if (state.active_token === token && state.capture === null && state.error === null) {{
+            state.error = String(error && error.message ? error.message : error);
+          }}
+          throw error;
+        }}
+      }};
+      if (state.installed === true) {{
+        state.capture = null;
+        state.error = null;
+        state.request_count = 0;
+        state.response_count = 0;
+        return true;
+      }}
+      const originalFetch = window.fetch.bind(window);
+      state.installed = true;
+      state.active_token = null;
+      state.capture = null;
+      state.error = null;
+      state.request_count = 0;
+      state.response_count = 0;
+      state.capability_response_count = Number(state.capability_response_count || 0);
+      window.fetch = async function(input, init) {{
+        return await observe(input, init, () => originalFetch(input, init));
+      }};
+      return true;
+    }})()"""
+
+
+def _command_observer_begin_script(token: str) -> str:
+    key = json.dumps(COMMAND_OBSERVER_KEY)
+    return f"""(() => {{
+      const __nomadC3ObserverPhase = "begin";
+      const state = window[{key}];
+      if (!state || state.installed !== true) return false;
+      state.active_token = {json.dumps(token)};
+      state.capture = null;
+      state.error = null;
+      state.request_count = 0;
+      state.response_count = 0;
+      return true;
+    }})()"""
+
+
+def _command_observer_peek_script(token: str) -> str:
+    key = json.dumps(COMMAND_OBSERVER_KEY)
+    return f"""(() => {{
+      const __nomadC3ObserverPhase = "peek";
+      const state = window[{key}];
+      if (!state || state.installed !== true) {{
+        return {{active:false,capture:null,error:null,request_count:0,response_count:0}};
+      }}
+      if (state.active_token !== {json.dumps(token)}) {{
+        return {{active:false,capture:null,error:null,request_count:0,response_count:0}};
+      }}
+      return {{
+        active:true,
+        capture:state.capture,
+        error:state.error,
+        request_count:Number(state.request_count || 0),
+        response_count:Number(state.response_count || 0),
+      }};
+    }})()"""
+
+
+def _command_observer_take_script(token: str) -> str:
+    key = json.dumps(COMMAND_OBSERVER_KEY)
+    return f"""(() => {{
+      const __nomadC3ObserverPhase = "take";
+      const state = window[{key}];
+      if (!state || state.installed !== true || state.active_token !== {json.dumps(token)}) {{
+        return {{active:false,capture:null,error:null,request_count:0,response_count:0}};
+      }}
+      const snapshot = {{
+        active:true,
+        capture:state.capture,
+        error:state.error,
+        request_count:Number(state.request_count || 0),
+        response_count:Number(state.response_count || 0),
+      }};
+      state.active_token = null;
+      state.capture = null;
+      state.error = null;
+      state.request_count = 0;
+      state.response_count = 0;
+      return snapshot;
+    }})()"""
+
+
+def install_command_observer(cdp: CDP) -> None:
+    if cdp.evaluate(_command_observer_install_script(), timeout=5) is not True:
+        fail("VISIBLE_COMMAND_OBSERVER_INSTALL_FAILED")
+
+
+def begin_command_observer(cdp: CDP, token: str) -> None:
+    if cdp.evaluate(_command_observer_begin_script(token), timeout=5) is not True:
+        fail("VISIBLE_COMMAND_OBSERVER_BEGIN_FAILED")
+
+
+def peek_command_observer(cdp: CDP, token: str) -> dict[str, Any]:
+    observed = cdp.evaluate(_command_observer_peek_script(token), timeout=5)
+    return observed if isinstance(observed, dict) else {}
+
+
+def take_command_observer(cdp: CDP, token: str) -> dict[str, Any]:
+    observed = cdp.evaluate(_command_observer_take_script(token), timeout=5)
+    return observed if isinstance(observed, dict) else {}
+
+
+def refresh_visible_capability(cdp: CDP) -> None:
+    key = json.dumps(COMMAND_OBSERVER_KEY)
+    before = cdp.evaluate(
+        f"Number((window[{key}] && window[{key}].capability_response_count) || 0)"
+    )
+    if not isinstance(before, int):
+        fail("VISIBLE_CAPABILITY_OBSERVER_INVALID")
+    clicked = cdp.evaluate("""(() => {
+      const button=Array.from(document.querySelectorAll('button')).find(
+        candidate => candidate.querySelector('span')?.textContent?.trim()==='Refresh' && !candidate.disabled
+      );
+      if (!button) return false;
+      button.click();
+      return true;
+    })()""")
+    if clicked is not True:
+        fail("VISIBLE_REFRESH_CONTROL_MISSING")
+    wait_eval(
+        cdp,
+        f"Number((window[{key}] && window[{key}].capability_response_count) || 0) > {before}",
+        40,
+    )
+
+
+def decode_response_body(raw: dict[str, Any]) -> str:
+    body = raw.get("body", "")
+    if raw.get("base64Encoded"):
+        body = base64.b64decode(body).decode()
+    return body
+
+
+def read_response_body(cdp: CDP, request_id: str, timeout: float) -> str | None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        loading_finished = False
+        loading_failed = False
+        for event in cdp.events:
+            params = event.get("params", {})
+            if params.get("requestId") != request_id:
+                continue
+            if event.get("method") == "Network.loadingFinished":
+                loading_finished = True
+            elif event.get("method") == "Network.loadingFailed":
+                loading_failed = True
+        if loading_failed:
+            return None
+        if loading_finished:
+            try:
+                raw = cdp.call(
+                    "Network.getResponseBody",
+                    {"requestId": request_id},
+                    timeout=max(0.1, min(2.0, deadline - time.monotonic())),
+                )
+            except SmokeFailure as error:
+                if str(error) != "CHROME_CDP_ERROR_Network_getResponseBody":
+                    raise
+            else:
+                return decode_response_body(raw)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            cdp.evaluate("true", timeout=max(0.1, min(1.0, remaining)))
+        except SmokeFailure:
+            pass
+        time.sleep(0.05)
+    return None
 
 
 def wait_session_response(cdp: CDP, timeout: float) -> dict[str, Any]:
@@ -652,10 +914,15 @@ def capture_visible_command(cdp: CDP, action: str, click_script: str) -> dict[st
         fail(f"VISIBLE_{action.upper()}_CONTROL_MISSING_{click_result}")
     deadline = time.monotonic() + COMMAND_TIMEOUT
     captured = None
+    browser_request_count = 0
+    browser_response_count = 0
+    requests: dict[str, dict[str, Any]] = {}
+    responses: dict[str, dict[str, Any]] = {}
     while time.monotonic() < deadline and captured is None:
         cdp.evaluate("true", timeout=2)
         requests = {}
         responses = {}
+        finished: set[str] = set()
         for event in cdp.events:
             params = event.get("params", {})
             request_id = params.get("requestId")
@@ -667,23 +934,26 @@ def capture_visible_command(cdp: CDP, action: str, click_script: str) -> dict[st
                     requests[request_id] = request
             elif event.get("method") == "Network.responseReceived":
                 responses[request_id] = params.get("response", {})
-        for request_id, request in requests.items():
+            elif event.get("method") == "Network.loadingFinished":
+                finished.add(request_id)
+        browser_request_count = len(requests)
+        browser_response_count = sum(1 for request_id in requests if request_id in responses)
+        if browser_request_count > 1 or browser_response_count > 1:
+            fail(f"VISIBLE_{action.upper()}_BROWSER_POST_COUNT_INVALID")
+        if browser_request_count == 1:
+            request_id, request = next(iter(requests.items()))
             response = responses.get(request_id)
-            if response is None:
-                continue
-            raw = cdp.call("Network.getResponseBody", {"requestId": request_id})
-            body = raw.get("body", "")
-            if raw.get("base64Encoded"):
-                body = base64.b64decode(body).decode()
-            captured = {
-                "body": request.get("postData", ""),
-                "headers": request.get("headers", {}),
-                "status": int(response.get("status", 0)),
-                "payload": json.loads(body),
-            }
-            break
-        if captured is None:
-            time.sleep(0.05)
+            if response is not None and request_id in finished:
+                body = read_response_body(cdp, request_id, 2.0)
+                if body is not None:
+                    captured = {
+                        "body": request.get("postData", ""),
+                        "headers": request.get("headers", {}),
+                        "status": int(response.get("status", 0)),
+                        "payload": json.loads(body),
+                    }
+                    break
+        time.sleep(0.05)
     if captured is None:
         paths = [
             urllib.parse.urlsplit(event.get("params", {}).get("request", {}).get("url", "")).path
@@ -698,6 +968,31 @@ def capture_visible_command(cdp: CDP, action: str, click_script: str) -> dict[st
                 reason = code
                 break
         fail(f"VISIBLE_{action.upper()}_POST_NOT_OBSERVED_{reason}_{len(paths)}")
+    # Drain a bounded quiet window before issuing the explicit replay probes.
+    # This catches a delayed duplicate emitted by the original UI action; Host
+    # idempotency must not be allowed to hide duplicate browser submissions.
+    quiet_deadline = time.monotonic() + 0.5
+    while time.monotonic() < quiet_deadline:
+        cdp.evaluate("true", timeout=1)
+        time.sleep(0.05)
+    final_requests = {
+        event.get("params", {}).get("requestId")
+        for event in cdp.events
+        if event.get("method") == "Network.requestWillBeSent"
+        and event.get("params", {}).get("requestId") not in prior
+        and event.get("params", {}).get("request", {}).get("method") == "POST"
+        and urllib.parse.urlsplit(event.get("params", {}).get("request", {}).get("url", "")).path == "/api/commands"
+    }
+    final_responses = {
+        event.get("params", {}).get("requestId")
+        for event in cdp.events
+        if event.get("method") == "Network.responseReceived"
+        and event.get("params", {}).get("requestId") in final_requests
+    }
+    browser_request_count = len(final_requests)
+    browser_response_count = len(final_responses)
+    if browser_request_count != 1 or browser_response_count != 1:
+        fail(f"VISIBLE_{action.upper()}_BROWSER_POST_COUNT_INVALID")
     browser_headers = {
         key: value
         for key, value in captured["headers"].items()
@@ -710,6 +1005,8 @@ def capture_visible_command(cdp: CDP, action: str, click_script: str) -> dict[st
     result = cdp.evaluate(replay_script, timeout=COMMAND_TIMEOUT)
     if not isinstance(result, dict) or result.get("stage") != "complete":
         fail(f"VISIBLE_{action.upper()}_FAILED")
+    result["browser_request_count"] = browser_request_count
+    result["browser_response_count"] = browser_response_count
     return result
 
 
@@ -990,14 +1287,23 @@ def run_smoke(timeout: float, chrome_path: Path, keep_bundle: Path | None) -> di
             mobile_shot = screenshot_digest(mobile_baseline)
             browser_surfaces.append(browser_private_surface(mobile_baseline))
             mobile_baseline.close(); pages.remove(mobile_baseline)
+            browser_surfaces.append(browser_private_surface(desktop))
+            desktop.close(); pages.remove(desktop)
 
-            reply_result = try_visible_reply(desktop, reply_content)
+            # The capability is intentionally short-lived.  The desktop/mobile
+            # comparison above can outlive it, so acquire a fresh browser page
+            # and exercise the visible control immediately; never extend the
+            # product TTL or retry the original action.
+            reply_page = chrome.page(base + "/", 1440, 900, False)
+            pages.append(reply_page)
+            wait_eval(reply_page, "document.body.innerText.includes('Provide a short reply for: deployment region.')", timeout)
+            reply_result = try_visible_reply(reply_page, reply_content)
             if reply_result is None:
                 fail("VISIBLE_REPLY_CONTROL_MISSING")
             reply_mode = "visible_control"
             assert_receipts(reply_result, "DispatchAcknowledged")
-            browser_surfaces.append(browser_private_surface(desktop))
-            desktop.close(); pages.remove(desktop)
+            browser_surfaces.append(browser_private_surface(reply_page))
+            reply_page.close(); pages.remove(reply_page)
 
             fake.phase("deny")
             mobile = chrome.page(base + "/", 390, 844, True)
@@ -1092,9 +1398,9 @@ def run_smoke(timeout: float, chrome_path: Path, keep_bundle: Path | None) -> di
                 "materialized_web": True, "fake_boundary": "external_loopback_opencode_shape",
                 "browser": {"engine": "Google Chrome headless via CDP", "desktop": "1440x900", "mobile": "390x844", "same_projection": True, "desktop_screenshot_sha256": desktop_shot, "mobile_screenshot_sha256": mobile_shot},
                 "actions": {
-                    "reply": {"browser_path": reply_mode, "posts": actions["reply"], "replay_side_effects": 0},
-                    "deny": {"browser_path": "visible_control", "posts": actions["deny"], "replay_side_effects": 0},
-                    "stop": {"browser_path": "visible_control", "posts": actions["stop"], "replay_side_effects": 0},
+                    "reply": {"browser_path": reply_mode, "browser_requests": reply_result["browser_request_count"], "browser_responses": reply_result["browser_response_count"], "posts": actions["reply"], "replay_side_effects": 0},
+                    "deny": {"browser_path": "visible_control", "browser_requests": deny_result["browser_request_count"], "browser_responses": deny_result["browser_response_count"], "posts": actions["deny"], "replay_side_effects": 0},
+                    "stop": {"browser_path": "visible_control", "browser_requests": stop_result["browser_request_count"], "browser_responses": stop_result["browser_response_count"], "posts": actions["stop"], "replay_side_effects": 0},
                     "uncertainty": {"status": "OutcomeUnknown", "posts": actions["unknown"], "automatic_retries": 0},
                 },
                 "fresh_five_route_reads": {"minimum_per_route": min(inspection["reads"].get(route, 0) for route in five_routes)},

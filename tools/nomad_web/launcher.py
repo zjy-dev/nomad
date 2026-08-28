@@ -1074,6 +1074,24 @@ def _cleanup_device_registry(path: Path | None) -> None:
         raise RuntimeError("DEVICE_REGISTRY_DIRECTORY_NOT_EMPTY") from error
 
 
+def _validate_runtime_dirs_if_present(config: Any) -> None:
+    validate_home(config)
+    home = Path(_get(config, "home"))
+    for name in ("bin", "run", "logs"):
+        path = home / name
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_mode & 0o022
+        ):
+            raise RuntimeError("UNSAFE_LAUNCHER_DIRECTORY")
+
+
 def _safe_remove_tree(path: Path, *, root: Path) -> None:
     if not os.path.lexists(path):
         return
@@ -1844,7 +1862,7 @@ def uninstall_foundation(config: Any) -> dict[str, Any]:
         allowed = {HOME_MARKER, "bin", "run", "logs", "bundles", "install", DEVICE_REGISTRY_DIRNAME}
         if not {entry.name for entry in home.iterdir()}.issubset(allowed):
             raise RuntimeError("UNSAFE_NOMAD_WEB_HOME_CONTENTS")
-        validate_runtime_dirs(config)
+        _validate_runtime_dirs_if_present(config)
         root = home.resolve(strict=True)
         _cleanup_device_registry(_device_registry_path(home))
         for name in ("run", "logs", "bin", "bundles", "install", HOME_MARKER):
