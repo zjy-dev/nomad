@@ -353,6 +353,25 @@ class ReleaseReadinessDoctorTests(unittest.TestCase):
         self.assertNotIn(canary, json.dumps(result, sort_keys=True))
         self.assertFalse(result["production_ready"])
 
+    def test_every_non_pass_gate_has_safe_stable_recovery(self) -> None:
+        result = self.run_with_common_patches(environment={})
+        non_pass = [gate for gate in result["release_gates"] if gate["status"] != "PASS"]
+        self.assertTrue(non_pass)
+        for gate in non_pass:
+            self.assertEqual(
+                set(gate) - {"name", "status", "code", "observations"},
+                {"recovery_code", "category", "scope", "next_step"},
+            )
+            self.assertRegex(gate["recovery_code"], r"^[A-Z][A-Z0-9_]*$")
+            self.assertIn(gate["scope"], {"REPO_OWNED_RECOVERY", "EXTERNAL_GATE"})
+            self.assertEqual(gate["next_step"].count("."), 1)
+        self.assertEqual(result["recovery_schema"], "nomad.web-companion.recovery.v1")
+        self.assertEqual(result["release_next_step"], result["recovery_actions"][0]["next_step"])
+        self.assertEqual(
+            set(result["release_blockers"][0]),
+            {"gate", "code", "recovery_code", "category", "scope", "next_step"},
+        )
+
     def test_bundle_and_digest_pass_only_after_strict_verification(self) -> None:
         result = self.run_with_common_patches(environment={})
         release = gates(result)

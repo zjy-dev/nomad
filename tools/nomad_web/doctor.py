@@ -25,6 +25,7 @@ from . import processes, state
 from .bundle import verify_bundle
 from .config import Config
 from .install_lifecycle import status as install_status
+from .recovery import RECOVERY_SCHEMA, decorate_gate, recovery_actions
 
 PROVIDERS = (
     "OPENAI_API_KEY",
@@ -183,11 +184,18 @@ def run_doctor(
             "verify protected publication and downloaded-artifact digest parity",
         ),
     ]
+    release_gates = [decorate_gate(gate) for gate in release_gates]
     release_blockers = [
-        {"gate": gate["name"], "code": gate["code"], "next_step": gate["next_step"]}
+        {
+            "gate": gate["name"], "code": gate["code"],
+            "recovery_code": gate["recovery_code"],
+            "category": gate["category"], "scope": gate["scope"],
+            "next_step": gate["next_step"],
+        }
         for gate in release_gates
         if gate["status"] != "PASS"
     ]
+    recoveries = recovery_actions(release_gates)
     release_readiness = (
         "BLOCK" if any(gate["status"] == "BLOCK" for gate in release_gates)
         else "NOT_RUN" if any(gate["status"] == "NOT_RUN" for gate in release_gates)
@@ -211,10 +219,12 @@ def run_doctor(
         "occupied_ports": occupied_ports,
         "next_step": "nomad-web start" if foundation_ready else "repair failed preflight checks and rerun doctor",
         "release_schema": "nomad.web-companion.release-readiness.v1",
+        "recovery_schema": RECOVERY_SCHEMA,
         "release_readiness": release_readiness,
         "release_gates": release_gates,
         "release_blockers": release_blockers,
-        "release_next_step": release_blockers[0]["next_step"] if release_blockers else None,
+        "recovery_actions": recoveries,
+        "release_next_step": recoveries[0]["next_step"] if recoveries else None,
         # External-owner gates above are deliberately not satisfiable by this
         # local doctor, so this remains false even when every local gate passes.
         "production_ready": False,
