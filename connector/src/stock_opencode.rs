@@ -1531,7 +1531,10 @@ mod tests {
         let fixture: Value =
             serde_json::from_str(include_str!("../../contracts/adapter_support_matrix.json"))
                 .unwrap();
-        assert_eq!(serde_json::to_value(adapter_support_matrix()).unwrap(), fixture);
+        assert_eq!(
+            serde_json::to_value(adapter_support_matrix()).unwrap(),
+            fixture
+        );
     }
 
     #[test]
@@ -1547,18 +1550,33 @@ mod tests {
         assert_eq!(matrix.capability_issuance.deny, "permission_only");
         assert_eq!(matrix.capability_issuance.stop, "busy_session_only");
         assert!(!matrix.capability_issuance.allow_once);
-        assert_eq!(matrix.no_capability.semantics, "snapshot_with_capability_null");
+        assert_eq!(
+            matrix.no_capability.semantics,
+            "snapshot_with_capability_null"
+        );
         assert!(matrix.no_capability.view_retained);
         assert_eq!(matrix.no_capability.capability_json, "null");
-        assert_eq!(matrix.pending_input.summary_behavior, "pending_question_summary_only");
+        assert_eq!(
+            matrix.pending_input.summary_behavior,
+            "pending_question_summary_only"
+        );
         assert!(!matrix.pending_input.provider_text_leaks_outside_adapter);
         assert!(matrix.unsupported.contains(&"allow_once"));
         assert!(matrix.unsupported.contains(&"provider_passthrough"));
         assert!(matrix.unsupported.contains(&"non_exact_version"));
         assert!(matrix.unsupported.contains(&"non_exact_shape"));
-        assert_eq!(matrix.fail_closed.unsupported_version, "ERR_INCOMPATIBLE_VERSION");
-        assert_eq!(matrix.fail_closed.unsupported_shape, "ERR_INCOMPATIBLE_VERSION");
-        assert_eq!(matrix.fail_closed.unsupported_action_surface, "ERR_SAFETY_BLOCKED");
+        assert_eq!(
+            matrix.fail_closed.unsupported_version,
+            "ERR_INCOMPATIBLE_VERSION"
+        );
+        assert_eq!(
+            matrix.fail_closed.unsupported_shape,
+            "ERR_INCOMPATIBLE_VERSION"
+        );
+        assert_eq!(
+            matrix.fail_closed.unsupported_action_surface,
+            "ERR_SAFETY_BLOCKED"
+        );
         assert_eq!(
             ConnectorError::VersionMismatch {
                 expected: STOCK_VERSION.into(),
@@ -1572,7 +1590,10 @@ mod tests {
             matrix.fail_closed.unsupported_shape
         );
         assert_eq!(
-            StockCommandBoundary::Reply.execute().unwrap_err().error_code(),
+            StockCommandBoundary::Reply
+                .execute()
+                .unwrap_err()
+                .error_code(),
             matrix.fail_closed.unsupported_action_surface
         );
     }

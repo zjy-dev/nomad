@@ -37,10 +37,9 @@ pub use crate::stock_opencode::{
     M2CapabilityReceipts, NoCapabilityRules, PendingInputRules, RealLifecycleEvidence,
     StockBlockedCommandResult, StockCommand, StockCommandBoundary, StockCommandHttp,
     StockCommandRequest, StockCommandResult, StockCommandTransport, StockHttpRequest,
-    StockObservationOutcome, StockOpenCodeAdapter, StockReconciliation,
-    StockReconciliationStatus, StockSnapshotFacts, UreqStockCommandHttp,
-    VerifiedM2Capabilities, APPROVAL_EXPIRED_OR_INVALID, COMMAND_SHAPE_SOURCE,
-    REAL_LIFECYCLE_EVIDENCE_REQUIRED, STOCK_VERSION,
+    StockObservationOutcome, StockOpenCodeAdapter, StockReconciliation, StockReconciliationStatus,
+    StockSnapshotFacts, UreqStockCommandHttp, VerifiedM2Capabilities, APPROVAL_EXPIRED_OR_INVALID,
+    COMMAND_SHAPE_SOURCE, REAL_LIFECYCLE_EVIDENCE_REQUIRED, STOCK_VERSION,
 };
 pub use crate::stock_snapshot::{
     project_stock_snapshot, StockReadonlySnapshot, STOCK_SNAPSHOT_EVIDENCE_CLASS,
