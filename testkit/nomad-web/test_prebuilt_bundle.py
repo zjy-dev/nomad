@@ -112,6 +112,8 @@ class PrebuiltBundleTests(unittest.TestCase):
     def setUp(self) -> None:
         self.case = tempfile.TemporaryDirectory(prefix="nomad-prebuilt-run-")
         self.home = Path(self.case.name) / "web-companion"
+        self.user_home = Path(self.case.name) / "user-home"
+        self.user_home.mkdir(mode=0o700)
         shim = Path(self.case.name) / "path"
         shim.mkdir()
         for name, source in (("python3", os.sys.executable), ("node", shutil.which("node"))):
@@ -122,6 +124,7 @@ class PrebuiltBundleTests(unittest.TestCase):
             "NOMAD_WEB_HOME": str(self.home), "NOMAD_WEB_BUNDLE": str(self.bundle),
             "NOMAD_WEB_RELAY_PORT": str(port()), "NOMAD_WEB_GATEWAY_PORT": str(port()),
             "NOMAD_WEB_AGENT_PORT": str(port()),
+            "HOME": str(self.user_home),
             "PYTHONDONTWRITEBYTECODE": "1",
         }
 
@@ -177,10 +180,12 @@ class PrebuiltBundleTests(unittest.TestCase):
         return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
 
     def test_prebuilt_runtime_needs_no_build_toolchain(self) -> None:
+        self.env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
         code, doctor = self.call("doctor", check=False)
         self.assertEqual(code, 2)
         self.assertEqual(doctor["runtime_mode"], "prebuilt-bundle")
         self.assertEqual(set(doctor["tools"]), {"python3", "node"})
+        self.assertTrue(doctor["tools"]["node"])
         _, started = self.call("start")
         self.assertEqual(started["state"], "RUNNING")
         stable = self.home / "bin" / "nomad-web"
@@ -216,6 +221,17 @@ class PrebuiltBundleTests(unittest.TestCase):
             installed_status.stdout + installed_status.stderr,
         )
         self.assertEqual(json.loads(installed_status.stdout)["state"], "RUNNING")
+        installed_doctor = self.run_cli(
+            [str(stable), "--json", "doctor"], timeout=60,
+        )
+        self.assertEqual(installed_doctor.returncode, 2, installed_doctor.stdout + installed_doctor.stderr)
+        doctor = json.loads(installed_doctor.stdout)
+        self.assertEqual(doctor["runtime_mode"], "prebuilt-bundle")
+        self.assertEqual(doctor["tools"], {"node": True, "python3": True})
+        self.assertEqual(doctor["missing_tools"], [])
+        self.assertNotIn("go", doctor["tools"])
+        self.assertNotIn("cargo", doctor["tools"])
+        self.assertNotIn("npm", doctor["tools"])
         try:
             urllib.request.urlopen(started["web_url"] + "api/alpha/session", timeout=5)
             self.fail("no Agent should produce unavailable")
@@ -224,11 +240,85 @@ class PrebuiltBundleTests(unittest.TestCase):
                 self.assertEqual(error.code, 503)
         stopped = self.run_cli([str(stable), "--json", "stop"], timeout=60)
         self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        restarted = self.run_cli([str(stable), "--json", "start"], timeout=60)
+        self.assertEqual(restarted.returncode, 0, restarted.stdout + restarted.stderr)
+        self.assertEqual(json.loads(restarted.stdout)["state"], "RUNNING")
+        stopped = self.run_cli([str(stable), "--json", "stop"], timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
         result = self.run_cli(
             [str(stable), "--json", "uninstall", "--confirm"],
             timeout=60,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_prebuilt_uninstall_removes_nomad_web_home_but_retains_external_identity_across_reinstall(self) -> None:
+        workspace = Path(self.case.name) / "cli-workspace"
+        workspace.mkdir(mode=0o700)
+        relay_guard = socket.socket()
+        relay_guard.bind(("127.0.0.1", int(self.env["NOMAD_WEB_RELAY_PORT"])))
+        try:
+            code, started = self.call_agent_start(workspace, "identity-persist-canary")
+        finally:
+            relay_guard.close()
+        self.assertEqual(code, 0, started)
+        installed_identity = started["identity"]["installed"]
+        self.assertEqual(installed_identity["availability"], "READY")
+        runtime = next((self.home / "run").glob("agent-runtime-*"))
+        external_target = Path(self.case.name) / "external-node-tool"
+        external_target.write_bytes(b"must survive uninstall")
+        npm_bin = runtime / "node_modules" / ".bin"
+        npm_bin.mkdir(parents=True, mode=0o700, exist_ok=True)
+        generated_link = npm_bin / "opencode-fixture"
+        generated_link.symlink_to(external_target)
+
+        identity_root = (
+            self.user_home
+            / "Library"
+            / "Application Support"
+            / "Nomad"
+            / "host-identity"
+        )
+        identity_file = identity_root / "private" / "host-device-identity.json"
+        self.assertTrue(identity_file.is_file())
+        identity_before = identity_file.read_bytes()
+        self.assertGreater(len(identity_before), 0)
+
+        stable = self.home / "bin" / "nomad-web"
+        stopped = self.run_cli([str(stable), "--json", "stop"], timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        uninstall = self.run_cli(
+            [str(stable), "--json", "uninstall", "--confirm"],
+            timeout=60,
+        )
+        self.assertEqual(uninstall.returncode, 0, uninstall.stdout + uninstall.stderr)
+        uninstall_payload = json.loads(uninstall.stdout)
+        self.assertEqual(uninstall_payload["state"], "UNINSTALLED")
+        self.assertEqual(uninstall_payload["host_identity_disposition"], "retained")
+        self.assertFalse(self.home.exists())
+        self.assertEqual(external_target.read_bytes(), b"must survive uninstall")
+        self.assertTrue(identity_file.is_file())
+        self.assertEqual(identity_file.read_bytes(), identity_before)
+
+        relay_guard = socket.socket()
+        relay_guard.bind(("127.0.0.1", int(self.env["NOMAD_WEB_RELAY_PORT"])))
+        try:
+            code, restarted = self.call_agent_start(workspace, "identity-persist-canary-2")
+        finally:
+            relay_guard.close()
+        self.assertEqual(code, 0, restarted)
+        self.assertTrue(self.home.exists())
+        self.assertTrue(identity_file.is_file())
+        self.assertEqual(identity_file.read_bytes(), identity_before)
+        self.assertEqual(restarted["identity"]["installed"], installed_identity)
+        self.assertEqual(
+            restarted["identity"]["paired_device"],
+            {
+                "availability": "NOT_RUN",
+                "device_key_commitment": None,
+                "pairing_epoch": None,
+            },
+        )
+        self.call("stop")
 
     def test_v2_manifest_has_ingress_and_exact_gateway_module_closure(self) -> None:
         from tools.nomad_web.bundle import (
@@ -247,6 +337,9 @@ class PrebuiltBundleTests(unittest.TestCase):
         )
         self.assertEqual(entries["gateway/pairing-session.mjs"]["mode"], "0644")
         self.assertEqual(REQUIRED["bin/nomad-ingress"], 0o755)
+        self.assertEqual(entries["runtime/node"]["mode"], "0755")
+        self.assertEqual(entries["runtime/LICENSE"]["mode"], "0644")
+        self.assertEqual(manifest["node_runtime"]["entrypoint"], "runtime/node")
         self.assertTrue(REQUIRED_PACKAGE.issubset(entries))
         self.assertIn("lib/nomad_web/diagnostics.py", entries)
         self.assertIn("lib/nomad_web/recovery.py", entries)
@@ -265,12 +358,35 @@ class PrebuiltBundleTests(unittest.TestCase):
         })
         self.assertFalse(any("node_modules" in path.parts for path in self.bundle.rglob("*")))
         loaded = subprocess.run(
-            [shutil.which("node"), "--input-type=module", "--eval",
+            [str(self.bundle / "runtime" / "node"), "--input-type=module", "--eval",
              f"await import({json.dumps((self.bundle / 'gateway' / 'server.mjs').as_uri())})"],
             cwd=self.case.name, env={"PATH": self.env["PATH"], "LANG": "C", "LC_ALL": "C"},
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30,
         )
         self.assertEqual(loaded.returncode, 0, loaded.stdout + loaded.stderr)
+
+    def test_bundled_node_missing_tamper_mode_symlink_and_extra_are_rejected(self) -> None:
+        from tools.nomad_web.bundle import verify_bundle
+
+        cases = []
+        cases.append(("missing", lambda root: (root / "runtime" / "node").unlink()))
+        cases.append(("tamper", lambda root: (root / "runtime" / "node").write_bytes(b"tampered")))
+        cases.append(("mode", lambda root: os.chmod(root / "runtime" / "node", 0o644)))
+
+        def symlink(root: Path) -> None:
+            node = root / "runtime" / "node"
+            node.unlink()
+            node.symlink_to(root / "bin" / "nomad-relay")
+
+        cases.append(("symlink", symlink))
+        cases.append(("extra", lambda root: (root / "runtime" / "extra").write_bytes(b"x")))
+        for name, mutate in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                clone = Path(temporary) / "bundle"
+                shutil.copytree(self.bundle, clone)
+                mutate(clone)
+                with self.assertRaises((OSError, RuntimeError)):
+                    verify_bundle(clone)
 
     def test_tampered_and_extra_files_are_rejected(self) -> None:
         from tools.nomad_web.bundle import verify_bundle
@@ -317,6 +433,7 @@ class PrebuiltBundleTests(unittest.TestCase):
         from tools.nomad_web.bundle import verify_bundle
         wrapper = (self.bundle / "bin" / "nomad-web").read_text()
         self.assertIn("unset PYTHONPATH PYTHONHOME", wrapper)
+        self.assertIn('$BUNDLE/runtime:/usr/bin:/bin:/usr/sbin:/sbin', wrapper)
         self.assertIn("python3 -I -B -c", wrapper)
         result = subprocess.run(
             [os.sys.executable, "-m", "tools.nomad_web", "--json", "materialize", "--output", str(self.bundle)],
@@ -418,9 +535,16 @@ class PrebuiltBundleTests(unittest.TestCase):
             manifest_path = clone / "manifest.json"
             value = json.loads(manifest_path.read_text())
             value["schema"] = SCHEMA_V1
+            value.pop("node_runtime")
+            for name in ("runtime/node", "runtime/LICENSE"):
+                (clone / name).unlink()
+            (clone / "runtime").rmdir()
             value["files"] = [
                 entry for entry in value["files"]
-                if entry["path"] not in {"bin/nomad-ingress", "gateway/pairing-session.mjs"}
+                if entry["path"] not in {
+                    "bin/nomad-ingress", "gateway/pairing-session.mjs",
+                    "runtime/node", "runtime/LICENSE",
+                }
             ]
             server_entry = next(entry for entry in value["files"] if entry["path"] == "gateway/server.mjs")
             server_raw = server_path.read_bytes()
@@ -559,7 +683,7 @@ class PrebuiltBundleTests(unittest.TestCase):
         self.assertEqual(
             started["identity"]["paired_device"],
             {
-                "availability": "UNPAIRED",
+                "availability": "NOT_RUN",
                 "device_key_commitment": None,
                 "pairing_epoch": None,
             },

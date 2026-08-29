@@ -17,6 +17,17 @@ class OfficialSessionResponse(Response):
     status=200
 
 class ProductHostBootstrapTests(unittest.TestCase):
+    @staticmethod
+    def cfg(root: Path, home: Path, bundle: Path | None = None) -> SimpleNamespace:
+        return SimpleNamespace(
+            repo_root=root,
+            home=home,
+            relay_port=18089,
+            gateway_port=14173,
+            agent_port=4096,
+            bundle_root=bundle,
+            _test_host_identity_root=root / "host-identity-root",
+        )
     def test_official_readiness_requires_available_safe_session_alias(self):
         safe_alias = "sess-" + "a" * 32
         payload = {
@@ -49,6 +60,223 @@ class ProductHostBootstrapTests(unittest.TestCase):
     def test_invalid_session_is_rejected(self):
         with mock.patch.object(launcher._NO_PROXY_OPENER,"open",return_value=Response(b'{"id":"bad id"}')):
             with self.assertRaisesRegex(RuntimeError,"SESSION_CREATE_INVALID"): launcher._create_run_session("http://127.0.0.1:4096","x")
+    def test_initial_prompt_dispatch_uses_exact_reviewed_v2_route_and_redacts_output(self):
+        seen=[]
+        prompt_text = "ship it"
+        prompt_digest = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
+        payload={
+            "data":{
+                "admittedSeq":7,
+                "delivery":"queue",
+                "id":"dispatch_raw",
+                "promotedSeq":8,
+                "prompt":{"text":"secret prompt should never surface"},
+                "sessionID":"ses_raw",
+                "timeCreated":1,
+            }
+        }
+        def open_(request,timeout):
+            seen.append(request)
+            return Response(json.dumps(payload, separators=(",", ":")).encode())
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, prompt_text.encode("utf-8"))
+        os.close(write_fd)
+        with mock.patch.object(launcher._NO_PROXY_OPENER, "open", side_effect=open_):
+            result = launcher._dispatch_initial_prompt(
+                "http://127.0.0.1:4096", "canary", "ses_raw", read_fd
+            )
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0].method, "POST")
+        self.assertEqual(seen[0].full_url, "http://127.0.0.1:4096/api/session/ses_raw/prompt")
+        self.assertEqual(
+            seen[0].headers["Authorization"],
+            "Basic " + base64.b64encode(b"opencode:canary").decode(),
+        )
+        self.assertEqual(seen[0].data, b'{"prompt":{"text":"ship it"}}')
+        self.assertEqual(result["delivery"], "queue")
+        self.assertEqual(result["admitted_seq"], 7)
+        self.assertEqual(result["promoted_seq"], 8)
+        self.assertTrue(result["dispatch_alias"].startswith("dispatch-"))
+        self.assertNotIn(prompt_text, json.dumps(result, sort_keys=True))
+        self.assertNotIn(prompt_digest, json.dumps(result, sort_keys=True))
+        self.assertNotIn("dispatch_raw", json.dumps(result, sort_keys=True))
+        self.assertNotIn("ses_raw", json.dumps(result, sort_keys=True))
+        with self.assertRaises(OSError):
+            os.fstat(read_fd)
+    def test_initial_prompt_dispatch_rejects_bad_shape_and_empty_prompt_input(self):
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b"   ")
+        os.close(write_fd)
+        with self.assertRaisesRegex(RuntimeError, "INITIAL_PROMPT_INVALID"):
+            launcher._dispatch_initial_prompt(
+                "http://127.0.0.1:4096", "canary", "ses_raw", read_fd
+            )
+        with self.assertRaises(OSError):
+            os.fstat(read_fd)
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b"prompt")
+        os.close(write_fd)
+        with mock.patch.object(launcher._NO_PROXY_OPENER, "open", return_value=Response(b'{"data":{"id":"x"}}')):
+            with self.assertRaisesRegex(RuntimeError, "INITIAL_PROMPT_DISPATCH_INVALID"):
+                launcher._dispatch_initial_prompt(
+                    "http://127.0.0.1:4096", "canary", "ses_raw", read_fd
+                )
+    def test_run_foundation_returns_redacted_projection_only(self):
+        result = {
+            "state": "RUNNING",
+            "mode": "official-agent-local",
+            "real_agent_enabled": True,
+            "bundle_digest": "a" * 64,
+            "blocked_on": ["PRODUCTION_DEVICE_IDENTITY"],
+            "web_url": "http://127.0.0.1:14173/",
+            "agent_origin": "http://127.0.0.1:4096",
+            "agent_version": "1.18.16",
+            "logs_dir": "/tmp/logs",
+            "run_id": "b" * 64,
+            "session_alias": "sess-" + "c" * 32,
+            "workspace_binding_digest": "d" * 64,
+            "identity": {"running": {"run_identity": "e" * 64}},
+            "_initial_prompt_dispatch": {
+                "schema": "nomad.web-companion.initial-dispatch.v1",
+                "status": "accepted",
+                "delivery": "queue",
+                "dispatch_alias": "dispatch-" + "f" * 32,
+                "admitted_seq": 7,
+                "promoted_seq": 8,
+                "empty_success": False,
+            },
+            "processes": [{"name": "opencode"}],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            config = SimpleNamespace(
+                home=Path(temporary) / "home",
+                _test_host_identity_root=Path(temporary) / "host-identity-root",
+            )
+            with mock.patch.object(launcher, "initialize_home"), mock.patch.object(
+                launcher, "lifecycle_lock"
+            ) as lock, mock.patch.object(
+                launcher, "_start_unlocked", return_value=result
+            ) as start:
+                lock.return_value.__enter__.return_value = True
+                lock.return_value.__exit__.return_value = False
+                output = launcher.run_foundation(
+                    config,
+                    provider_name="OPENAI_API_KEY",
+                    credential_fd=7,
+                    workspace=Path(temporary),
+                )
+        start.assert_called_once()
+        self.assertEqual(output["dispatch"]["dispatch_alias"], "dispatch-" + "f" * 32)
+        self.assertNotIn("processes", output)
+        self.assertNotIn("_initial_prompt_dispatch", output)
+    def test_run_mode_requires_stopped_and_prompt_failure_rolls_back(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary); home=root/"home"; workspace=root/"workspace"; bundle=root/"bundle"; workspace.mkdir(); bundle.mkdir()
+            config=self.cfg(root, home, bundle)
+            state.initialize_home(config)
+            for path in (home/"bin",home/"run",home/"logs"): path.mkdir(parents=True,exist_ok=True)
+            state.validate_runtime_dirs(config)
+            host={"name":"product-host","pid":11,"process_group":11,"identity":"a"*64,"log":str(home/"logs/host.log")}
+            prompt_read, prompt_write = os.pipe()
+            os.write(prompt_write, b"prompt")
+            os.close(prompt_write)
+            agent={"name":"opencode","pid":12,"process_group":12,"identity":"b"*64,"log":str(home/"logs/agent.log"),"origin":"http://127.0.0.1:4096","_server_password":"canary","_workspace_binding_digest":"c"*64,"_initial_prompt_fd":prompt_read}
+            stopped=[]
+            with mock.patch.object(launcher,"select_bundle_for_start",return_value=bundle), mock.patch.object(launcher,"_selected_bundle_digest",return_value="a"*64), mock.patch.object(launcher,"_require_host_identity_ready"), mock.patch.object(launcher,"_prepare_product_host_socket",return_value=home/"run"/"sockdir"/"product-host.sock"), mock.patch.object(launcher,"_socket_parent_identity",return_value={"parent_dev":1,"parent_ino":2}), mock.patch.object(launcher,"_prepare_device_registry_path",return_value=home/"private"/launcher.DEVICE_REGISTRY_BASENAME), mock.patch.object(launcher,"_prepare_command_journal",return_value=home/"run"/"command.sqlite3"), mock.patch.object(launcher,"_spawn_product_host",return_value=host), mock.patch.object(launcher,"start_run_agent",return_value=agent), mock.patch.object(launcher,"_create_run_session",return_value="ses_raw"), mock.patch.object(launcher,"_bootstrap_host",return_value={"parent_dev":1,"parent_ino":2,"parent_uid":os.geteuid(),"parent_mode":0o700,"socket_dev":3,"socket_ino":4,"socket_uid":os.geteuid(),"socket_mode":0o600}), mock.patch.object(launcher,"_cleanup_product_host_socket"), mock.patch.object(launcher,"_cleanup_gateway_db"), mock.patch.object(launcher,"_cleanup_command_journal"), mock.patch.object(launcher,"_dispatch_initial_prompt",side_effect=RuntimeError("INITIAL_PROMPT_DISPATCH_REJECTED")), mock.patch.object(launcher.processes,"stop",side_effect=lambda item: stopped.append(item["name"]) or True):
+                with self.assertRaisesRegex(RuntimeError,"INITIAL_PROMPT_DISPATCH_REJECTED"):
+                    launcher._start_unlocked(config,provider_name="OPENAI_API_KEY",credential_fd=7,workspace=workspace,require_stopped=True)
+            self.assertEqual(set(stopped),{"opencode","product-host"})
+            self.assertFalse(state.state_path(config).exists())
+            with self.assertRaises(OSError):
+                os.fstat(prompt_read)
+    def test_child_run_envelope_parser_accepts_canonical_only_and_returns_prompt(self):
+        valid = json.dumps({
+            "schema": agent_runtime.RUN_STDIN_SCHEMA,
+            "provider_credential": "sk-canary",
+            "initial_prompt": "ship it",
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, valid)
+        os.close(write_fd)
+        secret, prompt = agent_runtime._read_run_envelope_fd(read_fd)
+        self.assertEqual(secret, "sk-canary")
+        self.assertEqual(prompt, b"ship it")
+        bad_cases = (
+            b'{"schema":"nomad.web-companion.run-stdin.v1","provider_credential":"a","provider_credential":"b","initial_prompt":"x"}',
+            json.dumps({
+                "provider_credential": "a",
+                "schema": agent_runtime.RUN_STDIN_SCHEMA,
+                "initial_prompt": "x",
+            }, indent=2).encode(),
+            json.dumps({
+                "schema": agent_runtime.RUN_STDIN_SCHEMA,
+                "provider_credential": "a",
+                "initial_prompt": "   ",
+            }, sort_keys=True, separators=(",", ":")).encode(),
+        )
+        for payload in bad_cases:
+            with self.subTest(payload=payload[:80]):
+                read_fd, write_fd = os.pipe()
+                os.write(write_fd, payload)
+                os.close(write_fd)
+                with self.assertRaises(SystemExit) as exited:
+                    agent_runtime._read_run_envelope_fd(read_fd)
+                self.assertEqual(exited.exception.code, 70)
+    def test_prompt_pipe_writer_is_exact_and_closes_fd(self):
+        read_fd, write_fd = os.pipe()
+        agent_runtime._write_prompt_fd(write_fd, bytearray(b"prompt-bytes"))
+        self.assertEqual(os.read(read_fd, 64), b"prompt-bytes")
+        self.assertEqual(os.read(read_fd, 1), b"")
+        os.close(read_fd)
+        with self.assertRaises(OSError):
+            os.fstat(write_fd)
+    def test_run_mode_bootstraps_host_before_dispatch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary); home=root/"home"; workspace=root/"workspace"; bundle=root/"bundle"; workspace.mkdir(); bundle.mkdir()
+            config=self.cfg(root, home, bundle)
+            state.initialize_home(config)
+            for path in (home/"bin",home/"run",home/"logs"): path.mkdir(parents=True,exist_ok=True)
+            state.validate_runtime_dirs(config)
+            host={"name":"product-host","pid":11,"process_group":11,"identity":"a"*64,"log":str(home/"logs/host.log")}
+            prompt_read, prompt_write = os.pipe()
+            os.write(prompt_write, b"prompt")
+            os.close(prompt_write)
+            agent={"name":"opencode","pid":12,"process_group":12,"identity":"b"*64,"log":str(home/"logs/agent.log"),"origin":"http://127.0.0.1:4096","_server_password":"canary","_workspace_binding_digest":"c"*64,"_initial_prompt_fd":prompt_read}
+            order=[]
+            def fake_bootstrap(*_args, **_kwargs):
+                order.append("bootstrap")
+                return {"parent_dev":1,"parent_ino":2,"parent_uid":os.geteuid(),"parent_mode":0o700,"socket_dev":3,"socket_ino":4,"socket_uid":os.geteuid(),"socket_mode":0o600}
+            def fake_dispatch(*_args, **_kwargs):
+                order.append("dispatch")
+                return {"schema":"nomad.web-companion.initial-dispatch.v1","status":"accepted","delivery":"queue","dispatch_alias":"dispatch-"+"f"*32,"admitted_seq":1,"promoted_seq":None,"empty_success":False}
+            with mock.patch.object(launcher,"select_bundle_for_start",return_value=bundle), mock.patch.object(launcher,"_selected_bundle_digest",return_value="a"*64), mock.patch.object(launcher,"_require_host_identity_ready"), mock.patch.object(launcher,"_prepare_product_host_socket",return_value=home/"run"/"sockdir"/"product-host.sock"), mock.patch.object(launcher,"_socket_parent_identity",return_value={"parent_dev":1,"parent_ino":2}), mock.patch.object(launcher,"_prepare_device_registry_path",return_value=home/"private"/launcher.DEVICE_REGISTRY_BASENAME), mock.patch.object(launcher,"_prepare_command_journal",return_value=home/"run"/"command.sqlite3"), mock.patch.object(launcher,"_spawn_product_host",return_value=host), mock.patch.object(launcher,"start_run_agent",return_value=agent), mock.patch.object(launcher,"_create_run_session",return_value="ses_raw"), mock.patch.object(launcher,"_bootstrap_host",side_effect=fake_bootstrap), mock.patch.object(launcher,"_dispatch_initial_prompt",side_effect=fake_dispatch), mock.patch.object(launcher,"_compose_identity",return_value={"running":{"run_identity":"z"*64}}), mock.patch.object(launcher,"write_run_state"), mock.patch.object(launcher.processes,"spawn",return_value={"name":"gateway","pid":13,"process_group":13,"identity":"d"*64,"log":str(home/"logs/gateway.log")}), mock.patch.object(launcher,"_wait"), mock.patch.object(launcher,"_wait_official_session",return_value="sess-"+"e"*32):
+                result = launcher._start_unlocked(config,provider_name="OPENAI_API_KEY",credential_fd=7,workspace=workspace,require_stopped=True)
+            self.assertEqual(order,["bootstrap","dispatch"])
+            self.assertEqual(result["_initial_prompt_dispatch"]["delivery"],"queue")
+    def test_bootstrap_import_uses_installed_package_root(self):
+        self.assertIn("from nomad_web.agent_runtime import _bootstrap_main", agent_runtime.BOOTSTRAP)
+        self.assertNotIn("from tools.nomad_web.agent_runtime import _bootstrap_main", agent_runtime.BOOTSTRAP)
+        self.assertEqual(
+            agent_runtime._BOOTSTRAP_PACKAGE_ROOT,
+            str(Path(agent_runtime.__file__).resolve().parents[1]),
+        )
+    def test_run_spawn_maps_prompt_fd_and_closes_parent_writer(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace=Path(temporary); _,_,workspace_fd=agent_runtime._verified_workspace(workspace); input_read,input_write=os.pipe(); os.write(input_write,b"x"); os.close(input_write)
+            observed={}
+            def spawn(_exe,argv,_env,**kwargs): observed["argv"]=argv; observed["actions"]=kwargs["file_actions"]; return 4242
+            try:
+                with mock.patch.object(agent_runtime.os,"posix_spawn",side_effect=spawn):
+                    pid, prompt_fd = agent_runtime._spawn_with_run_envelope_fd(["/bin/echo","4096"],{},"OPENAI_API_KEY",input_read,"password",workspace_fd)
+                self.assertEqual(pid,4242)
+                self.assertIsInstance(prompt_fd,int)
+                targets=[action[2] for action in observed["actions"] if action[0]==os.POSIX_SPAWN_DUP2]
+                self.assertEqual(set(targets),{0,1,2,6,7,8,9})
+                self.assertIn("run",observed["argv"])
+                self.assertIn("6",observed["argv"])
+                os.close(prompt_fd)
+            finally:
+                os.close(workspace_fd)
     def test_session_extra_field_and_duplicate_are_rejected(self):
         extra={**self.SESSION,"extra":1}
         for raw in (json.dumps(extra).encode(),b'{"id":"a","id":"b"}'):
@@ -220,7 +448,7 @@ class ProductHostBootstrapTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary); home=root/"home"; home.mkdir(); digest="a"*64; bundle=home/"bundles"/digest; bundle.mkdir(parents=True)
             other=root/"other"; other.mkdir()
-            config=SimpleNamespace(home=home)
+            config=SimpleNamespace(home=home, _test_host_identity_root=root / "host-identity-root")
             with mock.patch.object(launcher,"verify_bundle",return_value={"bundle_digest":digest}):
                 self.assertEqual(launcher._selected_bundle_digest(config,bundle),digest)
                 with self.assertRaisesRegex(RuntimeError,"SELECTED_BUNDLE_BINDING_INVALID"):
@@ -233,14 +461,14 @@ class ProductHostBootstrapTests(unittest.TestCase):
     def test_ack_failure_cleans_host_and_agent_without_state(self):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary); home=root/"home"; workspace=root/"workspace"; bundle=root/"bundle"; workspace.mkdir(); bundle.mkdir()
-            config=SimpleNamespace(repo_root=root,home=home,relay_port=18089,gateway_port=14173,agent_port=4096,bundle_root=bundle)
+            config=self.cfg(root, home, bundle)
             state.initialize_home(config)
             for path in (home/"bin",home/"run",home/"logs"): path.mkdir(parents=True,exist_ok=True)
             state.validate_runtime_dirs(config)
             host={"name":"product-host","pid":11,"process_group":11,"identity":"a"*64,"log":str(home/"logs/host.log")}
             agent={"name":"opencode","pid":12,"process_group":12,"identity":"b"*64,"log":str(home/"logs/agent.log"),"origin":"http://127.0.0.1:4096","_server_password":"canary","_workspace_binding_digest":"c"*64}
             stopped=[]
-            with mock.patch.object(launcher,"select_bundle_for_start",return_value=bundle), mock.patch.object(launcher,"_selected_bundle_digest",return_value="a"*64), mock.patch.object(launcher,"_spawn_product_host",return_value=host), mock.patch.object(launcher,"start_agent",return_value=agent), mock.patch.object(launcher,"_create_run_session",return_value="ses_raw"), mock.patch.object(launcher,"_bootstrap_host",side_effect=RuntimeError("HOST_BOOTSTRAP_ACK_MISSING")), mock.patch.object(launcher.processes,"stop",side_effect=lambda item: stopped.append(item["name"]) or True):
+            with mock.patch.object(launcher,"select_bundle_for_start",return_value=bundle), mock.patch.object(launcher,"_selected_bundle_digest",return_value="a"*64), mock.patch.object(launcher,"_require_host_identity_ready"), mock.patch.object(launcher,"_spawn_product_host",return_value=host), mock.patch.object(launcher,"start_agent",return_value=agent), mock.patch.object(launcher,"_create_run_session",return_value="ses_raw"), mock.patch.object(launcher,"_bootstrap_host",side_effect=RuntimeError("HOST_BOOTSTRAP_ACK_MISSING")), mock.patch.object(launcher.processes,"stop",side_effect=lambda item: stopped.append(item["name"]) or True):
                 with self.assertRaisesRegex(RuntimeError,"HOST_BOOTSTRAP_ACK_MISSING"):
                     launcher._start_unlocked(config,provider_name="OPENAI_API_KEY",credential_fd=7,workspace=workspace)
             self.assertEqual(set(stopped),{"opencode","product-host"}); self.assertEqual(len(stopped),2); self.assertFalse(state.state_path(config).exists())
@@ -248,7 +476,7 @@ class ProductHostBootstrapTests(unittest.TestCase):
     def test_gateway_fd11_receives_transport_key_and_host_does_not(self):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary); home=root/"home"; workspace=root/"workspace"; bundle=root/"bundle"; workspace.mkdir(); bundle.mkdir()
-            config=SimpleNamespace(repo_root=root,home=home,relay_port=18089,gateway_port=14173,agent_port=4096,bundle_root=bundle)
+            config=self.cfg(root, home, bundle)
             state.initialize_home(config)
             for path in (home/"bin",home/"run",home/"logs"): path.mkdir(parents=True,exist_ok=True)
             state.validate_runtime_dirs(config)
@@ -268,7 +496,7 @@ class ProductHostBootstrapTests(unittest.TestCase):
                     seen["gateway_key"] = raw
                     self.assertEqual(os.read(source_fd, 1), b"")
                 return {"name":name,"pid":99 if name=="gateway" else 98,"process_group":99 if name=="gateway" else 98,"identity":"d"*64,"log":str(log_path)}
-            with mock.patch.object(launcher,"select_bundle_for_start",return_value=bundle), mock.patch.object(launcher,"_selected_bundle_digest",return_value="a"*64), mock.patch.object(launcher,"_spawn_product_host",return_value=host), mock.patch.object(launcher,"start_agent",return_value=agent), mock.patch.object(launcher,"_create_run_session",return_value="ses_raw"), mock.patch.object(launcher,"_bootstrap_host",side_effect=fake_bootstrap), mock.patch.object(launcher.processes,"spawn",side_effect=fake_spawn), mock.patch.object(launcher,"_wait"), mock.patch.object(launcher,"_wait_official_session",return_value="sess-"+"e"*32) as session_ready, mock.patch.object(launcher.processes,"stop",return_value=True):
+            with mock.patch.object(launcher,"select_bundle_for_start",return_value=bundle), mock.patch.object(launcher,"_selected_bundle_digest",return_value="a"*64), mock.patch.object(launcher,"_require_host_identity_ready"), mock.patch.object(launcher,"_spawn_product_host",return_value=host), mock.patch.object(launcher,"start_agent",return_value=agent), mock.patch.object(launcher,"_create_run_session",return_value="ses_raw"), mock.patch.object(launcher,"_bootstrap_host",side_effect=fake_bootstrap), mock.patch.object(launcher.processes,"spawn",side_effect=fake_spawn), mock.patch.object(launcher,"_wait"), mock.patch.object(launcher,"_wait_official_session",return_value="sess-"+"e"*32) as session_ready, mock.patch.object(launcher.processes,"stop",return_value=True):
                 result = launcher._start_unlocked(config,provider_name="OPENAI_API_KEY",credential_fd=7,workspace=workspace)
             self.assertEqual(result["state"],"RUNNING")
             self.assertEqual(result["bundle_digest"], "a" * 64)

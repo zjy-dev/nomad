@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
+
+HOST_IDENTITY_ROOT_ENV = "NOMAD_HOST_IDENTITY_ROOT"
 
 
 @dataclass(frozen=True)
@@ -62,6 +65,52 @@ class Config:
             join_gateway_port, relay_host_v2_port, relay_device_v2_port,
             relay_admin_port, relay_device_v1_port,
         )
+
+
+def host_identity_root(config: object | None = None) -> Path:
+    if isinstance(config, Config):
+        root = Path.home() / "Library" / "Application Support" / "Nomad" / "host-identity"
+    else:
+        override = getattr(config, "_test_host_identity_root", None) if config is not None else None
+        root = Path(override).expanduser() if override is not None else Path.home() / "Library" / "Application Support" / "Nomad" / "host-identity"
+    if not root.is_absolute():
+        raise RuntimeError("HOST_IDENTITY_ROOT_INVALID")
+    return root.resolve(strict=False)
+
+
+def ensure_host_identity_root(config: object | None = None) -> Path:
+    root = host_identity_root(config)
+    parents = list(reversed(root.parents))
+    if not parents or parents[0] != Path("/"):
+        raise RuntimeError("HOST_IDENTITY_ROOT_INVALID")
+    target_chain = [path for path in parents if path != Path("/")] + [root]
+    for path in target_chain:
+        if os.path.lexists(path):
+            info = path.lstat()
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or stat.S_ISLNK(info.st_mode)
+            ):
+                raise RuntimeError("HOST_IDENTITY_ROOT_INVALID")
+            mode = stat.S_IMODE(info.st_mode)
+            if path == root:
+                if info.st_uid != os.geteuid() or mode != 0o700:
+                    raise RuntimeError("HOST_IDENTITY_ROOT_INVALID")
+            else:
+                if info.st_uid not in {0, os.geteuid()} or mode & 0o022:
+                    raise RuntimeError("HOST_IDENTITY_ROOT_INVALID")
+            continue
+        os.mkdir(path, 0o700)
+        os.chmod(path, 0o700)
+        info = path.lstat()
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o700
+        ):
+            raise RuntimeError("HOST_IDENTITY_ROOT_INVALID")
+    return root
 
 
 def _port(name: str, default: int) -> int:

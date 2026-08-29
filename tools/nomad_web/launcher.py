@@ -26,8 +26,9 @@ from typing import Any
 
 from . import processes
 from . import lifecycle_coordinator
-from .agent_runtime import _validate_credential_source, _verified_workspace, start_agent
-from .bundle import verify_bundle
+from .agent_runtime import _validate_credential_source, _verified_workspace, start_agent, start_run_agent
+from .bundle import NODE_RUNTIME, verify_bundle
+from .config import HOST_IDENTITY_ROOT_ENV, ensure_host_identity_root, host_identity_root
 from .install_lifecycle import status_unlocked as install_status_unlocked
 from .install_lifecycle import select_bundle_for_start
 from .state import HOME_MARKER, REMOTE_STATE_SCHEMA, STATE_SCHEMA, initialize_home, lifecycle_lock, read_run_state, state_path, validate_home, validate_runtime_dirs, write_run_state
@@ -49,6 +50,14 @@ SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
 _NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 SESSION_ALLOWED = {"id","slug","projectID","workspaceID","directory","path","parentID","summary","cost","tokens","share","title","agent","model","version","metadata","time","permission","revert"}
 SESSION_REQUIRED = {"id","slug","projectID","directory","title","version","time"}
+PROMPT_DISPATCH_ALLOWED = {"data"}
+PROMPT_DISPATCH_REQUIRED = {"data"}
+PROMPT_DATA_ALLOWED = {"admittedSeq","delivery","id","promotedSeq","prompt","sessionID","timeCreated"}
+PROMPT_DATA_REQUIRED = {"admittedSeq","delivery","id","prompt","sessionID","timeCreated"}
+PROMPT_ALLOWED = {"agents","files","text"}
+PROMPT_REQUIRED = {"text"}
+MAX_INITIAL_PROMPT_BYTES = 8 * 1024
+MAX_PROMPT_RESPONSE_BYTES = 16 * 1024
 HOST_IDENTITY_PREFLIGHT_TIMEOUT = 5.0
 HOST_IDENTITY_AUTHORIZATION_TIMEOUT = 120.0
 HOST_IDENTITY_RESULTS = {
@@ -78,6 +87,10 @@ class HostIdentityError(RuntimeError):
         self.next_step = next_step
 
 
+HOST_IDENTITY_SCOPE_KEYCHAIN = "keychain"
+HOST_IDENTITY_SCOPE_LOCAL_INSTALLED = "local-installed"
+
+
 def _get(config: Any, name: str) -> Any:
     if hasattr(config, name):
         return getattr(config, name)
@@ -99,6 +112,17 @@ def _selected_bundle_digest(config: Any, bundle: Path | None) -> str | None:
     ):
         raise RuntimeError("SELECTED_BUNDLE_BINDING_INVALID")
     return digest
+
+
+def _bundled_node(bundle: Path | None) -> str:
+    if bundle is None:
+        raise RuntimeError("PREBUILT_BUNDLE_REQUIRED")
+    root = Path(bundle).resolve(strict=True)
+    # select_bundle_for_start() and _selected_bundle_digest() have already
+    # verified this exact installed root under the lifecycle lock. Keep the
+    # argv binding lexical and absolute; processes.spawn() opens this path
+    # directly and never falls back to PATH.
+    return str(root / NODE_RUNTIME["entrypoint"])
 
 
 def _sha256_json(value: Any) -> str:
@@ -197,45 +221,65 @@ def _host_public_commitment(mode: str) -> dict[str, Any]:
     return {"availability": "UNAVAILABLE", "commitment": None}
 
 
+def _paired_device_not_run() -> dict[str, Any]:
+    return {
+        "availability": "NOT_RUN",
+        "device_key_commitment": None,
+        "pairing_epoch": None,
+    }
+
+
 def _paired_device_identity(home: Path, mode: str) -> dict[str, Any]:
     if mode == "foundation-readonly":
-        return {
-            "availability": "NOT_RUN",
-            "device_key_commitment": None,
-            "pairing_epoch": None,
-        }
+        return _paired_device_not_run()
     path = _device_registry_path(home)
+    if not os.path.lexists(path.parent):
+        return _paired_device_not_run()
     _validate_device_registry_artifacts(path, require_main=False)
     if not path.exists():
-        return {
-            "availability": "UNPAIRED",
-            "device_key_commitment": None,
-            "pairing_epoch": None,
-        }
-    try:
-        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
-    except sqlite3.Error as error:
-        raise RuntimeError("PAIRED_DEVICE_IDENTITY_UNAVAILABLE") from error
-    try:
-        columns = tuple(
-            row[1]
-            for row in connection.execute("PRAGMA table_info(device_registry)")
-        )
-        if columns != PAIRING_DEVICE_REGISTRY_COLUMNS:
-            raise RuntimeError("PAIRED_DEVICE_IDENTITY_SCHEMA_MISMATCH")
-        row = connection.execute(PAIRING_DEVICE_REGISTRY_QUERY).fetchone()
-    except RuntimeError:
-        raise
-    except sqlite3.Error as error:
-        raise RuntimeError("PAIRED_DEVICE_IDENTITY_UNAVAILABLE") from error
-    finally:
-        connection.close()
+        return _paired_device_not_run()
+    deadline = time.monotonic() + 5.0
+    while True:
+        connection = None
+        try:
+            connection = sqlite3.connect(
+                f"file:{path}?mode=ro", uri=True, timeout=0.25,
+            )
+            columns = tuple(
+                value[1]
+                for value in connection.execute("PRAGMA table_info(device_registry)")
+            )
+            if not columns:
+                raise sqlite3.OperationalError("schema not ready")
+            if columns != PAIRING_DEVICE_REGISTRY_COLUMNS:
+                raise RuntimeError("PAIRED_DEVICE_IDENTITY_SCHEMA_MISMATCH")
+            row = connection.execute(PAIRING_DEVICE_REGISTRY_QUERY).fetchone()
+            break
+        except RuntimeError:
+            raise
+        except sqlite3.OperationalError as error:
+            if mode == "official-agent-local":
+                return _paired_device_not_run()
+            if time.monotonic() >= deadline:
+                raise RuntimeError("PAIRED_DEVICE_IDENTITY_UNAVAILABLE") from error
+            time.sleep(0.05)
+        except sqlite3.Error as error:
+            if mode == "official-agent-local":
+                return _paired_device_not_run()
+            raise RuntimeError("PAIRED_DEVICE_IDENTITY_UNAVAILABLE") from error
+        finally:
+            if connection is not None:
+                connection.close()
     if row is None:
-        return {
-            "availability": "UNPAIRED",
-            "device_key_commitment": None,
-            "pairing_epoch": None,
-        }
+        return (
+            _paired_device_not_run()
+            if mode == "official-agent-local"
+            else {
+                "availability": "UNPAIRED",
+                "device_key_commitment": None,
+                "pairing_epoch": None,
+            }
+        )
     (
         _row_id,
         _principal_alias,
@@ -317,13 +361,26 @@ def _assert_identity_match(
         raise RuntimeError("RUNNING_IDENTITY_MISMATCH")
 
 
-def _run_host_identity_command(binary: Path, arguments: list[str], *, interactive: bool = False) -> str:
+def _host_identity_env(identity_root: Path | None) -> dict[str, str]:
+    env = processes.minimal_env()
+    if identity_root is not None:
+        env[HOST_IDENTITY_ROOT_ENV] = str(identity_root)
+    return env
+
+
+def _run_host_identity_command(
+    binary: Path,
+    arguments: list[str],
+    *,
+    interactive: bool = False,
+    identity_root: Path | None = None,
+) -> str:
     timeout = HOST_IDENTITY_AUTHORIZATION_TIMEOUT if interactive else HOST_IDENTITY_PREFLIGHT_TIMEOUT
     try:
         result = subprocess.run(
             [str(binary), *arguments],
             cwd=binary.parent.parent,
-            env=processes.minimal_env(),
+            env=_host_identity_env(identity_root),
             stdin=None if interactive else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -351,8 +408,12 @@ def _run_host_identity_command(binary: Path, arguments: list[str], *, interactiv
     return matched
 
 
-def _require_host_identity_ready(binary: Path) -> None:
-    status = _run_host_identity_command(binary, ["identity-preflight", "--non-interactive"])
+def _require_host_identity_ready(binary: Path, *, scope: str, identity_root: Path | None = None) -> None:
+    status = _run_host_identity_command(
+        binary,
+        ["identity-preflight", "--non-interactive", f"--scope={scope}"],
+        identity_root=identity_root,
+    )
     error = HOST_IDENTITY_RESULTS[status][1]
     if error is not None:
         next_step = "nomad-web authorize-host-identity" if status in {"AUTH_REQUIRED", "USER_DENIED"} else None
@@ -368,7 +429,12 @@ def authorize_host_identity(config: Any) -> dict[str, Any]:
         if bundle is None:
             raise RuntimeError("PREBUILT_BUNDLE_REQUIRED")
         binary = bundle / "bin" / "nomad-product-host"
-        status = _run_host_identity_command(binary, ["authorize-host-identity"], interactive=True)
+        status = _run_host_identity_command(
+            binary,
+            ["authorize-host-identity", f"--scope={HOST_IDENTITY_SCOPE_LOCAL_INSTALLED}"],
+            interactive=True,
+            identity_root=ensure_host_identity_root(config),
+        )
         error = HOST_IDENTITY_RESULTS[status][1]
         if error is not None:
             next_step = "nomad-web authorize-host-identity" if status in {"AUTH_REQUIRED", "USER_DENIED"} else None
@@ -861,6 +927,114 @@ def _create_run_session(origin: str, password: str) -> str:
         raise RuntimeError("SESSION_CREATE_INVALID")
     return session_id
 
+
+def _dispatch_initial_prompt(origin: str, password: str, session_id: str, prompt_fd: int) -> dict[str, Any]:
+    prompt = _read_initial_prompt(prompt_fd)
+    body = json.dumps(
+        {"prompt": {"text": prompt.decode("utf-8")}},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    body_bytes = bytearray(body)
+    parsed = urllib.parse.urlsplit(origin)
+    if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or parsed.username is not None or parsed.password is not None or parsed.path or parsed.query or parsed.fragment or parsed.port is None:
+        raise RuntimeError("AGENT_LOOPBACK_URL_INVALID")
+    url = f"http://127.0.0.1:{parsed.port}/api/session/{urllib.parse.quote(session_id, safe='')}/prompt"
+    token = base64.b64encode(f"opencode:{password}".encode()).decode()
+    request = urllib.request.Request(url, data=body, method="POST", headers={"Authorization":f"Basic {token}","Content-Type":"application/json"})
+    try:
+        _validate_session_prompt_url(request.full_url, parsed.port)
+        with _NO_PROXY_OPENER.open(request, timeout=10) as response:
+            raw = response.read(MAX_PROMPT_RESPONSE_BYTES + 1)
+            status = response.status
+    except urllib.error.HTTPError as error:
+        try:
+            error.read(1024)
+        except Exception:
+            pass
+        raise RuntimeError("INITIAL_PROMPT_DISPATCH_REJECTED") from error
+    except (OSError, urllib.error.URLError) as error:
+        raise RuntimeError("INITIAL_PROMPT_DISPATCH_REJECTED") from error
+    finally:
+        prompt[:] = b"\x00" * len(prompt)
+        body_bytes[:] = b"\x00" * len(body_bytes)
+    if status < 200 or status >= 300 or len(raw) > MAX_PROMPT_RESPONSE_BYTES:
+        raise RuntimeError("INITIAL_PROMPT_DISPATCH_REJECTED")
+    if not raw:
+        return {
+            "schema": "nomad.web-companion.initial-dispatch.v1",
+            "status": "accepted",
+            "delivery": None,
+            "dispatch_alias": None,
+            "admitted_seq": None,
+            "promoted_seq": None,
+            "empty_success": True,
+        }
+    return _parse_prompt_dispatch_response(raw)
+
+
+def _read_initial_prompt(descriptor: int) -> bytearray:
+    value = bytearray()
+    try:
+        while len(value) <= MAX_INITIAL_PROMPT_BYTES:
+            chunk = os.read(descriptor, min(4096, MAX_INITIAL_PROMPT_BYTES + 1 - len(value)))
+            if not chunk:
+                break
+            value.extend(chunk)
+        decoded = value.decode("utf-8")
+        if not value or len(value) > MAX_INITIAL_PROMPT_BYTES or not decoded.strip() or "\x00" in decoded:
+            raise RuntimeError("INITIAL_PROMPT_INVALID")
+        return value
+    except UnicodeDecodeError as error:
+        raise RuntimeError("INITIAL_PROMPT_INVALID") from error
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _parse_prompt_dispatch_response(raw: bytes) -> dict[str, Any]:
+    try:
+        _bounded_json_depth(raw)
+        value = json.loads(raw, object_pairs_hook=_unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError) as error:
+        raise RuntimeError("INITIAL_PROMPT_DISPATCH_INVALID") from error
+    if type(value) is not dict or not PROMPT_DISPATCH_REQUIRED.issubset(value) or not set(value).issubset(PROMPT_DISPATCH_ALLOWED):
+        raise RuntimeError("INITIAL_PROMPT_DISPATCH_INVALID")
+    data = value.get("data")
+    if type(data) is not dict or not PROMPT_DATA_REQUIRED.issubset(data) or not set(data).issubset(PROMPT_DATA_ALLOWED):
+        raise RuntimeError("INITIAL_PROMPT_DISPATCH_INVALID")
+    prompt = data.get("prompt")
+    if type(prompt) is not dict or not PROMPT_REQUIRED.issubset(prompt) or not set(prompt).issubset(PROMPT_ALLOWED):
+        raise RuntimeError("INITIAL_PROMPT_DISPATCH_INVALID")
+    if (
+        type(data.get("admittedSeq")) is not int
+        or data["admittedSeq"] <= 0
+        or data.get("delivery") not in {"steer", "queue"}
+        or type(data.get("id")) is not str
+        or not SESSION_ID.fullmatch(data["id"])
+        or type(data.get("sessionID")) is not str
+        or not SESSION_ID.fullmatch(data["sessionID"])
+        or type(data.get("timeCreated")) not in (int, float)
+        or type(prompt.get("text")) is not str
+        or not prompt["text"]
+    ):
+        raise RuntimeError("INITIAL_PROMPT_DISPATCH_INVALID")
+    promoted = data.get("promotedSeq")
+    if promoted is not None and (type(promoted) is not int or promoted <= 0):
+        raise RuntimeError("INITIAL_PROMPT_DISPATCH_INVALID")
+    return {
+        "schema": "nomad.web-companion.initial-dispatch.v1",
+        "status": "accepted",
+        "delivery": data["delivery"],
+        "dispatch_alias": "dispatch-" + hashlib.sha256(f"dispatch:{data['id']}".encode("ascii")).hexdigest()[:32],
+        "admitted_seq": data["admittedSeq"],
+        "promoted_seq": promoted,
+        "empty_success": False,
+    }
+
 def _unique_object(pairs):
     value={}
     for key,item in pairs:
@@ -887,6 +1061,12 @@ def _bounded_json_depth(raw: bytes, maximum: int = 32) -> None:
 def _validate_session_url(url: str, port: int) -> None:
     parsed=urllib.parse.urlsplit(url)
     if parsed.scheme!="http" or parsed.hostname!="127.0.0.1" or parsed.port!=port or parsed.username is not None or parsed.password is not None or parsed.path!="/session" or parsed.query or parsed.fragment:
+        raise RuntimeError("AGENT_LOOPBACK_URL_INVALID")
+
+
+def _validate_session_prompt_url(url: str, port: int) -> None:
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or parsed.port != port or parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment or re.fullmatch(r"/api/session/[A-Za-z0-9_.%:-]{1,512}/prompt", parsed.path) is None:
         raise RuntimeError("AGENT_LOOPBACK_URL_INVALID")
 
 def _terminate_reap(pid: int) -> None:
@@ -1104,12 +1284,22 @@ def _validate_runtime_dirs_if_present(config: Any) -> None:
             raise RuntimeError("UNSAFE_LAUNCHER_DIRECTORY")
 
 
-def _safe_remove_tree(path: Path, *, root: Path) -> None:
+def _safe_remove_tree(
+    path: Path, *, root: Path, _allow_leaf_symlink: bool = False,
+) -> None:
     if not os.path.lexists(path):
         return
     info = path.lstat()
-    if info.st_uid != os.geteuid() or stat.S_ISLNK(info.st_mode):
+    if info.st_uid != os.geteuid():
         raise RuntimeError("UNSAFE_NOMAD_WEB_HOME_CONTENTS")
+    if stat.S_ISLNK(info.st_mode):
+        if not _allow_leaf_symlink:
+            raise RuntimeError("UNSAFE_NOMAD_WEB_HOME_CONTENTS")
+        # Never resolve or inspect the target. The containing directory was
+        # already opened through an owned canonical path, so remove only this
+        # directory entry and leave any in-home or external target untouched.
+        path.unlink()
+        return
     try:
         canonical = path.resolve(strict=True)
     except OSError as error:
@@ -1118,7 +1308,7 @@ def _safe_remove_tree(path: Path, *, root: Path) -> None:
         raise RuntimeError("UNSAFE_NOMAD_WEB_HOME_CONTENTS")
     if stat.S_ISDIR(info.st_mode):
         for entry in sorted(path.iterdir(), key=lambda item: item.name):
-            _safe_remove_tree(entry, root=root)
+            _safe_remove_tree(entry, root=root, _allow_leaf_symlink=True)
         path.rmdir()
         return
     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
@@ -1217,6 +1407,49 @@ def start_foundation(
         )
 
 
+def run_foundation(
+    config: Any,
+    *,
+    provider_name: str,
+    credential_fd: int,
+    workspace: Path,
+) -> dict[str, Any]:
+    initialize_home(config)
+    try:
+        with lifecycle_lock(config, create=True):
+            started = _start_unlocked(
+                config,
+                provider_name=provider_name,
+                credential_fd=credential_fd,
+                workspace=workspace,
+                require_stopped=True,
+            )
+    except Exception:
+        for descriptor in (credential_fd,):
+            processes.close_fd(descriptor)
+        raise
+    dispatch = started.pop("_initial_prompt_dispatch", None)
+    if type(dispatch) is not dict:
+        raise RuntimeError("INITIAL_PROMPT_DISPATCH_INVALID")
+    return {
+        "schema": "nomad.web-companion.run-result.v1",
+        "state": started["state"],
+        "mode": started["mode"],
+        "real_agent_enabled": started["real_agent_enabled"],
+        "bundle_digest": started["bundle_digest"],
+        "blocked_on": started["blocked_on"],
+        "web_url": started["web_url"],
+        "agent_origin": started["agent_origin"],
+        "agent_version": started["agent_version"],
+        "logs_dir": started["logs_dir"],
+        "run_id": started["run_id"],
+        "session_alias": started["session_alias"],
+        "workspace_binding_digest": started["workspace_binding_digest"],
+        "identity": started["identity"],
+        "dispatch": dispatch,
+    }
+
+
 def start_remote_local_evidence(
     config: Any, *, provider_name: str | None, credential_fd: int | None,
     workspace: Path | None, public_origin: str | None, https_listen: str | None,
@@ -1250,6 +1483,7 @@ def _start_unlocked(
     provider_name: str | None = None,
     credential_fd: int | None = None,
     workspace: Path | None = None,
+    require_stopped: bool = False,
 ) -> dict[str, Any]:
     agent_requested = any(value is not None for value in (provider_name, credential_fd, workspace))
     if agent_requested and not all(value is not None for value in (provider_name, credential_fd, workspace)):
@@ -1275,6 +1509,8 @@ def _start_unlocked(
                     os.close(int(credential_fd))
                 except OSError:
                     pass
+            if require_stopped:
+                raise RuntimeError("RUN_COMMAND_REQUIRES_STOP")
             if agent_requested and existing["mode"] != "official-agent-local":
                 raise RuntimeError("MODE_CHANGE_REQUIRES_STOP")
             _assert_identity_match(
@@ -1311,9 +1547,17 @@ def _start_unlocked(
     validate_runtime_dirs(config)
     if bundle is not None:
         relay_binary = bundle / "bin" / "nomad-relay"
+        host_binary = bundle / "bin" / "nomad-product-host"
         relay_cwd = bundle
         gateway_dir = bundle / "gateway"
         web_dir = bundle / "web"
+        node = _bundled_node(bundle)
+        if agent_requested:
+            _require_host_identity_ready(
+                host_binary,
+                scope=HOST_IDENTITY_SCOPE_LOCAL_INSTALLED,
+                identity_root=ensure_host_identity_root(config),
+            )
     else:
         if os.environ.get("NOMAD_WEB_ALLOW_SOURCE_BUILD") != "1":
             raise RuntimeError("PREBUILT_BUNDLE_REQUIRED")
@@ -1324,15 +1568,19 @@ def _start_unlocked(
         relay_cwd = repo / "relay"
         gateway_dir = repo / "mobile-reference" / "pilot-gateway"
         web_dir = repo / "mobile-reference" / "dist"
-    node = shutil.which("node")
-    if not node:
-        raise RuntimeError("NODE_UNAVAILABLE")
+        # Explicit source-build mode is a developer-only escape hatch. Stable
+        # installed execution always takes the verified bundle branch above.
+        node = shutil.which("node")
+        if node is None:
+            raise RuntimeError("NODE_UNAVAILABLE")
     token = secrets.token_urlsafe(32) if not agent_requested else None
     run_id = secrets.token_hex(32) if agent_requested else None
     run_state_alias = hashlib.sha256(f"state:{run_id}".encode()).hexdigest() if agent_requested else None
     children: list[dict[str, Any]] = []
+    dispatch_metadata: dict[str, Any] | None = None
     bootstrap_parent = bootstrap_child = None
     command_gateway_read = command_gateway_write = None
+    initial_prompt_fd = None
     product_host_socket_path = None
     product_host_socket_identity = None
     device_registry_path = None
@@ -1358,22 +1606,40 @@ def _start_unlocked(
             host = _spawn_product_host(bundle / "bin" / "nomad-product-host", bundle, log_dir / f"product-host-{run_state_alias}.log", bootstrap_child)
             children.append(host)
             bootstrap_child.close(); bootstrap_child = None
-            agent = start_agent(
-                bundle,
-                Path(workspace),
-                run_dir / f"agent-runtime-{run_state_alias}",
-                int(_get(config, "agent_port")),
-                str(provider_name),
-                int(credential_fd),
-                log_dir / f"agent-{run_state_alias}.log",
+            agent = (
+                start_run_agent(
+                    bundle,
+                    Path(workspace),
+                    run_dir / f"agent-runtime-{run_state_alias}",
+                    int(_get(config, "agent_port")),
+                    str(provider_name),
+                    int(credential_fd),
+                    log_dir / f"agent-{run_state_alias}.log",
+                )
+                if require_stopped
+                else start_agent(
+                    bundle,
+                    Path(workspace),
+                    run_dir / f"agent-runtime-{run_state_alias}",
+                    int(_get(config, "agent_port")),
+                    str(provider_name),
+                    int(credential_fd),
+                    log_dir / f"agent-{run_state_alias}.log",
+                )
             )
             password = agent.pop("_server_password")
+            initial_prompt_fd = agent.pop("_initial_prompt_fd", None)
             children.insert(0, {key: agent[key] for key in ("name", "pid", "process_group", "identity", "log")})
             workspace_digest = str(agent.pop("_workspace_binding_digest"))
             session_id = _create_run_session(str(agent["origin"]), password)
             product_host_socket_identity = _bootstrap_host(bootstrap_parent, run_id=run_id, origin=str(agent["origin"]), session_id=session_id, password=password, workspace_digest=workspace_digest, product_host_socket_path=product_host_socket_path, device_registry_path=device_registry_path, agent_pid=int(agent["pid"]), agent_process_group=int(agent["process_group"]), agent_process_identity=str(agent["identity"]), command_transport_key=command_transport_key, command_authority_key=command_authority_key, command_journal_path=command_journal_path)
-            password = ""
             bootstrap_parent.close(); bootstrap_parent = None
+            if initial_prompt_fd is not None:
+                dispatch_metadata = _dispatch_initial_prompt(
+                    str(agent["origin"]), password, session_id, initial_prompt_fd,
+                )
+                initial_prompt_fd = None
+            password = ""
         if not agent_requested:
             relay = processes.spawn(
                 "relay",
@@ -1450,7 +1716,10 @@ def _start_unlocked(
             socket_identity=state["product_host_socket_identity"],
         )
         write_run_state(config, state)
-        return {**state, "state": "RUNNING"}
+        result = {**state, "state": "RUNNING"}
+        if dispatch_metadata is not None:
+            result["_initial_prompt_dispatch"] = dispatch_metadata
+        return result
     except Exception:
         for child in reversed(children):
             processes.stop(child)
@@ -1465,6 +1734,8 @@ def _start_unlocked(
             os.close(command_gateway_read)
         if command_gateway_write is not None:
             os.close(command_gateway_write)
+        if initial_prompt_fd is not None:
+            processes.close_fd(initial_prompt_fd)
 
 
 def _start_remote_unlocked(
@@ -1530,10 +1801,12 @@ def _start_remote_unlocked(
     host_binary = bundle / "bin" / "nomad-product-host"
     ingress_binary = bundle / "bin" / "nomad-ingress"
     gateway_dir, web_dir = bundle / "gateway", bundle / "web"
-    _require_host_identity_ready(host_binary)
-    node = shutil.which("node")
-    if not node:
-        raise RuntimeError("NODE_UNAVAILABLE")
+    _require_host_identity_ready(
+        host_binary,
+        scope=HOST_IDENTITY_SCOPE_KEYCHAIN,
+        identity_root=None,
+    )
+    node = _bundled_node(bundle)
 
     relay_host_v1_port = _remote_port(config, "relay_port")
     relay_device_v1_port = _remote_port(config, "relay_device_v1_port")

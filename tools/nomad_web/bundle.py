@@ -41,6 +41,8 @@ REQUIRED = {
     **COMMON_REQUIRED,
     **GATEWAY_MODULES,
     "bin/nomad-ingress": 0o755,
+    "runtime/node": 0o755,
+    "runtime/LICENSE": 0o644,
 }
 REQUIRED_BY_SCHEMA = {SCHEMA_V1: REQUIRED_V1, SCHEMA: REQUIRED}
 REQUIRED_PACKAGE_V1 = {
@@ -67,7 +69,9 @@ PACKAGE_BY_SCHEMA = {SCHEMA_V1: REQUIRED_PACKAGE, SCHEMA: REQUIRED_PACKAGE}
 RUNNERS_BY_SCHEMA = {
     SCHEMA_V1: REQUIRED_RUNNER_CLOSURE, SCHEMA: REQUIRED_RUNNER_CLOSURE,
 }
-TOP_KEYS = {"schema", "classification", "platform", "launcher_version", "source_commit_oid", "source_dirty", "build_tools", "agent_runtime", "files", "bundle_digest"}
+TOP_KEYS_V1 = {"schema", "classification", "platform", "launcher_version", "source_commit_oid", "source_dirty", "build_tools", "agent_runtime", "files", "bundle_digest"}
+TOP_KEYS = TOP_KEYS_V1 | {"node_runtime"}
+TOP_KEYS_BY_SCHEMA = {SCHEMA_V1: TOP_KEYS_V1, SCHEMA: TOP_KEYS}
 FILE_KEYS = {"path", "size_bytes", "raw_sha256", "mode"}
 AGENT_ENTRYPOINT_SHA256 = "a41776bf64c75786d6baf531b840ffb873c090d7c44793ae2dd4b1896de56a1f"
 AGENT_RUNTIME = {
@@ -78,6 +82,17 @@ AGENT_RUNTIME = {
     "entrypoint": "agent/opencode",
     "entrypoint_raw_sha256": AGENT_ENTRYPOINT_SHA256,
     "provider_backed": False,
+}
+NODE_ENTRYPOINT_SHA256 = "3200fbd9f7fd4410426dd541e10d1ab829d3472f270d743c7fabd1696c03fe32"
+NODE_LICENSE_SHA256 = "4573185d56580da2b890ba34a85a409257640f1c5632eade4300137266194d18"
+NODE_RUNTIME = {
+    "classification": "official-nodejs-developer-id-locked-runtime",
+    "version": "24.15.0",
+    "platform": "darwin-arm64",
+    "entrypoint": "runtime/node",
+    "entrypoint_raw_sha256": NODE_ENTRYPOINT_SHA256,
+    "license": "runtime/LICENSE",
+    "license_raw_sha256": NODE_LICENSE_SHA256,
 }
 
 
@@ -141,7 +156,9 @@ def _verify_bundle_inputs(
         value = json.loads(raw_manifest)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise RuntimeError("INVALID_BUNDLE_MANIFEST") from error
-    if not isinstance(value, dict) or set(value) != TOP_KEYS or value["schema"] not in SUPPORTED_SCHEMAS:
+    if not isinstance(value, dict) or value.get("schema") not in SUPPORTED_SCHEMAS:
+        raise RuntimeError("INVALID_BUNDLE_MANIFEST")
+    if set(value) != TOP_KEYS_BY_SCHEMA[value["schema"]]:
         raise RuntimeError("INVALID_BUNDLE_MANIFEST")
     required = REQUIRED_BY_SCHEMA[value["schema"]]
     required_package = PACKAGE_BY_SCHEMA[value["schema"]]
@@ -150,6 +167,8 @@ def _verify_bundle_inputs(
         raise RuntimeError("INVALID_BUNDLE_MANIFEST")
     if value["agent_runtime"] != AGENT_RUNTIME:
         raise RuntimeError("INVALID_AGENT_RUNTIME")
+    if value.get("node_runtime") != (NODE_RUNTIME if value["schema"] == SCHEMA else None):
+        raise RuntimeError("INVALID_NODE_RUNTIME")
     if (
         not isinstance(value["launcher_version"], str)
         or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", value["launcher_version"]) is None
@@ -195,12 +214,20 @@ def _verify_bundle_inputs(
             or entry["mode"] != f"{mode:04o}"
         ):
             raise RuntimeError("INVALID_BUNDLE_MODE")
-        limit = 192 * 1024 * 1024 if name == AGENT_RUNTIME["entrypoint"] else 64 * 1024 * 1024
+        limit = (
+            192 * 1024 * 1024
+            if name in (AGENT_RUNTIME["entrypoint"], NODE_RUNTIME["entrypoint"])
+            else 64 * 1024 * 1024
+        )
         raw = read_file(name, limit, mode)
         if entry["size_bytes"] != len(raw) or entry["raw_sha256"] != hashlib.sha256(raw).hexdigest():
             raise RuntimeError("BUNDLE_FILE_MISMATCH")
         if name == AGENT_RUNTIME["entrypoint"] and entry["raw_sha256"] != AGENT_ENTRYPOINT_SHA256:
             raise RuntimeError("AGENT_ENTRYPOINT_MISMATCH")
+        if name == NODE_RUNTIME["entrypoint"] and entry["raw_sha256"] != NODE_ENTRYPOINT_SHA256:
+            raise RuntimeError("NODE_ENTRYPOINT_MISMATCH")
+        if name == NODE_RUNTIME["license"] and entry["raw_sha256"] != NODE_LICENSE_SHA256:
+            raise RuntimeError("NODE_LICENSE_MISMATCH")
     expected_files = observed | {MANIFEST}
     expected_dirs = {str(parent) for name in expected_files for parent in Path(name).parents if str(parent) != "."}
     if (

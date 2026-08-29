@@ -213,7 +213,7 @@ def host_identity_preflight(bundle: Path) -> dict[str, Any]:
     code = "HOST_IDENTITY_PREFLIGHT_INVALID"
     try:
         result = subprocess.run(
-            [str(binary), "identity-preflight", "--non-interactive"],
+            [str(binary), "identity-preflight", "--non-interactive", "--scope=keychain"],
             cwd=bundle,
             env=sanitized_env({}),
             stdin=subprocess.DEVNULL,

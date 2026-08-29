@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import shutil
+import stat
 import subprocess
 import tempfile
 from pathlib import Path
@@ -17,6 +18,9 @@ from .bundle import (
     AGENT_RUNTIME,
     GATEWAY_MODULES,
     MANIFEST,
+    NODE_ENTRYPOINT_SHA256,
+    NODE_LICENSE_SHA256,
+    NODE_RUNTIME,
     REQUIRED_PACKAGE,
     SCHEMA,
     _rename_exclusive,
@@ -39,7 +43,8 @@ def materialize(repo: Path, output: Path) -> dict[str, Any]:
         root = Path(temporary) / "bundle"
         for directory in (
             root / "bin", root / "agent", root / "gateway", root / "web",
-            root / "lib" / "nomad_web", root / "testkit" / "remote-v2",
+            root / "lib" / "nomad_web", root / "runtime",
+            root / "testkit" / "remote-v2",
         ):
             directory.mkdir(parents=True, exist_ok=True)
         ingress_source = repo / "relay" / "cmd" / "nomad-ingress"
@@ -54,6 +59,7 @@ def materialize(repo: Path, output: Path) -> dict[str, Any]:
         shutil.copyfile(repo / "connector" / "target" / "release" / "nomad-product-host", host)
         run_checked(["npm", "run", "build"], repo / "mobile-reference")
         _materialize_agent(repo, Path(temporary), root)
+        node_version = _materialize_node(root)
         gateway_source = repo / "mobile-reference" / "pilot-gateway"
         gateway_modules = gateway_module_closure(gateway_source)
         if {f"gateway/{name}" for name in gateway_modules} != set(GATEWAY_MODULES):
@@ -72,8 +78,9 @@ def materialize(repo: Path, output: Path) -> dict[str, Any]:
             shutil.copyfile(runner_source / name, root / "testkit" / "remote-v2" / name)
         wrapper = root / "bin" / "nomad-web"
         wrapper.write_text(
-            "#!/bin/sh\nset -eu\nBUNDLE=$(CDPATH= cd -- \"$(dirname -- \"$0\")/..\" && pwd)\n"
+            "#!/bin/sh\nset -eu\nBUNDLE=$(CDPATH= cd -- \"$(/usr/bin/dirname -- \"$0\")/..\" && /bin/pwd -P)\n"
             "export NOMAD_WEB_BUNDLE=\"$BUNDLE\"\n"
+            "PATH=\"$BUNDLE/runtime:/usr/bin:/bin:/usr/sbin:/sbin\"\nexport PATH\n"
             "unset PYTHONPATH PYTHONHOME\n"
             "exec python3 -I -B -c '"
             "import runpy,sys; sys.path.insert(0,sys.argv.pop(1)); "
@@ -83,7 +90,10 @@ def materialize(repo: Path, output: Path) -> dict[str, Any]:
         for directory in sorted((item for item in root.rglob("*") if item.is_dir()), reverse=True):
             os.chmod(directory, 0o755)
         os.chmod(root, 0o755)
-        executable_files = {relay, ingress, host, wrapper, root / "agent" / "opencode"}
+        executable_files = {
+            relay, ingress, host, wrapper, root / "agent" / "opencode",
+            root / NODE_RUNTIME["entrypoint"],
+        }
         for path in root.rglob("*"):
             if path.is_file():
                 os.chmod(path, 0o755 if path in executable_files else 0o644)
@@ -96,8 +106,9 @@ def materialize(repo: Path, output: Path) -> dict[str, Any]:
             "platform": "darwin-arm64", "launcher_version": "0.1.0",
             "source_commit_oid": _git(repo, "rev-parse", "HEAD"),
             "source_dirty": bool(_git(repo, "status", "--porcelain")),
-            "build_tools": {"go": _line(["go", "version"]), "node": _line(["node", "--version"]), "npm": _line(["npm", "--version"]), "python": platform.python_version()},
+            "build_tools": {"go": _line(["go", "version"]), "node": node_version, "npm": _line(["npm", "--version"]), "python": platform.python_version()},
             "agent_runtime": AGENT_RUNTIME,
+            "node_runtime": NODE_RUNTIME,
             "files": files,
         }
         value = {**core, "bundle_digest": hashlib.sha256(json.dumps(core, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()}
@@ -151,3 +162,58 @@ def _materialize_agent(repo: Path, temporary: Path, root: Path) -> None:
         raise RuntimeError("AGENT_ENTRYPOINT_MISMATCH")
     shutil.copyfile(entrypoint, root / "agent" / "opencode")
     shutil.copyfile(install / "node_modules" / "opencode-ai" / "LICENSE", root / "agent" / "LICENSE")
+
+
+def _materialize_node(root: Path) -> str:
+    selected = shutil.which("node")
+    if selected is None:
+        raise RuntimeError("NODE_BUILD_RUNTIME_UNAVAILABLE")
+    candidate = Path(selected)
+    if not candidate.is_absolute():
+        raise RuntimeError("NODE_BUILD_RUNTIME_UNSAFE")
+    try:
+        entrypoint = candidate.resolve(strict=True)
+        info = entrypoint.stat()
+    except OSError as error:
+        raise RuntimeError("NODE_BUILD_RUNTIME_UNSAFE") from error
+    if (
+        not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+        or info.st_uid not in (0, os.geteuid())
+        or not os.access(entrypoint, os.X_OK)
+        or stat.S_IMODE(info.st_mode) & 0o022
+    ):
+        raise RuntimeError("NODE_BUILD_RUNTIME_UNSAFE")
+    for ancestor in entrypoint.parents:
+        try:
+            ancestor_info = ancestor.lstat()
+        except OSError as error:
+            raise RuntimeError("NODE_BUILD_RUNTIME_UNSAFE") from error
+        if (
+            not stat.S_ISDIR(ancestor_info.st_mode)
+            or stat.S_ISLNK(ancestor_info.st_mode)
+            or ancestor_info.st_uid not in (0, os.geteuid())
+            or stat.S_IMODE(ancestor_info.st_mode) & 0o022
+        ):
+            raise RuntimeError("NODE_BUILD_RUNTIME_UNSAFE")
+    installation = entrypoint.parent.parent
+    license_path = installation / "LICENSE"
+    try:
+        license_info = license_path.lstat()
+    except OSError as error:
+        raise RuntimeError("NODE_LICENSE_MISMATCH") from error
+    if (
+        not entrypoint.is_file()
+        or hashlib.sha256(entrypoint.read_bytes()).hexdigest() != NODE_ENTRYPOINT_SHA256
+        or _line([str(entrypoint), "--version"]) != f"v{NODE_RUNTIME['version']}"
+    ):
+        raise RuntimeError("NODE_ENTRYPOINT_MISMATCH")
+    if (
+        not stat.S_ISREG(license_info.st_mode) or stat.S_ISLNK(license_info.st_mode)
+        or license_info.st_nlink != 1 or license_info.st_uid not in (0, os.geteuid())
+        or stat.S_IMODE(license_info.st_mode) & 0o022
+        or hashlib.sha256(license_path.read_bytes()).hexdigest() != NODE_LICENSE_SHA256
+    ):
+        raise RuntimeError("NODE_LICENSE_MISMATCH")
+    shutil.copyfile(entrypoint, root / NODE_RUNTIME["entrypoint"])
+    shutil.copyfile(license_path, root / NODE_RUNTIME["license"])
+    return f"v{NODE_RUNTIME['version']}"

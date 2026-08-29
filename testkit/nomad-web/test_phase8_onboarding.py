@@ -16,7 +16,10 @@ from tools.nomad_web import onboarding
 class Phase8OnboardingTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="nomad-onboarding-")
-        self.config = SimpleNamespace(home=Path(self.temporary.name) / "home")
+        self.config = SimpleNamespace(
+            home=Path(self.temporary.name) / "home",
+            _test_host_identity_root=Path(self.temporary.name) / "host-identity-root",
+        )
         self.digest = "a" * 64
         self.installed = {
             "schema": lifecycle.STATUS_SCHEMA,
@@ -56,6 +59,16 @@ class Phase8OnboardingTests(unittest.TestCase):
             },
         }
 
+    def foundation_run_state(self) -> dict[str, object]:
+        value = self.run_state("NOT_RUN")
+        value["mode"] = "foundation-readonly"
+        value["identity"]["running"] = {
+            "availability": "NOT_RUN", "bundle_digest": None,
+            "run_id": None, "process_commitment": None,
+            "socket_commitment": None, "run_identity": None,
+        }
+        return value
+
     def assert_safe(self, value: dict[str, object]) -> None:
         self.assertFalse(value["production_ready"])
         self.assertEqual(value["external_readiness"], "NOT_RUN")
@@ -93,9 +106,11 @@ class Phase8OnboardingTests(unittest.TestCase):
         with mock.patch.object(lifecycle.processes, "ownership", return_value="owned"):
             unpaired = lifecycle._classify_onboarding_unlocked(self.config, self.installed, self.run_state("UNPAIRED"))
             paired = lifecycle._classify_onboarding_unlocked(self.config, self.installed, self.run_state("READY"))
-            foundation = lifecycle._classify_onboarding_unlocked(self.config, self.installed, self.run_state("NOT_RUN"))
+            not_run = lifecycle._classify_onboarding_unlocked(self.config, self.installed, self.run_state("NOT_RUN"))
+            foundation = lifecycle._classify_onboarding_unlocked(self.config, self.installed, self.foundation_run_state())
             drift = lifecycle._classify_onboarding_unlocked(self.config, self.installed, self.run_state("UNPAIRED", digest="c" * 64))
         self.assertEqual(unpaired["state"], "RUNNING_NEEDS_PAIRING")
+        self.assertEqual(not_run["state"], "RUNNING_NEEDS_PAIRING")
         self.assertEqual(paired["state"], "RUNNING_PAIRED")
         self.assertEqual(paired["run_identity"], "b" * 64)
         self.assertEqual(paired["paired_device_commitment"], "d" * 64)
@@ -103,6 +118,15 @@ class Phase8OnboardingTests(unittest.TestCase):
         self.assertEqual(foundation["blockers"], ["OFFICIAL_AGENT_RUNTIME_REQUIRED"])
         self.assertEqual(drift["blockers"], ["RUNNING_IDENTITY_MISMATCH"])
         self.assert_safe(paired)
+
+    def test_foundation_running_identity_not_run_is_not_drift(self) -> None:
+        with mock.patch.object(lifecycle.processes, "ownership", return_value="owned"):
+            value = lifecycle._classify_onboarding_unlocked(
+                self.config, self.installed, self.foundation_run_state(),
+            )
+        self.assertEqual(value["state"], "RUNNING_DEGRADED_RECOVERY_REQUIRED")
+        self.assertEqual(value["blockers"], ["OFFICIAL_AGENT_RUNTIME_REQUIRED"])
+        self.assertNotIn("RUNNING_IDENTITY_MISMATCH", value["blockers"])
 
     def test_degraded_process_and_embedded_install_result(self) -> None:
         with mock.patch.object(lifecycle.processes, "ownership", return_value="absent"):
@@ -169,10 +193,16 @@ class Phase8OnboardingTests(unittest.TestCase):
             "from pathlib import Path;"
             "from types import SimpleNamespace;"
             "from nomad_web.install_lifecycle import onboarding_status;"
-            "print(json.dumps(onboarding_status(SimpleNamespace(home=Path(sys.argv[2]))),sort_keys=True))"
+            "cfg=SimpleNamespace(home=Path(sys.argv[2]),_test_host_identity_root=Path(sys.argv[3]));"
+            "print(json.dumps(onboarding_status(cfg),sort_keys=True))"
         )
         result = subprocess.run(
-            [os.sys.executable, "-I", "-B", "-c", code, str(bundle / "lib"), str(Path(self.temporary.name) / "fresh-home")],
+            [
+                os.sys.executable, "-I", "-B", "-c", code,
+                str(bundle / "lib"),
+                str(Path(self.temporary.name) / "fresh-home"),
+                str(Path(self.temporary.name) / "fresh-host-identity-root"),
+            ],
             cwd=self.temporary.name,
             env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C", "LC_ALL": "C"},
             stdout=subprocess.PIPE,

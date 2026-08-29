@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from tools.nomad_web import doctor
+from tools.nomad_web.config import host_identity_root
 
 
 def config(root: Path, *, bundle: Path | None = None) -> SimpleNamespace:
@@ -114,12 +115,14 @@ class ReleaseReadinessDoctorTests(unittest.TestCase):
             with self.subTest(identity_status=identity_status), mock.patch.object(
                 doctor.subprocess, "run", return_value=self.completed(identity_status),
             ) as run:
-                result = doctor._host_identity_gate(self.bundle)
+                result = doctor._host_identity_gate(
+                    self.bundle, config=config(self.root), scope="local-installed"
+                )
                 self.assertEqual((result["status"], result["code"], result["next_step"]), (gate_status, code, next_step))
                 run.assert_called_once_with(
-                    [str(self.bundle / "bin" / "nomad-product-host"), "identity-preflight", "--non-interactive"],
+                    [str(self.bundle / "bin" / "nomad-product-host"), "identity-preflight", "--non-interactive", "--scope=local-installed"],
                     cwd=self.bundle,
-                    env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+                    env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "NOMAD_HOST_IDENTITY_ROOT": str(host_identity_root(config(self.root)))},
                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     timeout=doctor.HOST_IDENTITY_TIMEOUT_SECONDS, check=False,
                 )
@@ -134,10 +137,14 @@ class ReleaseReadinessDoctorTests(unittest.TestCase):
         )
         for result in cases:
             with self.subTest(result=result), mock.patch.object(doctor.subprocess, "run", return_value=result):
-                gate = doctor._host_identity_gate(self.bundle)
+                gate = doctor._host_identity_gate(
+                    self.bundle, config=config(self.root), scope="local-installed"
+                )
                 self.assertEqual((gate["status"], gate["code"]), ("BLOCK", "HOST_IDENTITY_PREFLIGHT_INVALID"))
         with mock.patch.object(doctor.subprocess, "run", side_effect=subprocess.TimeoutExpired([], 5)):
-            gate = doctor._host_identity_gate(self.bundle)
+            gate = doctor._host_identity_gate(
+                self.bundle, config=config(self.root), scope="local-installed"
+            )
             self.assertEqual((gate["status"], gate["code"]), ("BLOCK", "HOST_IDENTITY_PREFLIGHT_TIMEOUT"))
 
     def test_all_runtime_ports_are_checked_and_one_collision_blocks(self) -> None:

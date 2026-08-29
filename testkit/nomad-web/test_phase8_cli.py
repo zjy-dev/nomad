@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -59,6 +60,26 @@ class Phase8CliTests(unittest.TestCase):
         ), redirect_stdout(output):
             code = cli.run(list(arguments))
         return code, output.getvalue()
+
+    def invoke_json_stdin(
+        self, payload: bytes, *arguments: str
+    ) -> tuple[int, dict[str, object]]:
+        output = StringIO()
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, payload)
+        os.close(write_fd)
+        saved = os.dup(0)
+        os.dup2(read_fd, 0)
+        os.close(read_fd)
+        try:
+            with mock.patch.object(
+                cli.Config, "load", return_value=self.config
+            ), redirect_stdout(output):
+                code = cli.run(["--json", *arguments])
+        finally:
+            os.dup2(saved, 0)
+            os.close(saved)
+        return code, json.loads(output.getvalue())
 
     @staticmethod
     def onboarding(state: str) -> dict[str, object]:
@@ -302,6 +323,101 @@ class Phase8CliTests(unittest.TestCase):
                 "Production ready: false\n",
             )
             human_handler.assert_not_called()
+
+    def test_run_requires_provider_and_workspace(self) -> None:
+        for arguments in (
+            ("run",),
+            ("run", "--provider", "OPENAI_API_KEY"),
+            ("run", "--workspace", str(Path(self.temporary.name) / "workspace")),
+        ):
+            with self.subTest(arguments=arguments):
+                code, result = self.invoke_json(*arguments)
+            self.assertEqual(code, 1)
+            self.assertEqual(result["error"], "RUN_INPUTS_INCOMPLETE")
+
+    def test_run_passes_opaque_stdin_fd_to_launcher_and_never_echoes_secrets(self) -> None:
+        workspace = Path(self.temporary.name) / "workspace"
+        workspace.mkdir()
+        payload = (
+            b'{"schema":"nomad.web-companion.run-stdin.v1",'
+            b'"provider_credential":"sk-canary","provider_credential":"duplicate",'
+            b'"initial_prompt":"fix tests"}'
+        )
+        result = {
+            "schema": "nomad.web-companion.run-result.v1",
+            "state": "RUNNING",
+            "mode": "official-agent-local",
+            "real_agent_enabled": True,
+            "bundle_digest": "a" * 64,
+            "blocked_on": ["PRODUCTION_DEVICE_IDENTITY"],
+            "web_url": "http://127.0.0.1:14173/",
+            "agent_origin": "http://127.0.0.1:4096",
+            "agent_version": "1.18.16",
+            "logs_dir": "/tmp/logs",
+            "run_id": "b" * 64,
+            "session_alias": "sess-" + "c" * 32,
+            "workspace_binding_digest": "d" * 64,
+            "identity": {"running": {"run_identity": "e" * 64}},
+            "dispatch": {
+                "schema": "nomad.web-companion.initial-dispatch.v1",
+                "status": "accepted",
+                "delivery": "queue",
+                "dispatch_alias": "dispatch-" + "f" * 32,
+                "admitted_seq": 7,
+                "promoted_seq": 8,
+                "empty_success": False,
+            },
+        }
+        seen = {}
+
+        def fake_run_foundation(config, *, provider_name, credential_fd, workspace):
+            seen["config"] = config
+            seen["provider_name"] = provider_name
+            seen["workspace"] = workspace
+            seen["payload"] = os.read(credential_fd, 4096)
+            return result
+
+        with mock.patch.object(cli, "run_foundation", side_effect=fake_run_foundation) as handler:
+            code, emitted = self.invoke_json_stdin(
+                payload,
+                "run",
+                "--provider",
+                "OPENAI_API_KEY",
+                "--workspace",
+                str(workspace),
+            )
+        self.assertEqual((code, emitted), (0, result))
+        handler.assert_called_once()
+        self.assertIs(seen["config"], self.config)
+        self.assertEqual(seen["provider_name"], "OPENAI_API_KEY")
+        self.assertEqual(seen["workspace"], workspace)
+        self.assertEqual(seen["payload"], payload)
+        self.assertNotIn("sk-canary", json.dumps(emitted))
+        self.assertNotIn("fix tests", json.dumps(emitted))
+
+    def test_run_does_not_validate_stdin_envelope_in_parent(self) -> None:
+        workspace = Path(self.temporary.name) / "workspace"
+        workspace.mkdir()
+        cases = (
+            b"not-json-at-all",
+            b'{"schema":"nomad.web-companion.run-stdin.v1","provider_credential":"a","provider_credential":"b","initial_prompt":"x"}',
+            b'{"schema":"nomad.web-companion.run-stdin.v1","provider_credential":"a","initial_prompt":"' + b"x" * 9000 + b'"}',
+        )
+        for payload in cases:
+            with self.subTest(payload=payload[:80]), mock.patch.object(
+                cli, "run_foundation", return_value={"schema": "nomad.web-companion.run-result.v1", "state": "RUNNING"}
+            ) as handler:
+                code, result = self.invoke_json_stdin(
+                    payload,
+                    "run",
+                    "--provider",
+                    "OPENAI_API_KEY",
+                    "--workspace",
+                    str(workspace),
+                )
+            self.assertEqual(code, 0)
+            self.assertEqual(result["state"], "RUNNING")
+            handler.assert_called_once()
 
     def test_errors_preserve_output_mode_and_never_echo_arbitrary_text(self) -> None:
         cases = (

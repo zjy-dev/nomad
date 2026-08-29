@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import io
 import os
 import re
 import shutil
 import socket
+import sqlite3
 import stat
 import subprocess
 import tempfile
@@ -15,7 +17,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from tools.nomad_web import cli, install_lifecycle, launcher, processes, state
-from tools.nomad_web.config import Config
+from tools.nomad_web.config import Config, ensure_host_identity_root, host_identity_root
 
 
 def free_port() -> int:
@@ -39,6 +41,45 @@ def materialized_bundle(root: Path) -> Path:
     materialize(Path(__file__).resolve().parents[2], bundle)
     verify_bundle(bundle)
     return bundle
+
+
+def add_bundled_node_runtime(bundle: Path) -> None:
+    from tools.nomad_web.bundle import (
+        NODE_ENTRYPOINT_SHA256, NODE_LICENSE_SHA256, NODE_RUNTIME,
+    )
+
+    selected = shutil.which("node")
+    if selected is None:
+        raise AssertionError("locked Node runtime unavailable for fixture")
+    node = Path(selected).resolve(strict=True)
+    license_path = node.parent.parent / "LICENSE"
+    if hashlib.sha256(node.read_bytes()).hexdigest() != NODE_ENTRYPOINT_SHA256:
+        raise AssertionError("fixture Node digest mismatch")
+    if hashlib.sha256(license_path.read_bytes()).hexdigest() != NODE_LICENSE_SHA256:
+        raise AssertionError("fixture Node license digest mismatch")
+    runtime = bundle / "runtime"
+    runtime.mkdir(mode=0o755)
+    shutil.copyfile(node, bundle / NODE_RUNTIME["entrypoint"])
+    shutil.copyfile(license_path, bundle / NODE_RUNTIME["license"])
+    os.chmod(bundle / NODE_RUNTIME["entrypoint"], 0o755)
+    os.chmod(bundle / NODE_RUNTIME["license"], 0o644)
+
+
+def add_empty_device_registry(home: Path) -> None:
+    private = home / launcher.DEVICE_REGISTRY_DIRNAME
+    private.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(private, 0o700)
+    registry = private / launcher.DEVICE_REGISTRY_BASENAME
+    with sqlite3.connect(registry) as connection:
+        connection.execute(
+            "CREATE TABLE device_registry ("
+            "row_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "device_alias TEXT NOT NULL,principal_alias TEXT NOT NULL,"
+            "signing_key_digest BLOB NOT NULL,agreement_key_digest BLOB NOT NULL,"
+            "state TEXT NOT NULL,activated_epoch INTEGER NOT NULL,"
+            "revoked_epoch INTEGER,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)"
+        )
+    os.chmod(registry, 0o600)
 
 
 class M3ELauncherTests(unittest.TestCase):
@@ -147,6 +188,32 @@ class M3ELauncherTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "DUPLICATE_LOOPBACK_PORT"):
                 Config.load(Path(temporary))
 
+    def test_production_config_ignores_ambient_host_identity_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(
+            os.environ,
+            {
+                "NOMAD_WEB_HOME": str(Path(temporary) / "home"),
+                "NOMAD_TEST_HOST_IDENTITY_ROOT": str(Path(temporary) / "ambient-override"),
+            },
+            clear=True,
+        ):
+            config = Config.load(Path(temporary))
+        object.__setattr__(config, "_test_host_identity_root", Path(temporary) / "private-attr-override")
+        expected = (Path.home() / "Library" / "Application Support" / "Nomad" / "host-identity").resolve(strict=False)
+        self.assertEqual(host_identity_root(config), expected)
+
+    def test_ensure_host_identity_root_allows_secure_0750_user_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            secure_home = root / "secure-home"
+            secure_home.mkdir(mode=0o750)
+            os.chmod(secure_home, 0o750)
+            config = SimpleNamespace(_test_host_identity_root=secure_home / "Library" / "Application Support" / "Nomad" / "host-identity")
+            ensured = ensure_host_identity_root(config)
+            self.assertEqual(ensured, host_identity_root(config))
+            self.assertTrue(ensured.is_dir())
+            self.assertEqual(ensured.stat().st_mode & 0o777, 0o700)
+
     def test_remote_partial_inputs_are_zero_spawn_and_close_owned_fd(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); bundle = root / "bundle"; bundle.mkdir()
@@ -186,8 +253,10 @@ class M3ELauncherTests(unittest.TestCase):
     def test_remote_composition_has_fixed_roles_distinct_fds_and_state_v2(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); bundle = root / "bundle"; bundle.mkdir(); workspace = root / "workspace"; workspace.mkdir(mode=0o700)
+            add_bundled_node_runtime(bundle)
             config = self.config(root, bundle)
             state.initialize_home(config)
+            add_empty_device_registry(config.home)
             credential = self.credential_fd(); cert = self.private_fd(root, "cert.pem", b"cert-canary"); key = self.private_fd(root, "key.pem", b"key-canary")
             calls: list[dict[str, object]] = []; secrets_by_child: dict[str, dict[int, bytes]] = {}; pid = 100
             raw_values = iter((b"c" * 32, b"j" * 32, b"a" * 32, b"t" * 32, b"i" * 32))
@@ -272,6 +341,7 @@ class M3ELauncherTests(unittest.TestCase):
             (bundle / "bin").mkdir(parents=True); workspace.mkdir(mode=0o700)
             shutil.copytree(repo / "mobile-reference" / "pilot-gateway", bundle / "gateway")
             (bundle / "web").mkdir(); (bundle / "web" / "index.html").write_text("<!doctype html>")
+            add_bundled_node_runtime(bundle)
             for target, package in (("nomad-relay", "./cmd/relay"), ("nomad-ingress", "./cmd/nomad-ingress")):
                 subprocess.run(["go", "build", "-o", str(bundle / "bin" / target), package], cwd=repo / "relay", check=True)
             (bundle / "bin" / "nomad-product-host").write_bytes(b"placeholder")
@@ -279,6 +349,7 @@ class M3ELauncherTests(unittest.TestCase):
             subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key), "-out", str(cert), "-days", "1", "-subj", f"/CN={address}", "-addext", f"subjectAltName=IP:{address}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
             os.chmod(key, 0o600)
             config = self.config(root, bundle); state.initialize_home(config)
+            add_empty_device_registry(config.home)
             for name in ("bin", "run", "logs"): (config.home / name).mkdir(mode=0o700, exist_ok=True)
             credential = self.credential_fd(); cert_fd = os.open(cert, os.O_RDONLY); key_fd = os.open(key, os.O_RDONLY)
             public_port = free_port(); public_origin = f"https://{address}:{public_port}"; digest = "9" * 64
@@ -451,6 +522,68 @@ class M3ELauncherTests(unittest.TestCase):
             self.assertTrue(config.home.is_dir())
             self.assertTrue(all(artifact.read_bytes() == b"persistent" for artifact in artifacts))
 
+    def test_official_agent_local_accepts_external_local_identity_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); bundle = root / "bundle"; (bundle / "bin").mkdir(parents=True)
+            relay = bundle / "bin" / "nomad-relay"; relay.write_bytes(b"relay"); os.chmod(relay, 0o755)
+            host = bundle / "bin" / "nomad-product-host"; host.write_bytes(b"host"); os.chmod(host, 0o755)
+            config = self.config(root, bundle); state.initialize_home(config)
+            config._test_host_identity_root = root / "host-identity-root"
+            for name in ("bin", "run", "logs"):
+                (config.home / name).mkdir(mode=0o700)
+            credential = self.credential_fd()
+            with mock.patch.object(launcher, "select_bundle_for_start", return_value=bundle), mock.patch.object(launcher, "_selected_bundle_digest", return_value="a" * 64), mock.patch.object(launcher, "_port_free", return_value=True), mock.patch.object(launcher, "_bundled_node", return_value="/usr/bin/node"), mock.patch.object(launcher, "_require_host_identity_ready") as preflight, mock.patch.object(launcher, "_prepare_product_host_socket", return_value=root / "product-host.sock"), mock.patch.object(launcher, "_socket_parent_identity", return_value={"parent_dev": 1, "parent_ino": 2, "parent_uid": os.geteuid(), "parent_mode": 0o700, "socket_dev": 3, "socket_ino": 4, "socket_uid": os.geteuid(), "socket_mode": 0o600}), mock.patch.object(launcher, "_prepare_device_registry_path", return_value=config.home / launcher.DEVICE_REGISTRY_DIRNAME / launcher.DEVICE_REGISTRY_BASENAME), mock.patch.object(launcher, "_prepare_command_journal", return_value=root / "command.sqlite3"), mock.patch.object(launcher.socket, "socketpair", side_effect=RuntimeError("STOP_AFTER_PRIVATE_VALIDATION")), mock.patch.object(launcher, "_cleanup_product_host_socket"), mock.patch.object(processes, "spawn") as spawn, mock.patch.object(launcher, "start_agent") as agent:
+                with self.assertRaisesRegex(RuntimeError, "STOP_AFTER_PRIVATE_VALIDATION"):
+                    launcher._start_unlocked(config, provider_name="OPENAI_API_KEY", credential_fd=credential, workspace=root)
+                preflight.assert_called_once_with(host, scope="local-installed", identity_root=host_identity_root(config))
+                spawn.assert_not_called()
+                agent.assert_not_called()
+
+    def test_official_agent_local_rejects_unknown_private_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); bundle = root / "bundle"; (bundle / "bin").mkdir(parents=True)
+            relay = bundle / "bin" / "nomad-relay"; relay.write_bytes(b"relay"); os.chmod(relay, 0o755)
+            host = bundle / "bin" / "nomad-product-host"; host.write_bytes(b"host"); os.chmod(host, 0o755)
+            config = self.config(root, bundle); state.initialize_home(config)
+            for name in ("bin", "run", "logs"):
+                (config.home / name).mkdir(mode=0o700)
+            private = config.home / launcher.DEVICE_REGISTRY_DIRNAME
+            private.mkdir(mode=0o700)
+            os.chmod(private, 0o700)
+            rogue = private / "operator-note"
+            rogue.write_bytes(b"unexpected")
+            os.chmod(rogue, 0o600)
+            credential = self.credential_fd()
+            with mock.patch.object(launcher, "select_bundle_for_start", return_value=bundle), mock.patch.object(launcher, "_selected_bundle_digest", return_value="a" * 64), mock.patch.object(launcher, "_port_free", return_value=True), mock.patch.object(launcher, "_bundled_node", return_value="/usr/bin/node"), mock.patch.object(launcher, "_require_host_identity_ready") as preflight, mock.patch.object(processes, "spawn") as spawn, mock.patch.object(launcher, "start_agent") as agent:
+                with self.assertRaisesRegex(RuntimeError, "UNSAFE_DEVICE_REGISTRY_DIRECTORY"):
+                    launcher._start_unlocked(config, provider_name="OPENAI_API_KEY", credential_fd=credential, workspace=root)
+                preflight.assert_called_once_with(host, scope="local-installed", identity_root=host_identity_root(config))
+                spawn.assert_not_called()
+                agent.assert_not_called()
+
+    def test_official_agent_local_registry_open_race_is_not_run_not_fatal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self.config(root, root / "bundle")
+            state.initialize_home(config)
+            private = config.home / launcher.DEVICE_REGISTRY_DIRNAME
+            private.mkdir(mode=0o700)
+            os.chmod(private, 0o700)
+            registry = private / launcher.DEVICE_REGISTRY_BASENAME
+            registry.write_bytes(b"")
+            os.chmod(registry, 0o600)
+            with mock.patch.object(launcher, "_validate_device_registry_artifacts"):
+                with mock.patch.object(launcher.sqlite3, "connect", side_effect=launcher.sqlite3.OperationalError("schema not ready")):
+                    paired = launcher._paired_device_identity(config.home.resolve(), "official-agent-local")
+            self.assertEqual(
+                paired,
+                {
+                    "availability": "NOT_RUN",
+                    "device_key_commitment": None,
+                    "pairing_epoch": None,
+                },
+            )
+
     def test_uninstall_lifecycle_accepts_verified_installed_home_without_runtime_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -511,6 +644,43 @@ class M3ELauncherTests(unittest.TestCase):
             self.assertTrue((config.home / "run").is_symlink())
             self.assertTrue(config.home.exists())
 
+    def test_safe_remove_tree_unlinks_owned_leaf_symlinks_without_following(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); home = root / "home"; run = home / "run"
+            target = root / "external-target"
+            run.mkdir(parents=True, mode=0o700)
+            target.write_bytes(b"must survive")
+            link = run / "agent-runtime" / "node_modules" / ".bin" / "tool"
+            link.parent.mkdir(parents=True, mode=0o700)
+            link.symlink_to(target)
+            launcher._safe_remove_tree(run, root=home.resolve(strict=True))
+            self.assertFalse(run.exists())
+            self.assertEqual(target.read_bytes(), b"must survive")
+
+    def test_safe_remove_tree_rejects_root_symlink_hardlink_and_special_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); home = root / "home"; home.mkdir(mode=0o700)
+            external = root / "external"; external.mkdir(mode=0o700)
+            root_link = home / "run"; root_link.symlink_to(external, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "UNSAFE_NOMAD_WEB_HOME_CONTENTS"):
+                launcher._safe_remove_tree(root_link, root=home.resolve(strict=True))
+            self.assertTrue(root_link.is_symlink()); self.assertTrue(external.is_dir())
+
+            root_link.unlink(); run = home / "run"; run.mkdir(mode=0o700)
+            original = run / "original"; original.write_bytes(b"hardlink")
+            os.link(original, run / "linked")
+            with self.assertRaisesRegex(RuntimeError, "UNSAFE_NOMAD_WEB_HOME_CONTENTS"):
+                launcher._safe_remove_tree(run, root=home.resolve(strict=True))
+            self.assertTrue(original.exists())
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); home = root / "home"; run = home / "run"
+            run.mkdir(parents=True, mode=0o700)
+            fifo = run / "special"; os.mkfifo(fifo, 0o600)
+            with self.assertRaisesRegex(RuntimeError, "UNSAFE_NOMAD_WEB_HOME_CONTENTS"):
+                launcher._safe_remove_tree(run, root=home.resolve(strict=True))
+            self.assertTrue(fifo.exists())
+
     def test_gateway_route_probe_rejects_wrong_route_table_response(self) -> None:
         class Headers:
             def get_content_type(self): return "application/json"
@@ -567,8 +737,9 @@ class M3ELauncherTests(unittest.TestCase):
                     launcher._start_remote_unlocked(config, provider_name="OPENAI_API_KEY", credential_fd=credential, workspace=root, public_origin="https://pair.example:8443", https_listen="192.0.2.10:8443", tls_cert_fd=cert, tls_key_fd=key)
                 self.assertEqual(raised.exception.next_step, "nomad-web authorize-host-identity")
                 relay_spawn.assert_not_called(); agent_spawn.assert_not_called()
-            self.assertEqual(command.call_args.args[0], [str(host), "identity-preflight", "--non-interactive"])
+            self.assertEqual(command.call_args.args[0], [str(host), "identity-preflight", "--non-interactive", "--scope=keychain"])
             self.assertEqual(command.call_args.kwargs["timeout"], launcher.HOST_IDENTITY_PREFLIGHT_TIMEOUT)
+            self.assertNotIn("NOMAD_WEB_HOME", command.call_args.kwargs["env"])
             self.assertFalse(state.state_path(config).exists())
 
     def test_host_identity_parser_rejects_noncanonical_output_and_bad_exit(self) -> None:
@@ -581,7 +752,7 @@ class M3ELauncherTests(unittest.TestCase):
         for result in invalid:
             with self.subTest(result=result), mock.patch.object(launcher.subprocess, "run", return_value=result):
                 with self.assertRaisesRegex(launcher.HostIdentityError, "HOST_IDENTITY_PREFLIGHT_INVALID"):
-                    launcher._run_host_identity_command(host, ["identity-preflight", "--non-interactive"])
+                    launcher._run_host_identity_command(host, ["identity-preflight", "--non-interactive", "--scope=keychain"])
 
     def test_authorize_cli_runs_host_foreground_and_emits_guidance(self) -> None:
         config = SimpleNamespace(repo_root=Path("/repo"), home=Path("/home"), bundle_root=Path("/bundle"))
@@ -600,27 +771,46 @@ class M3ELauncherTests(unittest.TestCase):
         host = Path("/private/tmp/nomad-product-host")
         with mock.patch.object(launcher.subprocess, "run", side_effect=launcher.subprocess.TimeoutExpired([str(host)], launcher.HOST_IDENTITY_AUTHORIZATION_TIMEOUT)) as command:
             with self.assertRaisesRegex(launcher.HostIdentityError, "HOST_IDENTITY_AUTHORIZATION_TIMEOUT"):
-                launcher._run_host_identity_command(host, ["authorize-host-identity"], interactive=True)
+                launcher._run_host_identity_command(host, ["authorize-host-identity", "--scope=local-installed"], interactive=True)
         self.assertEqual(command.call_args.kwargs["timeout"], launcher.HOST_IDENTITY_AUTHORIZATION_TIMEOUT)
         self.assertIsNone(command.call_args.kwargs["stdin"])
         with mock.patch.object(launcher.subprocess, "run", side_effect=OSError("exec failed")):
             with self.assertRaisesRegex(launcher.HostIdentityError, "HOST_IDENTITY_AUTHORIZATION_FAILED"):
-                launcher._run_host_identity_command(host, ["authorize-host-identity"], interactive=True)
+                launcher._run_host_identity_command(host, ["authorize-host-identity", "--scope=local-installed"], interactive=True)
 
     def test_authorize_user_denied_keeps_retry_guidance_and_spawns_no_business_process(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); bundle = root / "bundle"; (bundle / "bin").mkdir(parents=True)
             host = bundle / "bin" / "nomad-product-host"; host.write_bytes(b"host"); os.chmod(host, 0o755)
             config = self.config(root, bundle)
+            config._test_host_identity_root = root / "host-identity-root"
             denied = SimpleNamespace(returncode=1, stdout=b'{"status":"USER_DENIED"}\n', stderr=b"")
             with mock.patch.object(launcher, "select_bundle_for_start", return_value=bundle), mock.patch.object(launcher, "_selected_bundle_digest", return_value="a" * 64), mock.patch.object(launcher.subprocess, "run", return_value=denied) as command, mock.patch.object(processes, "spawn") as spawn, mock.patch.object(launcher, "start_agent") as agent:
                 with self.assertRaisesRegex(launcher.HostIdentityError, "HOST_IDENTITY_USER_DENIED") as raised:
                     launcher.authorize_host_identity(config)
                 self.assertEqual(raised.exception.next_step, "nomad-web authorize-host-identity")
                 spawn.assert_not_called(); agent.assert_not_called()
-            self.assertEqual(command.call_args.args[0], [str(host), "authorize-host-identity"])
+            self.assertEqual(command.call_args.args[0], [str(host), "authorize-host-identity", "--scope=local-installed"])
             self.assertEqual(command.call_args.kwargs["timeout"], launcher.HOST_IDENTITY_AUTHORIZATION_TIMEOUT)
             self.assertIsNone(command.call_args.kwargs["stdin"])
+            self.assertEqual(command.call_args.kwargs["env"]["NOMAD_HOST_IDENTITY_ROOT"], str(host_identity_root(config)))
+            self.assertNotIn("NOMAD_WEB_HOME", command.call_args.kwargs["env"])
+
+    def test_official_agent_local_start_preflights_installed_identity_before_spawn(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); bundle = root / "bundle"; (bundle / "bin").mkdir(parents=True)
+            relay = bundle / "bin" / "nomad-relay"; relay.write_bytes(b"relay"); os.chmod(relay, 0o755)
+            host = bundle / "bin" / "nomad-product-host"; host.write_bytes(b"host"); os.chmod(host, 0o755)
+            config = self.config(root, bundle); config._test_host_identity_root = root / "host-identity-root"; state.initialize_home(config)
+            for name in ("bin", "run", "logs"):
+                (config.home / name).mkdir(mode=0o700)
+            credential = self.credential_fd()
+            with mock.patch.object(launcher, "select_bundle_for_start", return_value=bundle), mock.patch.object(launcher, "_selected_bundle_digest", return_value="a" * 64), mock.patch.object(launcher, "_port_free", return_value=True), mock.patch.object(launcher, "_bundled_node", return_value="/usr/bin/node"), mock.patch.object(launcher, "_require_host_identity_ready", side_effect=launcher.HostIdentityError("HOST_IDENTITY_AUTH_REQUIRED")) as preflight, mock.patch.object(processes, "spawn") as spawn, mock.patch.object(launcher, "start_agent") as agent:
+                with self.assertRaisesRegex(launcher.HostIdentityError, "HOST_IDENTITY_AUTH_REQUIRED"):
+                    launcher._start_unlocked(config, provider_name="OPENAI_API_KEY", credential_fd=credential, workspace=root)
+                preflight.assert_called_once_with(host, scope="local-installed", identity_root=host_identity_root(config))
+                spawn.assert_not_called()
+                agent.assert_not_called()
 
 
 if __name__ == "__main__":

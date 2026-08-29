@@ -14,6 +14,15 @@
     "mobile-reference/pilot-gateway/view.mjs"
   ],
   "mobile_dist": "mobile-reference/dist",
+  "node_runtime": {
+    "classification": "official-nodejs-developer-id-locked-runtime",
+    "version": "24.15.0",
+    "platform": "darwin-arm64",
+    "entrypoint": "runtime/node",
+    "entrypoint_raw_sha256": "3200fbd9f7fd4410426dd541e10d1ab829d3472f270d743c7fabd1696c03fe32",
+    "license": "runtime/LICENSE",
+    "license_raw_sha256": "4573185d56580da2b890ba34a85a409257640f1c5632eade4300137266194d18"
+  },
   "onboarding": {
     "schema": "nomad.web-companion.onboarding.v1",
     "installed_runtime_module": "tools/nomad_web/install_lifecycle.py",

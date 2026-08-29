@@ -23,7 +23,7 @@ from typing import Any, Mapping
 
 from . import processes, state
 from .bundle import verify_bundle
-from .config import Config
+from .config import Config, HOST_IDENTITY_ROOT_ENV, host_identity_root
 from .install_lifecycle import status as install_status
 from .recovery import RECOVERY_SCHEMA, decorate_gate, recovery_actions
 
@@ -148,7 +148,11 @@ def run_doctor(
     release_gates = [
         _bundle_verify_gate(bundle_mode, bundle_verified),
         _bundle_digest_gate(bundle_mode, bundle_manifest),
-        _host_identity_gate(Path(config.bundle_root)) if bundle_verified else _gate(
+        _host_identity_gate(
+            Path(config.bundle_root),
+            config=config,
+            scope="local-installed",
+        ) if bundle_verified else _gate(
             "host_identity", "NOT_RUN", "HOST_IDENTITY_NOT_RUN_NO_VERIFIED_BUNDLE",
             "verify the release bundle before checking Host identity",
             {"status": "NOT_RUN"},
@@ -280,15 +284,16 @@ def _bundle_digest_gate(bundle_mode: bool, manifest: Mapping[str, Any] | None) -
     )
 
 
-def _host_identity_gate(bundle: Path) -> dict[str, Any]:
+def _host_identity_gate(bundle: Path, *, config: object | None = None, scope: str = "keychain") -> dict[str, Any]:
     binary = bundle / "bin" / "nomad-product-host"
     try:
         result = subprocess.run(
-            [str(binary), "identity-preflight", "--non-interactive"],
+            [str(binary), "identity-preflight", "--non-interactive", f"--scope={scope}"],
             cwd=bundle,
             env={
                 "LANG": "C", "LC_ALL": "C",
                 "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                **({HOST_IDENTITY_ROOT_ENV: str(host_identity_root(config))} if config is not None and scope == "local-installed" else {}),
             },
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,

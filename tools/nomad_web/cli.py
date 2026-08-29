@@ -19,8 +19,8 @@ from .install_lifecycle import (
 )
 from .launcher import (
     HostIdentityError, authorize_host_identity, reset_remote_access,
-    restart_foundation, start_foundation, status_foundation, stop_foundation,
-    uninstall_lifecycle,
+    restart_foundation, run_foundation, start_foundation, status_foundation,
+    stop_foundation, uninstall_lifecycle,
 )
 from .materialize import materialize
 from .lifecycle_coordinator import operation_status
@@ -40,7 +40,7 @@ def run(argv: Sequence[str] | None = None, repo_root: Path | None = None) -> int
     parser.add_argument(
         "command",
         choices=(
-            "doctor", "start", "restart", "status", "stop",
+            "doctor", "run", "start", "restart", "status", "stop",
             "uninstall", "materialize", "authorize-host-identity",
             "install", "upgrade", "rollback", "resume-evidence",
             "verify-release", "install-status", "onboarding",
@@ -175,6 +175,28 @@ def run(argv: Sequence[str] | None = None, repo_root: Path | None = None) -> int
             result = authorize_host_identity(config)
             _emit(result, args.json)
             return 0
+        if args.command == "run":
+            if args.provider is None or args.workspace is None:
+                raise RuntimeError("RUN_INPUTS_INCOMPLETE")
+            credential_fd = None
+            try:
+                credential_fd = os.dup(0)
+                result = run_foundation(
+                    config,
+                    provider_name=args.provider,
+                    credential_fd=credential_fd,
+                    workspace=args.workspace,
+                )
+                credential_fd = None
+            finally:
+                for descriptor in (credential_fd,):
+                    if descriptor is not None:
+                        try:
+                            os.close(descriptor)
+                        except OSError:
+                            pass
+            _emit(result, args.json)
+            return 0
         if args.command in ("start", "restart"):
             remote_inputs = (args.public_origin, args.https_listen, args.tls_cert_fd, args.tls_key_fd)
             if any(value is not None for value in remote_inputs) and not args.remote_local_evidence:
@@ -278,7 +300,8 @@ HOST_IDENTITY_AUTHORIZATION_FAILED HOST_IDENTITY_AUTHORIZATION_INVALID
 HOST_IDENTITY_AUTHORIZATION_REQUIRES_STOP HOST_IDENTITY_AUTHORIZATION_TIMEOUT
 HOST_IDENTITY_AUTH_REQUIRED HOST_IDENTITY_CORRUPT HOST_IDENTITY_KEYCHAIN_LOCKED
 HOST_IDENTITY_PREFLIGHT_FAILED HOST_IDENTITY_PREFLIGHT_INVALID
-HOST_IDENTITY_PREFLIGHT_TIMEOUT HOST_IDENTITY_UNAVAILABLE HOST_IDENTITY_USER_DENIED
+HOST_IDENTITY_PREFLIGHT_TIMEOUT HOST_IDENTITY_ROOT_INVALID
+HOST_IDENTITY_UNAVAILABLE HOST_IDENTITY_USER_DENIED
 HOST_READY_IDENTITY_MISMATCH HOST_READY_INVALID HTTPS_LISTEN_RELEASE_TIMEOUT
 INGRESS_NEGATIVE_ROUTE_ACCEPTED INGRESS_PROCESS_NOT_OWNED INGRESS_READY_INVALID
 INGRESS_SOURCE_UNAVAILABLE INGRESS_TLS_PROBE_FAILED INSTALLED_BUNDLE_DIGEST_MISMATCH
@@ -292,11 +315,14 @@ INVALID_BUNDLE_PATH INVALID_BUNDLE_SNAPSHOT INVALID_COMMAND_KEY
 INVALID_COMMAND_STATUS INVALID_FD_SECRET INVALID_INHERITED_FD
 INVALID_GATEWAY_MODULE_PATH INVALID_GATEWAY_PACKAGE INVALID_INSTALLED_BUNDLE
 INVALID_INSTALL_CURRENT INVALID_INSTALL_HISTORY INVALID_NOMAD_WEB_AGENT_PORT
+INVALID_NODE_RUNTIME
 INVALID_NOMAD_WEB_GATEWAY_PORT INVALID_NOMAD_WEB_JOIN_GATEWAY_PORT
 INVALID_NOMAD_WEB_RELAY_ADMIN_PORT INVALID_NOMAD_WEB_RELAY_DEVICE_V1_PORT
 INVALID_NOMAD_WEB_RELAY_DEVICE_V2_PORT INVALID_NOMAD_WEB_RELAY_HOST_V2_PORT
 INVALID_NOMAD_WEB_RELAY_PORT INVALID_ONBOARDING_STATE INVALID_RELEASE_GATE_STATUS
 INVALID_PROVIDER_CREDENTIAL INVALID_RUN_ALIAS INVALID_STATE INVALID_STATE_SNAPSHOT
+INITIAL_PROMPT_DISPATCH_INVALID INITIAL_PROMPT_DISPATCH_REJECTED
+INITIAL_PROMPT_INVALID
 JOIN_GATEWAY_NOT_READY LAUNCHER_FAILURE LISTENER_PROCESS_BINDING_NOT_VERIFIED
 LIFECYCLE_CHANNEL_CLOSED LIFECYCLE_COMMIT_MISMATCH
 LIFECYCLE_COORDINATOR_IDENTITY_MISMATCH LIFECYCLE_COORDINATOR_STOP_FAILED
@@ -320,11 +346,13 @@ LIFECYCLE_REQUEST_NOT_ACCEPTED LIFECYCLE_RESET_POSTCONDITION_FAILED
 LIFECYCLE_RESULT_INVALID LIFECYCLE_RUNTIME_BINDING_MISMATCH
 LIFECYCLE_UNINSTALL_POSTCONDITION_FAILED LIFECYCLE_WORKER_ARGUMENTS_INVALID
 LIFECYCLE_WORKER_BOOTSTRAP_INVALID
-LIFECYCLE_WORKLOAD_STILL_PRESENT
+LIFECYCLE_WORKLOAD_STILL_PRESENT LEGACY_BUNDLE_RUNTIME_UNSUPPORTED
 LIVE_PROBE_HTTP_FRAMING_INVALID LIVE_PROBE_HTTP_SCHEMA_INVALID
 LIVE_PROBE_HTTP_STATUS_INVALID LIVE_PROBE_RESPONSE_TOO_LARGE
 LIVE_PROBE_TRANSPORT_FAILED LOOPBACK_PORT_IN_USE LOOPBACK_PORT_RELEASE_TIMEOUT
-MATERIALIZE_OUTPUT_REQUIRED MODE_CHANGE_REQUIRES_STOP NODE_UNAVAILABLE
+MATERIALIZE_OUTPUT_REQUIRED MODE_CHANGE_REQUIRES_STOP NODE_RUNTIME_BINDING_INVALID NODE_UNAVAILABLE
+NODE_BUILD_RUNTIME_UNAVAILABLE NODE_BUILD_RUNTIME_UNSAFE
+NODE_ENTRYPOINT_MISMATCH NODE_LICENSE_MISMATCH
 NOMAD_WEB_HOME_MUST_BE_ABSOLUTE NONCANONICAL_BUNDLE_MANIFEST
 OFFICIAL_SESSION_NOT_READY PAIRED_DEVICE_IDENTITY_SCHEMA_MISMATCH
 PAIRED_DEVICE_IDENTITY_UNAVAILABLE PARENT_BLOCKER_NOT_RESUMABLE
@@ -347,6 +375,7 @@ REMOTE_UNINSTALL_REVOKE_REQUIRED RESET_CONFIRMATION_REQUIRED
 RESUME_EVIDENCE_INPUTS_REQUIRED RESUME_LINEAGE_MISMATCH RESUME_OUTPUT_INVALID
 RESUME_RUNNER_FAILED RESUME_TLS_INPUTS_REQUIRED RUNNER_ARGUMENT_FORBIDDEN
 RUNNER_CLOSURE_MANIFEST_INVALID RUNNER_SOURCE_MISMATCH RUNNER_STAGING_FAILED
+RUN_COMMAND_REQUIRES_STOP RUN_INPUTS_INCOMPLETE RUN_STDIN_INVALID
 RUNNING_BUNDLE_BINDING_MISMATCH RUNNING_IDENTITY_MISMATCH RUNTIME_PORT_IN_USE
 RUNTIME_EXECUTABLE_BINDING_NOT_VERIFIED RUNTIME_STATE_PORT_BINDING_INVALID
 SELECTED_BUNDLE_BINDING_INVALID
@@ -400,6 +429,41 @@ def _read_release_record(path: Path) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise RuntimeError("RELEASE_RECORD_INVALID") from error
+
+
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate")
+        value[key] = item
+    return value
+
+
+def _bounded_json_depth(raw: bytes, maximum: int = 32) -> None:
+    depth = 0
+    quoted = False
+    escaped = False
+    for byte in raw:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif byte == 92:
+                escaped = True
+            elif byte == 34:
+                quoted = False
+        elif byte == 34:
+            quoted = True
+        elif byte in (91, 123):
+            depth += 1
+            if depth > maximum:
+                raise ValueError("depth")
+        elif byte in (93, 125):
+            depth -= 1
+            if depth < 0:
+                raise ValueError("depth")
+    if quoted or depth != 0:
+        raise ValueError("depth")
 
 
 def _open_tls_input(path: Path, *, private: bool) -> int:

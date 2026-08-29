@@ -1,26 +1,36 @@
-use nomad_connector::host_device_identity::HostIdentityPreflightStatus;
+use nomad_connector::host_device_identity::{HostDeviceIdentityScope, HostIdentityPreflightStatus};
 use std::ffi::{OsStr, OsString};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Invocation {
     ProductHost,
-    IdentityPreflight,
-    AuthorizeHostIdentity,
+    IdentityPreflight(HostDeviceIdentityScope),
+    AuthorizeHostIdentity(HostDeviceIdentityScope),
     Invalid,
+}
+
+fn parse_scope(flag: &OsStr) -> Option<HostDeviceIdentityScope> {
+    match flag.to_str() {
+        Some("--scope=keychain") => Some(HostDeviceIdentityScope::Keychain),
+        Some("--scope=local-installed") => Some(HostDeviceIdentityScope::LocalInstalled),
+        _ => None,
+    }
 }
 
 fn parse_invocation(arguments: &[OsString]) -> Invocation {
     match arguments {
         [] => Invocation::ProductHost,
-        [command, flag]
+        [command, flag, scope]
             if command == OsStr::new("identity-preflight")
                 && flag == OsStr::new("--non-interactive") =>
         {
-            Invocation::IdentityPreflight
+            parse_scope(scope)
+                .map(Invocation::IdentityPreflight)
+                .unwrap_or(Invocation::Invalid)
         }
-        [command] if command == OsStr::new("authorize-host-identity") => {
-            Invocation::AuthorizeHostIdentity
-        }
+        [command, scope] if command == OsStr::new("authorize-host-identity") => parse_scope(scope)
+            .map(Invocation::AuthorizeHostIdentity)
+            .unwrap_or(Invocation::Invalid),
         _ => Invocation::Invalid,
     }
 }
@@ -30,12 +40,13 @@ fn main() {
     let invocation = parse_invocation(&arguments);
     if invocation != Invocation::ProductHost {
         let status = match invocation {
-            Invocation::IdentityPreflight => {
+            Invocation::IdentityPreflight(scope) => {
                 nomad_connector::host_device_identity::preflight_host_device_identity_noninteractive(
+                    scope,
                 )
             }
-            Invocation::AuthorizeHostIdentity => {
-                nomad_connector::host_device_identity::authorize_host_device_identity()
+            Invocation::AuthorizeHostIdentity(scope) => {
+                nomad_connector::host_device_identity::authorize_host_device_identity(scope)
             }
             Invocation::Invalid => HostIdentityPreflightStatus::Unavailable,
             Invocation::ProductHost => unreachable!(),
@@ -69,16 +80,38 @@ mod tests {
     #[test]
     fn only_exact_identity_commands_are_accepted() {
         assert_eq!(
-            parse_invocation(&args(&["identity-preflight", "--non-interactive"])),
-            Invocation::IdentityPreflight
+            parse_invocation(&args(&[
+                "identity-preflight",
+                "--non-interactive",
+                "--scope=keychain",
+            ])),
+            Invocation::IdentityPreflight(HostDeviceIdentityScope::Keychain)
         );
         assert_eq!(
-            parse_invocation(&args(&["authorize-host-identity"])),
-            Invocation::AuthorizeHostIdentity
+            parse_invocation(&args(&[
+                "identity-preflight",
+                "--non-interactive",
+                "--scope=local-installed",
+            ])),
+            Invocation::IdentityPreflight(HostDeviceIdentityScope::LocalInstalled)
+        );
+        assert_eq!(
+            parse_invocation(&args(&["authorize-host-identity", "--scope=keychain"])),
+            Invocation::AuthorizeHostIdentity(HostDeviceIdentityScope::Keychain)
+        );
+        assert_eq!(
+            parse_invocation(&args(&[
+                "authorize-host-identity",
+                "--scope=local-installed",
+            ])),
+            Invocation::AuthorizeHostIdentity(HostDeviceIdentityScope::LocalInstalled)
         );
         for invalid in [
             args(&["identity-preflight"]),
             args(&["identity-preflight", "--interactive"]),
+            args(&["identity-preflight", "--non-interactive"]),
+            args(&["identity-preflight", "--non-interactive", "--scope=unknown"]),
+            args(&["authorize-host-identity"]),
             args(&["authorize-host-identity", "--non-interactive"]),
             args(&["unknown"]),
         ] {

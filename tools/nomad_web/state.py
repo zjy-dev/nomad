@@ -541,7 +541,7 @@ def _validate_identity(
         raise RuntimeError("INVALID_STATE")
     if mode == "foundation-readonly" and paired["availability"] != "NOT_RUN":
         raise RuntimeError("INVALID_STATE")
-    if mode != "foundation-readonly" and paired["availability"] == "NOT_RUN":
+    if mode == "remote-local-evidence" and paired["availability"] == "NOT_RUN":
         raise RuntimeError("INVALID_STATE")
 
 

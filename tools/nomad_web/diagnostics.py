@@ -390,7 +390,7 @@ def _validate_runtime_projection(value: object) -> dict[str, Any]:
             host_identity["availability"] != "NOT_RUN"
             or paired_identity["availability"] != "NOT_RUN"
         ))
-        or (mode != "foundation-readonly" and (
+        or (mode == "remote-local-evidence" and (
             host_identity["availability"] == "NOT_RUN"
             or paired_identity["availability"] == "NOT_RUN"
         ))

@@ -154,6 +154,21 @@ class Phase8IdentityTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "PAIRED_DEVICE_IDENTITY_SCHEMA_MISMATCH"):
                 launcher._paired_device_identity(cfg.home, "official-agent-local")
 
+    def test_paired_device_identity_not_run_when_private_registry_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cfg = config(root)
+            state.initialize_home(cfg)
+            paired = launcher._paired_device_identity(cfg.home, "official-agent-local")
+            self.assertEqual(
+                paired,
+                {
+                    "availability": "NOT_RUN",
+                    "device_key_commitment": None,
+                    "pairing_epoch": None,
+                },
+            )
+
     def test_processes_module_does_not_need_phase8_changes(self) -> None:
         source = Path(launcher.processes.__file__).read_text(encoding="utf-8")
         self.assertIn("def process_identity(pid: int) -> str:", source)

@@ -23,7 +23,8 @@ from pathlib import Path
 from typing import Any
 
 from . import processes
-from .bundle import MANIFEST, verify_bundle
+from .bundle import MANIFEST, SCHEMA, verify_bundle
+from .config import HOST_IDENTITY_ROOT_ENV, ensure_host_identity_root, host_identity_root
 from .state import lifecycle_lock, read_run_state, validate_home
 
 CURRENT_SCHEMA = "nomad.web-companion.install-current.v1"
@@ -170,6 +171,8 @@ class SnapshotLoader(importlib.abc.MetaPathFinder,importlib.abc.Loader):
 sys.meta_path.insert(0,SnapshotLoader())
 from nomad_web.bundle import verify_bundle_snapshot
 if verify_bundle_snapshot(snapshot,modes,actual_dirs).get("bundle_digest")!=digest: raise RuntimeError("INSTALLED_BUNDLE_DIGEST_MISMATCH")
+os.environ["NOMAD_WEB_BUNDLE"]=str(root)
+os.environ["PATH"]=str(root/"runtime")+":/usr/bin:/bin:/usr/sbin:/sbin"
 from nomad_web import install_lifecycle as install_module
 install_module._validate_current(current)
 from nomad_web import cli as cli_module
@@ -243,6 +246,7 @@ def install(config: Any, bundle: Path | str) -> dict[str, Any]:
         _ensure_layout(home)
         current = _read_current(home)
         manifest = verify_bundle(source)
+        _require_installable_bundle(manifest)
         digest = _manifest_digest(manifest)
         _checkpoint("source_verified")
         if current is not None:
@@ -277,6 +281,7 @@ def upgrade(config: Any, bundle: Path | str) -> dict[str, Any]:
         old_digest = old["bundle_digest"]
         _verify_installed_bundle(home, old_digest)
         manifest = verify_bundle(source)
+        _require_installable_bundle(manifest)
         digest = _manifest_digest(manifest)
         _checkpoint("source_verified")
         _publish_stable_launcher(home, config)
@@ -317,7 +322,7 @@ def rollback(config: Any) -> dict[str, Any]:
         snapshot_digest = selected["state_snapshot_digest"]
         if target_digest is None or snapshot_digest is None:
             raise RuntimeError("INVALID_INSTALL_HISTORY")
-        _verify_installed_bundle(home, target_digest)
+        _require_installable_bundle(_verify_installed_bundle(home, target_digest))
         _validate_snapshot(home, snapshot_digest)
         _publish_stable_launcher(home, config)
         history = [*old["history"], _history_entry(
@@ -427,9 +432,14 @@ def _classify_onboarding_unlocked(
             ["PAIRED_DEVICE_REQUIRED"], "PAIR_PHONE",
         )
     if paired["availability"] == "NOT_RUN":
+        if run_state.get("mode") == "foundation-readonly":
+            return _onboarding_result(
+                "RUNNING_DEGRADED_RECOVERY_REQUIRED", installed, run_state,
+                ["OFFICIAL_AGENT_RUNTIME_REQUIRED"], "START_OFFICIAL_AGENT",
+            )
         return _onboarding_result(
-            "RUNNING_DEGRADED_RECOVERY_REQUIRED", installed, run_state,
-            ["OFFICIAL_AGENT_RUNTIME_REQUIRED"], "START_OFFICIAL_AGENT",
+            "RUNNING_NEEDS_PAIRING", installed, run_state,
+            ["PAIRED_DEVICE_REQUIRED"], "PAIR_PHONE",
         )
     return _onboarding_result(
         "RUNNING_DEGRADED_RECOVERY_REQUIRED", installed, run_state,
@@ -453,8 +463,10 @@ def select_bundle_for_start(config: Any, explicit_bundle: Path | str | None) -> 
     explicit_path = Path(explicit_bundle).absolute() if explicit_bundle is not None else None
     if explicit_path is not None:
         explicit_manifest = verify_bundle(explicit_path)
+        _require_installable_bundle(explicit_manifest)
     if current is not None:
         selected = _verify_installed_bundle(home, current["bundle_digest"])
+        _require_installable_bundle(selected)
         if (
             explicit_manifest is not None
             and _manifest_digest(explicit_manifest) != _manifest_digest(selected)
@@ -488,6 +500,11 @@ def _get(config: Any, name: str) -> Any:
     raise RuntimeError(f"CONFIG_{name.upper()}_MISSING")
 
 
+def _require_installable_bundle(manifest: dict[str, Any]) -> None:
+    if manifest.get("schema") != SCHEMA:
+        raise RuntimeError("LEGACY_BUNDLE_RUNTIME_UNSUPPORTED")
+
+
 def _host_identity_blocker(config: Any, installed: dict[str, Any]) -> str | None:
     digest = installed.get("current_bundle_digest")
     if not isinstance(digest, str) or _DIGEST.fullmatch(digest) is None:
@@ -495,9 +512,14 @@ def _host_identity_blocker(config: Any, installed: dict[str, Any]) -> str | None
     binary = _home(config) / "bundles" / digest / "bin" / "nomad-product-host"
     try:
         result = subprocess.run(
-            [str(binary), "identity-preflight", "--non-interactive"],
+            [str(binary), "identity-preflight", "--non-interactive", "--scope=local-installed"],
             cwd=binary.parent.parent,
-            env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+            env={
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                HOST_IDENTITY_ROOT_ENV: str(ensure_host_identity_root(config)),
+            },
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -528,12 +550,17 @@ def _running_drift(installed: dict[str, Any], run_state: Any) -> str | None:
     installed_identity = identity.get("installed")
     running_identity = identity.get("running")
     expected_installed_identity = _expected_installed_identity(installed)
+    mode = run_state.get("mode")
+    expected_running_availability = "NOT_RUN" if mode == "foundation-readonly" else "READY"
     if (
         run_state.get("bundle_digest") != selected
         or installed_identity != expected_installed_identity
         or not isinstance(running_identity, dict)
-        or running_identity.get("availability") != "READY"
-        or running_identity.get("bundle_digest") != selected
+        or running_identity.get("availability") != expected_running_availability
+        or (
+            running_identity.get("bundle_digest")
+            != (None if expected_running_availability == "NOT_RUN" else selected)
+        )
     ):
         return "RUNNING_IDENTITY_MISMATCH"
     ownership = [processes.ownership(item) for item in run_state.get("processes", [])]

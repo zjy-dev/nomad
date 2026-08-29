@@ -8,14 +8,26 @@ use p256::{
     SecretKey,
 };
 use std::fmt;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use zeroize::{Zeroize, Zeroizing};
 
 const KEYCHAIN_SERVICE: &str = "dev.nomad.connector.host-device-identity.v1";
 const KEYCHAIN_ACCOUNT: &str = "host-device-identity-bundle";
 const BUNDLE_VERSION: &str = "host-device-identity-bundle-v1";
+const LOCAL_FILE_BASENAME: &str = "host-device-identity.json";
+const LOCAL_IDENTITY_ROOT_ENV: &str = "NOMAD_HOST_IDENTITY_ROOT";
 const TEST_SERVICE: &str = "dev.nomad.connector.host-device-identity.test";
 const TEST_ACCOUNT: &str = "memory";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostDeviceIdentityScope {
+    Keychain,
+    LocalInstalled,
+}
 
 #[derive(Clone)]
 pub(crate) struct HostDeviceIdentity {
@@ -148,6 +160,88 @@ trait IdentitySecretStore: Send + Sync + 'static {
         account: &str,
         bundle: &[u8],
     ) -> Result<(), HostDeviceIdentityError>;
+}
+
+#[derive(Clone, Debug)]
+struct LocalFileSecretStore {
+    path: PathBuf,
+}
+
+impl LocalFileSecretStore {
+    fn from_home(home: &Path) -> Result<Self, HostDeviceIdentityError> {
+        validate_owned_home_dir(home)?;
+        let directory = home.join("private");
+        ensure_owned_private_dir(&directory)?;
+        Ok(Self {
+            path: directory.join(LOCAL_FILE_BASENAME),
+        })
+    }
+}
+
+impl IdentitySecretStore for LocalFileSecretStore {
+    fn load_bundle(
+        &self,
+        service: &str,
+        account: &str,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>, HostDeviceIdentityError> {
+        ensure_fixed_locator(service, account)?;
+        match open_existing_private_file(&self.path) {
+            Ok(mut file) => {
+                let metadata = file
+                    .metadata()
+                    .map_err(|_| HostDeviceIdentityError::BackendUnavailable)?;
+                validate_private_regular_file_metadata(&metadata)?;
+                let size = usize::try_from(metadata.len())
+                    .map_err(|_| HostDeviceIdentityError::Corrupt)?;
+                if size == 0 || size > 64 * 1024 {
+                    return Err(HostDeviceIdentityError::Corrupt);
+                }
+                let mut data = Zeroizing::new(vec![0_u8; size]);
+                file.read_exact(data.as_mut_slice())
+                    .map_err(|_| HostDeviceIdentityError::Corrupt)?;
+                let mut extra = [0_u8; 1];
+                if file
+                    .read(&mut extra)
+                    .map_err(|_| HostDeviceIdentityError::Corrupt)?
+                    != 0
+                {
+                    return Err(HostDeviceIdentityError::Corrupt);
+                }
+                Ok(Some(data))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(HostDeviceIdentityError::BackendUnavailable),
+        }
+    }
+
+    fn create_bundle_if_absent(
+        &self,
+        service: &str,
+        account: &str,
+        bundle: &[u8],
+    ) -> Result<(), HostDeviceIdentityError> {
+        ensure_fixed_locator(service, account)?;
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&self.path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+            Err(_) => return Err(HostDeviceIdentityError::BackendUnavailable),
+        };
+        file.write_all(bundle)
+            .map_err(|_| HostDeviceIdentityError::BackendUnavailable)?;
+        file.sync_all()
+            .map_err(|_| HostDeviceIdentityError::BackendUnavailable)?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| HostDeviceIdentityError::BackendUnavailable)?;
+        validate_private_regular_file_metadata(&metadata)?;
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -397,6 +491,27 @@ struct IdentityBundle {
 
 pub(crate) fn load_or_create_host_device_identity(
 ) -> Result<HostDeviceIdentity, HostDeviceIdentityError> {
+    load_or_create_host_device_identity_with_scope(HostDeviceIdentityScope::Keychain)
+}
+
+pub(crate) fn load_or_create_host_device_identity_with_scope(
+    scope: HostDeviceIdentityScope,
+) -> Result<HostDeviceIdentity, HostDeviceIdentityError> {
+    match scope {
+        HostDeviceIdentityScope::Keychain => load_or_create_keychain_host_device_identity(),
+        HostDeviceIdentityScope::LocalInstalled => load_or_create_local_host_device_identity(),
+    }
+}
+
+fn load_or_create_local_host_device_identity() -> Result<HostDeviceIdentity, HostDeviceIdentityError>
+{
+    let root = local_installed_identity_root_from_env()?;
+    let store = LocalFileSecretStore::from_home(root.as_path())?;
+    load_or_create_with_store(&store, KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+}
+
+fn load_or_create_keychain_host_device_identity(
+) -> Result<HostDeviceIdentity, HostDeviceIdentityError> {
     #[cfg(target_os = "macos")]
     {
         load_or_create_with_store(&MacOsKeychainStore, KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
@@ -408,45 +523,63 @@ pub(crate) fn load_or_create_host_device_identity(
     }
 }
 
-pub fn preflight_host_device_identity_noninteractive() -> HostIdentityPreflightStatus {
-    #[cfg(target_os = "macos")]
-    {
-        let guard = match NonInteractiveKeychainGuard::enter() {
-            Ok(guard) => guard,
-            Err(error) => return preflight_status_from_error(error),
-        };
-        let result = load_or_create_host_device_identity();
-        drop(guard);
-        preflight_status_from_result(result)
-    }
+pub fn preflight_host_device_identity_noninteractive(
+    scope: HostDeviceIdentityScope,
+) -> HostIdentityPreflightStatus {
+    match scope {
+        HostDeviceIdentityScope::Keychain => {
+            #[cfg(target_os = "macos")]
+            {
+                let guard = match NonInteractiveKeychainGuard::enter() {
+                    Ok(guard) => guard,
+                    Err(error) => return preflight_status_from_error(error),
+                };
+                let result = load_or_create_keychain_host_device_identity();
+                drop(guard);
+                preflight_status_from_result(result)
+            }
 
-    #[cfg(not(target_os = "macos"))]
-    {
-        preflight_status_from_result(load_or_create_host_device_identity())
+            #[cfg(not(target_os = "macos"))]
+            {
+                preflight_status_from_result(load_or_create_keychain_host_device_identity())
+            }
+        }
+        HostDeviceIdentityScope::LocalInstalled => {
+            preflight_status_from_result(load_or_create_local_host_device_identity())
+        }
     }
 }
 
-pub fn authorize_host_device_identity() -> HostIdentityPreflightStatus {
-    #[cfg(target_os = "macos")]
-    {
-        let result = {
-            let guard = match InteractiveKeychainGuard::enter() {
-                Ok(guard) => guard,
-                Err(error) => return preflight_status_from_error(error),
-            };
-            let result = load_or_create_host_device_identity();
-            drop(guard);
-            result
-        };
-        if let Err(error) = result {
-            return preflight_status_from_error(error);
-        }
-        preflight_host_device_identity_noninteractive()
-    }
+pub fn authorize_host_device_identity(
+    scope: HostDeviceIdentityScope,
+) -> HostIdentityPreflightStatus {
+    match scope {
+        HostDeviceIdentityScope::Keychain => {
+            #[cfg(target_os = "macos")]
+            {
+                let result = {
+                    let guard = match InteractiveKeychainGuard::enter() {
+                        Ok(guard) => guard,
+                        Err(error) => return preflight_status_from_error(error),
+                    };
+                    let result = load_or_create_keychain_host_device_identity();
+                    drop(guard);
+                    result
+                };
+                if let Err(error) = result {
+                    return preflight_status_from_error(error);
+                }
+                preflight_host_device_identity_noninteractive(HostDeviceIdentityScope::Keychain)
+            }
 
-    #[cfg(not(target_os = "macos"))]
-    {
-        HostIdentityPreflightStatus::Unavailable
+            #[cfg(not(target_os = "macos"))]
+            {
+                HostIdentityPreflightStatus::Unavailable
+            }
+        }
+        HostDeviceIdentityScope::LocalInstalled => {
+            preflight_host_device_identity_noninteractive(HostDeviceIdentityScope::LocalInstalled)
+        }
     }
 }
 
@@ -497,6 +630,97 @@ fn load_or_create_with_store<S: IdentitySecretStore>(
         .load_bundle(service, account)?
         .ok_or(HostDeviceIdentityError::Invariant)?;
     decode_identity_bundle(stored)
+}
+
+fn local_installed_identity_root_from_env() -> Result<PathBuf, HostDeviceIdentityError> {
+    let raw = std::env::var_os(LOCAL_IDENTITY_ROOT_ENV)
+        .ok_or(HostDeviceIdentityError::BackendUnavailable)?;
+    let root = PathBuf::from(raw);
+    if !root.is_absolute() || has_symlinked_component(&root)? {
+        return Err(HostDeviceIdentityError::BackendUnavailable);
+    }
+    Ok(root)
+}
+
+fn has_symlinked_component(path: &Path) -> Result<bool, HostDeviceIdentityError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => {
+                current.push(component.as_os_str());
+            }
+            Component::Normal(_) => {
+                current.push(component.as_os_str());
+                match fs::symlink_metadata(&current) {
+                    Ok(metadata) => {
+                        if metadata.file_type().is_symlink() {
+                            return Ok(true);
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(_) => return Err(HostDeviceIdentityError::BackendUnavailable),
+                }
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(HostDeviceIdentityError::BackendUnavailable)
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn validate_owned_home_dir(path: &Path) -> Result<(), HostDeviceIdentityError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|_| HostDeviceIdentityError::BackendUnavailable)?;
+    validate_owned_dir_metadata(&metadata)
+}
+
+fn ensure_owned_private_dir(path: &Path) -> Result<(), HostDeviceIdentityError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => validate_owned_dir_metadata(&metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(path).map_err(|_| HostDeviceIdentityError::BackendUnavailable)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .map_err(|_| HostDeviceIdentityError::BackendUnavailable)?;
+            let metadata = fs::symlink_metadata(path)
+                .map_err(|_| HostDeviceIdentityError::BackendUnavailable)?;
+            validate_owned_dir_metadata(&metadata)
+        }
+        Err(_) => Err(HostDeviceIdentityError::BackendUnavailable),
+    }
+}
+
+fn validate_owned_dir_metadata(metadata: &fs::Metadata) -> Result<(), HostDeviceIdentityError> {
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o777 != 0o700
+    {
+        return Err(HostDeviceIdentityError::BackendUnavailable);
+    }
+    Ok(())
+}
+
+fn open_existing_private_file(path: &Path) -> std::io::Result<fs::File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+}
+
+fn validate_private_regular_file_metadata(
+    metadata: &fs::Metadata,
+) -> Result<(), HostDeviceIdentityError> {
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o777 != 0o600
+        || metadata.nlink() != 1
+    {
+        return Err(HostDeviceIdentityError::BackendUnavailable);
+    }
+    Ok(())
 }
 
 fn ensure_fixed_locator(service: &str, account: &str) -> Result<(), HostDeviceIdentityError> {
@@ -627,6 +851,7 @@ fn decode_hex_nibble(byte: u8) -> Result<u8, HostDeviceIdentityError> {
 mod tests {
     use super::*;
     use std::thread;
+    use tempfile::TempDir;
 
     #[test]
     fn memory_backend_generates_stable_reopen_identity() {
@@ -845,5 +1070,55 @@ mod tests {
             let err = load_or_create_host_device_identity().unwrap_err();
             assert!(matches!(err, HostDeviceIdentityError::BackendUnavailable));
         }
+    }
+
+    #[test]
+    fn local_file_backend_generates_stable_reopen_identity() {
+        let home = TempDir::new().unwrap();
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let store = LocalFileSecretStore::from_home(home.path()).unwrap();
+
+        let first = load_or_create_with_store(&store, KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT).unwrap();
+        let second = load_or_create_with_store(&store, KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT).unwrap();
+
+        assert_eq!(first.signing_public_sec1(), second.signing_public_sec1());
+        assert_eq!(
+            first.agreement_public_sec1(),
+            second.agreement_public_sec1()
+        );
+        assert_eq!(first.signing_commitment(), second.signing_commitment());
+        assert_eq!(first.agreement_commitment(), second.agreement_commitment());
+    }
+
+    #[test]
+    fn local_file_backend_corruption_fails_closed_without_rotation() {
+        let home = TempDir::new().unwrap();
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let store = LocalFileSecretStore::from_home(home.path()).unwrap();
+        let path = store.path.clone();
+        fs::write(&path, br#"{"version":"nope"}"#).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let err =
+            load_or_create_with_store(&store, KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT).unwrap_err();
+        assert!(matches!(
+            err,
+            HostDeviceIdentityError::Corrupt | HostDeviceIdentityError::Invariant
+        ));
+        assert_eq!(fs::read(&path).unwrap(), br#"{"version":"nope"}"#);
+    }
+
+    #[test]
+    fn local_installed_scope_requires_absolute_owned_home() {
+        let current = std::env::var_os(LOCAL_IDENTITY_ROOT_ENV);
+        std::env::set_var(LOCAL_IDENTITY_ROOT_ENV, "relative");
+        let status =
+            preflight_host_device_identity_noninteractive(HostDeviceIdentityScope::LocalInstalled);
+        if let Some(value) = current {
+            std::env::set_var(LOCAL_IDENTITY_ROOT_ENV, value);
+        } else {
+            std::env::remove_var(LOCAL_IDENTITY_ROOT_ENV);
+        }
+        assert_eq!(status, HostIdentityPreflightStatus::Unavailable);
     }
 }

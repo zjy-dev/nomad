@@ -26,7 +26,10 @@ class InstallLifecycleTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="nomad-install-lifecycle-")
         self.root = Path(self.temporary.name)
-        self.config = SimpleNamespace(home=self.root / "home")
+        self.config = SimpleNamespace(
+            home=self.root / "home",
+            _test_host_identity_root=self.root / "host-identity-root",
+        )
         self.bundles = self.root / "sources"
         self.bundles.mkdir(mode=0o700)
         self.v1 = self.make_bundle("v1", b"#!/bin/sh\nprintf 'v1:%s\n' \"$*\"\n")
@@ -100,8 +103,9 @@ class InstallLifecycleTests(unittest.TestCase):
                 "path": relative, "size_bytes": len(raw),
                 "raw_sha256": hashlib.sha256(raw).hexdigest(), "mode": f"{mode:04o}",
             })
-        digest = hashlib.sha256(canonical({"files": entries})).hexdigest()
-        manifest = {"bundle_digest": digest, "files": entries}
+        core = {"schema": "nomad.web-companion.prebuilt.v2", "files": entries}
+        digest = hashlib.sha256(canonical(core)).hexdigest()
+        manifest = {"bundle_digest": digest, **core}
         (root / lifecycle.MANIFEST).write_bytes(canonical(manifest) + b"\n")
         os.chmod(root / lifecycle.MANIFEST, 0o644)
         os.chmod(root / "bin", 0o755)
@@ -410,6 +414,20 @@ class InstallLifecycleTests(unittest.TestCase):
                     lifecycle.install(self.config, source)
                 self.assertEqual(lifecycle.status(self.config)["state"], "NOT_INSTALLED")
 
+    def test_install_and_start_selector_reject_legacy_bundle_runtime(self) -> None:
+        legacy = self.make_bundle("legacy", b"legacy")
+        manifest_path = legacy / lifecycle.MANIFEST
+        manifest = json.loads(manifest_path.read_bytes())
+        manifest["schema"] = "nomad.web-companion.prebuilt.v1"
+        core = {key: value for key, value in manifest.items() if key != "bundle_digest"}
+        manifest["bundle_digest"] = hashlib.sha256(canonical(core)).hexdigest()
+        manifest_path.write_bytes(canonical(manifest) + b"\n")
+        with self.assertRaisesRegex(RuntimeError, "LEGACY_BUNDLE_RUNTIME_UNSUPPORTED"):
+            lifecycle.install(self.config, legacy)
+        with lifecycle.lifecycle_lock(self.config, create=True):
+            with self.assertRaisesRegex(RuntimeError, "LEGACY_BUNDLE_RUNTIME_UNSUPPORTED"):
+                lifecycle.select_bundle_for_start(self.config, legacy)
+
     def test_status_rejects_tampered_installed_bundle_and_unsafe_current(self) -> None:
         self.install()
         target = self.config.home / "bundles" / self.digest(self.v1) / "README.txt"
@@ -488,7 +506,12 @@ class InstallLifecycleTests(unittest.TestCase):
         for index, failure_stage in enumerate(stages):
             with self.subTest(stage=failure_stage):
                 case_home = self.root / f"failure-home-{index}"
-                config = SimpleNamespace(home=case_home)
+                config = SimpleNamespace(
+                    home=case_home,
+                    _test_host_identity_root=(
+                        self.root / f"failure-host-identity-{index}"
+                    ),
+                )
                 lifecycle.install(config, self.v1)
                 private = case_home / "private"
                 private.mkdir(mode=0o700)
