@@ -156,6 +156,9 @@ class ProductJourneyTests(unittest.TestCase):
             package.mkdir(parents=True)
             (package / "__init__.py").write_text("", encoding="utf-8")
             (package / "processes.py").write_text("ORIGIN = 'installed'\n", encoding="utf-8")
+            (package / "bundle.py").write_text(
+                "verify_bundle = object()\n", encoding="utf-8",
+            )
             (package / "launcher.py").write_text(
                 "_bootstrap_host = object()\n"
                 "_cleanup_product_host_socket = object()\n"
@@ -164,6 +167,16 @@ class ProductJourneyTests(unittest.TestCase):
                 "_write_fd_secret = object()\n", encoding="utf-8",
             )
             (package / "materialize.py").write_text("materialize = object()\n", encoding="utf-8")
+            current_staged, current_binding = runner._stage_qa_driver(
+                ROOT / "testkit" / "browser" / "c3_local_command_smoke.py",
+                root / "current-driver-stage", installed, installed.name,
+            )
+            self.assertNotIn(b"tools.nomad_web", current_staged.read_bytes())
+            self.assertEqual(
+                current_binding["trusted_source_sha256"],
+                runner.QA_DRIVER_SOURCE_SHA256,
+            )
+
             source = repo / "testkit" / "browser" / "c3_local_command_smoke.py"
             source.parent.mkdir(parents=True)
             source_raw = (
@@ -173,9 +186,13 @@ class ProductJourneyTests(unittest.TestCase):
                 "if __package__ in (None, \"\"):\n"
                 "    sys.path.insert(0, str(REPO))\n"
                 "from tools.nomad_web import processes\n"
+                "from tools.nomad_web.bundle import verify_bundle\n"
                 "from tools.nomad_web.launcher import (\n"
-                "    _bootstrap_host, _cleanup_product_host_socket,\n"
-                "    _random_command_key, _spawn_product_host, _write_fd_secret,\n"
+                "    _bootstrap_host,\n"
+                "    _cleanup_product_host_socket,\n"
+                "    _random_command_key,\n"
+                "    _spawn_product_host,\n"
+                "    _write_fd_secret,\n"
                 ")\n"
                 "from tools.nomad_web.materialize import materialize\n"
                 "IMPORT_ORIGIN = processes.ORIGIN\n"
@@ -230,6 +247,40 @@ class ProductJourneyTests(unittest.TestCase):
                     "sha256:" + "b" * 64,
                 )
             self.assertEqual(symlinked["code"], "P8H_QA_DRIVER_STAGE_INVALID")
+
+    def test_staged_qa_driver_rejects_unknown_import_and_extra_repo_binding(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            installed = root / "home" / "bundles" / ("c" * 64)
+            (installed / "lib").mkdir(parents=True)
+            source = root / "c3_local_command_smoke.py"
+            trusted_raw = (
+                ROOT / "testkit" / "browser" / "c3_local_command_smoke.py"
+            ).read_bytes()
+            known_import = b"from tools.nomad_web.bundle import verify_bundle\n"
+            cases = {
+                "extra-fifth-import": (
+                    trusted_raw
+                    + b"\nfrom tools.nomad_web.state import read_run_state\n"
+                ),
+                "duplicate-known-import": trusted_raw + b"\n" + known_import,
+                "missing-known-import": trusted_raw.replace(known_import, b""),
+                "extra-repo-binding": (
+                    trusted_raw
+                    + b"\nREPO = Path('/unexpected-rebinding')\n"
+                ),
+            }
+            for name, raw in cases.items():
+                source.write_bytes(raw)
+                trusted = runner.hashlib.sha256(raw).hexdigest()
+                with self.subTest(name=name), mock.patch.object(
+                    runner, "QA_DRIVER_SOURCE_SHA256", trusted,
+                ), self.assertRaisesRegex(
+                    RuntimeError, "P8H_QA_DRIVER_SOURCE_INVALID",
+                ):
+                    runner._stage_qa_driver(
+                        source, root / f"stage-{name}", installed, installed.name,
+                    )
 
     def test_a_without_tls_does_not_import_repo_runner(self):
         with mock.patch.object(runner, "_load", side_effect=AssertionError("repo import")):

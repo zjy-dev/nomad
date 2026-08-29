@@ -31,7 +31,7 @@ REQUIRED = ("A_remote_local_evidence", "B_c3_local", "C_lifecycle")
 MAX_CLI_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_QA_DRIVER_BYTES = 2 * 1024 * 1024
 QA_DRIVER_CLASSIFICATION = "external-qa-not-shipped-product-closure"
-QA_DRIVER_SOURCE_SHA256 = "f521f5b71e84b50013b98dd3010de601b79ccfecb79e73aba2a2d8e081a817b9"
+QA_DRIVER_SOURCE_SHA256 = "c7a56097c81562c51cbd9bdad3cad9daadbe9e625d693aa555ff01a378aed202"
 CHROME = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
 ONBOARDING_STATES = {
     "NOT_INSTALLED", "INSTALLED_NEEDS_START",
@@ -157,8 +157,43 @@ def _stage_qa_driver(
         b"if __package__ in (None, \"\"):\n"
         b"    sys.path.insert(0, str(REPO))\n"
     )
-    tools_import = b"from tools.nomad_web"
-    if raw.count(repo_binding) != 1 or raw.count(tools_import) != 3:
+    import_rewrites = (
+        (
+            b"from tools.nomad_web import processes\n",
+            b"from nomad_web import processes\n",
+        ),
+        (
+            b"from tools.nomad_web.bundle import verify_bundle\n",
+            b"from nomad_web.bundle import verify_bundle\n",
+        ),
+        (
+            b"from tools.nomad_web.launcher import (\n"
+            b"    _bootstrap_host,\n"
+            b"    _cleanup_product_host_socket,\n"
+            b"    _random_command_key,\n"
+            b"    _spawn_product_host,\n"
+            b"    _write_fd_secret,\n"
+            b")\n",
+            b"from nomad_web.launcher import (\n"
+            b"    _bootstrap_host,\n"
+            b"    _cleanup_product_host_socket,\n"
+            b"    _random_command_key,\n"
+            b"    _spawn_product_host,\n"
+            b"    _write_fd_secret,\n"
+            b")\n",
+        ),
+        (
+            b"from tools.nomad_web.materialize import materialize\n",
+            b"from nomad_web.materialize import materialize\n",
+        ),
+    )
+    repo_assignments = re.findall(rb"(?m)^[ \t]*REPO(?:\s*:[^=\n]+)?\s*=", raw)
+    if (
+        raw.count(repo_binding) != 1
+        or len(repo_assignments) != 1
+        or raw.count(b"from tools.nomad_web") != len(import_rewrites)
+        or any(raw.count(source_import) != 1 for source_import, _ in import_rewrites)
+    ):
         raise RuntimeError("P8H_QA_DRIVER_SOURCE_INVALID")
     stage_root = stage_root.absolute()
     installed_lib = (installed_bundle / "lib").resolve(strict=True)
@@ -168,7 +203,14 @@ def _stage_qa_driver(
             f"REPO = Path({json.dumps(str(stage_root))})\n"
             f"sys.path.insert(0, {json.dumps(str(installed_lib))})\n"
         ).encode("utf-8"),
-    ).replace(tools_import, b"from nomad_web")
+    )
+    for source_import, installed_import in import_rewrites:
+        raw = raw.replace(source_import, installed_import)
+    if (
+        b"tools.nomad_web" in raw
+        or len(re.findall(rb"(?m)^[ \t]*REPO(?:\s*:[^=\n]+)?\s*=", raw)) != 1
+    ):
+        raise RuntimeError("P8H_QA_DRIVER_SOURCE_INVALID")
     generated_digest = hashlib.sha256(raw).hexdigest()
     binding = {
         "classification": QA_DRIVER_CLASSIFICATION,

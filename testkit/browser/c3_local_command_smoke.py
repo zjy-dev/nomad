@@ -17,9 +17,10 @@ import base64
 import hashlib
 import json
 import os
+import re
 import secrets
-import shutil
 import socket
+import sqlite3
 import stat
 import struct
 import subprocess
@@ -41,6 +42,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(REPO))
 
 from tools.nomad_web import processes
+from tools.nomad_web.bundle import verify_bundle
 from tools.nomad_web.launcher import (
     _bootstrap_host,
     _cleanup_product_host_socket,
@@ -56,6 +58,66 @@ CHROME = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
 NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 READ_LIMIT = 64 * 1024
 COMMAND_TIMEOUT = 20.0
+GATEWAY_LOG_LIMIT = 64 * 1024
+HEARTBEATS = (
+    "C3_STAGE_START", "BUNDLE_READY", "FAKE_READY", "HOST_READY",
+    "GATEWAY_READY", "CHROME_READY", "DESKTOP_READY", "MOBILE_READY",
+    "REPLY_DONE", "DENY_DONE", "STOP_DONE", "UNKNOWN_DONE", "AUDIT_DONE",
+    "CLEANUP_BEGIN", "CLEANUP_DONE", "PASS",
+)
+RECEIPT_KEYS = {
+    "schema", "receipt_id", "request_id", "action", "snapshot_seq",
+    "snapshot_digest", "accepted_at", "status", "error_code",
+    "idempotent_replay",
+}
+RECEIPT_STATUSES = {
+    "HostAccepted": "HOST_ACCEPTED",
+    "Dispatching": "DISPATCHING",
+    "DispatchAcknowledged": "DISPATCH_ACKNOWLEDGED",
+    "Rejected": "REJECTED",
+    "Stale": "STALE",
+    "Expired": "EXPIRED",
+    "OutcomeUnknown": "OUTCOME_UNKNOWN",
+}
+RECEIPT_ERRORS = {
+    "OK", "ERR_REQUEST_EXPIRED", "ERR_REQUEST_STALE",
+    "ERR_INCOMPATIBLE_VERSION", "ERR_REQUEST_REVOKED",
+    "ERR_DUPLICATE_REQUEST", "ERR_HOST_OFFLINE", "ERR_SAFETY_BLOCKED",
+    "ERR_PERMISSION_DENIED", "ERR_OUTCOME_UNKNOWN", "ERR_COMMAND_REJECTED",
+}
+OPAQUE_ID = re.compile(r"[A-Za-z0-9_-]{8,160}")
+DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+ACTION_ALIAS = {
+    "turn_alias": re.compile(r"turn-[0-9a-f]{32}"),
+    "input_alias": re.compile(r"input-[0-9a-f]{32}"),
+    "permission_alias": re.compile(r"permission-[0-9a-f]{32}"),
+}
+RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})")
+HEX_COMMITMENT = re.compile(r"[0-9a-f]{64}")
+COMMAND_OBSERVER_KEY = "__nomadC3PassiveCommandObserverV1"
+COMMAND_REQUEST_COMMON_KEYS = {
+    "schema", "capability_id", "request_id", "nonce", "command_seq",
+    "expected_snapshot_seq", "expected_snapshot_digest", "issued_at",
+    "expires_at", "action",
+}
+COMMAND_REQUEST_ACTION_KEYS = {
+    "reply": {"turn_alias", "input_alias", "content"},
+    "deny": {"permission_alias", "action_hash", "permission_expires_at"},
+    "stop": {"turn_alias"},
+}
+OBSERVER_HEADER_NAMES = {"accept", "content-type", "x-nomad-csrf"}
+GATEWAY_COMMAND_ERRORS = {
+    "COMMAND_OUTCOME_UNAVAILABLE", "COMMAND_GATEWAY_UNAVAILABLE",
+    "COMMAND_CAPABILITY_UNAVAILABLE", "INVALID_COMMAND_FRAMING",
+    "INVALID_COMMAND_JSON", "INVALID_COMMAND", "CSRF_REJECTED",
+    "ORIGIN_REJECTED", "METHOD_NOT_ALLOWED",
+}
+JOURNAL_STATUS_CODES = {
+    "HostAccepted": "HOST_ACCEPTED",
+    "Dispatching": "DISPATCHING",
+    "DispatchAcknowledged": "DISPATCH_ACKNOWLEDGED",
+    "OutcomeUnknown": "OUTCOME_UNKNOWN",
+}
 
 
 class SmokeFailure(RuntimeError):
@@ -64,6 +126,12 @@ class SmokeFailure(RuntimeError):
 
 def fail(code: str) -> None:
     raise SmokeFailure(code)
+
+
+def heartbeat(stage: str) -> None:
+    if stage not in HEARTBEATS:
+        raise ValueError("INVALID_C3_HEARTBEAT")
+    print(stage, file=sys.stderr, flush=True)
 
 
 def canonical(value: Any) -> bytes:
@@ -474,6 +542,8 @@ class Chrome:
             fail("CHROME_MISSING")
         self.port = free_port()
         self.log_handle = log_path.open("xb")
+        self._log_closed = False
+        self.process: subprocess.Popen[bytes] | None = None
         try:
             self.process = subprocess.Popen(
                 [
@@ -487,16 +557,23 @@ class Chrome:
                 cwd=REPO, env=processes.minimal_env({}), stdin=subprocess.DEVNULL,
                 stdout=self.log_handle, stderr=subprocess.STDOUT, start_new_session=True,
             )
-        except Exception:
-            self.log_handle.close()
+            self.record = {
+                "name": "chrome", "pid": self.process.pid, "process_group": self.process.pid,
+                "identity": processes.process_identity(self.process.pid), "log": str(log_path),
+            }
+            wait_json(
+                f"http://127.0.0.1:{self.port}/json/version", 15,
+                "CHROME_DEVTOOLS_TIMEOUT", child=self.process,
+                early_exit_code="CHROME_DEVTOOLS_EARLY_EXIT",
+            )
+        except BaseException:
+            self._terminate()
             raise
-        self.record = {
-            "name": "chrome", "pid": self.process.pid, "process_group": self.process.pid,
-            "identity": processes.process_identity(self.process.pid), "log": str(log_path),
-        }
-        wait_json(f"http://127.0.0.1:{self.port}/json/version", 15)
 
-    def page(self, url: str, width: int, height: int, mobile: bool) -> CDP:
+    def page(
+        self, url: str, width: int, height: int, mobile: bool,
+        *, action_observer: bool = False,
+    ) -> CDP:
         request = urllib.request.Request(
             f"http://127.0.0.1:{self.port}/json/new?about:blank", method="PUT"
         )
@@ -508,13 +585,26 @@ class Chrome:
         cdp.call("Emulation.setDeviceMetricsOverride", {
             "width": width, "height": height, "deviceScaleFactor": 1, "mobile": mobile,
         })
+        if action_observer:
+            cdp.call(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {"source": _legacy_command_observer_install_script()},
+            )
         cdp.call("Page.navigate", {"url": url})
         wait_eval(cdp, "document.readyState === 'complete'", 15)
         return cdp
 
     def stop(self) -> None:
+        self._terminate()
+
+    def _close_log(self) -> None:
+        if not self._log_closed:
+            self.log_handle.close()
+            self._log_closed = True
+
+    def _terminate(self) -> None:
         try:
-            if self.process.poll() is None:
+            if self.process is not None and self.process.poll() is None:
                 os.killpg(self.process.pid, 15)
                 try:
                     self.process.wait(timeout=8)
@@ -522,7 +612,7 @@ class Chrome:
                     os.killpg(self.process.pid, 9)
                     self.process.wait(timeout=5)
         finally:
-            self.log_handle.close()
+            self._close_log()
 
 
 def free_port() -> int:
@@ -541,15 +631,130 @@ def port_available(port: int) -> bool:
             return False
 
 
-def wait_json(url: str, timeout: float) -> Any:
+def wait_json(
+    url: str, timeout: float, failure_code: str,
+    *, child: subprocess.Popen[bytes] | dict[str, Any] | None = None,
+    early_exit_code: str | None = None,
+    early_exit_log: Path | None = None,
+) -> Any:
     deadline = time.monotonic() + timeout
+    last_failure = "OTHER_UNAVAILABLE"
     while time.monotonic() < deadline:
+        if child is not None and not child_alive(child):
+            if early_exit_code is None:
+                fail("HTTP_SERVICE_EARLY_EXIT")
+            if (
+                early_exit_code == "GATEWAY_HTTP_EARLY_EXIT"
+                and isinstance(child, dict) and early_exit_log is not None
+            ):
+                fail(gateway_early_exit_code(child, early_exit_log))
+            fail(early_exit_code)
         try:
             with NO_PROXY.open(url, timeout=1) as response:
                 return json.load(response)
-        except (OSError, urllib.error.URLError, json.JSONDecodeError):
+        except (OSError, urllib.error.URLError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            last_failure = classify_http_failure(error)
             time.sleep(0.05)
-    fail("HTTP_SERVICE_TIMEOUT")
+    fail(f"{failure_code}_{last_failure}")
+
+
+def child_alive(child: subprocess.Popen[bytes] | dict[str, Any]) -> bool:
+    if isinstance(child, dict):
+        return processes.ownership(child) == "owned"
+    return child.poll() is None
+
+
+def classify_http_failure(error: BaseException) -> str:
+    if isinstance(error, urllib.error.HTTPError):
+        return f"HTTP_{error.code}" if type(error.code) is int else "OTHER_HTTPError"
+    if isinstance(error, (json.JSONDecodeError, UnicodeDecodeError)):
+        return "INVALID_JSON"
+    observed: BaseException = error
+    if isinstance(error, urllib.error.URLError) and isinstance(error.reason, BaseException):
+        observed = error.reason
+    if isinstance(observed, (TimeoutError, socket.timeout)):
+        return "REQUEST_TIMEOUT"
+    if isinstance(observed, ConnectionRefusedError):
+        return "CONNECTION_REFUSED"
+    name = observed.__class__.__name__
+    return "OTHER_" + (name if re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", name) else "Exception")
+
+
+def gateway_early_exit_code(record: dict[str, Any], log_path: Path) -> str:
+    classification = classify_gateway_log(log_path)
+    fact = child_exit_fact(int(record["pid"]))
+    return "GATEWAY_HTTP_EARLY_EXIT_" + classification + ("_" + fact if fact else "")
+
+
+def classify_gateway_log(path: Path) -> str:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600
+            ):
+                return "OTHER"
+            raw = os.read(descriptor, GATEWAY_LOG_LIMIT + 1)
+            if len(raw) > GATEWAY_LOG_LIMIT or os.read(descriptor, 1):
+                return "OTHER"
+        finally:
+            os.close(descriptor)
+    except OSError:
+        return "OTHER"
+    if b"EADDRINUSE" in raw:
+        return "EADDRINUSE"
+    if b"ERR_UNKNOWN_BUILTIN_MODULE" in raw:
+        return "ERR_UNKNOWN_BUILTIN_MODULE"
+    if b"MODULE_NOT_FOUND" in raw:
+        return "MODULE_NOT_FOUND"
+    if any(marker in raw for marker in (
+        b"SQLITE_", b"node:sqlite", b"state database",
+        b"database is locked", b"unable to open database",
+    )):
+        return "SQLITE_INIT"
+    if any(marker in raw for marker in (
+        b"INVALID_COMMAND_KEY", b"command-key-fd", b"COMMAND_TRANSPORT_KEY",
+    )):
+        return "COMMAND_KEY_INVALID"
+    if any(marker in raw for marker in (
+        b"Unsupported Gateway", b"Unsupported or incomplete option",
+        b"Invalid --", b"Missing --", b"Missing or invalid",
+        b"must not use", b"requires official-agent-local mode",
+    )):
+        return "ARGS_INVALID"
+    return "OTHER"
+
+
+def child_exit_fact(pid: int) -> str | None:
+    try:
+        waited, status = os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        return None
+    if waited != pid:
+        return None
+    if os.WIFEXITED(status):
+        return f"EXIT_{os.WEXITSTATUS(status)}"
+    if os.WIFSIGNALED(status):
+        return f"SIGNAL_{os.WTERMSIG(status)}"
+    return None
+
+
+def verified_bundle_runtime(bundle: Path) -> tuple[Path, Path]:
+    verify_bundle(bundle)
+    root = bundle.resolve(strict=True)
+    node = root / "runtime" / "node"
+    try:
+        info = node.lstat()
+    except OSError as error:
+        raise SmokeFailure("BUNDLE_RUNTIME_NODE_INVALID") from error
+    if (
+        not node.is_absolute() or stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISREG(info.st_mode) or not info.st_mode & 0o111
+    ):
+        fail("BUNDLE_RUNTIME_NODE_INVALID")
+    return root, node
 
 
 def wait_eval(cdp: CDP, expression: str, timeout: float) -> Any:
@@ -724,7 +929,10 @@ def _command_observer_take_script(token: str) -> str:
 
 
 def install_command_observer(cdp: CDP) -> None:
-    if cdp.evaluate(_command_observer_install_script(), timeout=5) is not True:
+    key = json.dumps(COMMAND_OBSERVER_KEY)
+    if cdp.evaluate(
+        f"Boolean(window[{key}] && window[{key}].installed === true)", timeout=5
+    ) is not True:
         fail("VISIBLE_COMMAND_OBSERVER_INSTALL_FAILED")
 
 
@@ -741,6 +949,196 @@ def peek_command_observer(cdp: CDP, token: str) -> dict[str, Any]:
 def take_command_observer(cdp: CDP, token: str) -> dict[str, Any]:
     observed = cdp.evaluate(_command_observer_take_script(token), timeout=5)
     return observed if isinstance(observed, dict) else {}
+
+
+def observer_capture_ready(observer: dict[str, Any]) -> bool:
+    return (
+        observer.get("active") is True
+        and observer.get("error") is None
+        and observer.get("request_count") == 1
+        and observer.get("response_count") == 1
+        and isinstance(observer.get("capture"), dict)
+    )
+
+
+def selected_headers(headers: Any) -> dict[str, str]:
+    if not isinstance(headers, dict):
+        return {}
+    return {
+        str(name).lower(): value
+        for name, value in headers.items()
+        if isinstance(name, str) and name.lower() in OBSERVER_HEADER_NAMES
+        and isinstance(value, str)
+    }
+
+
+def command_headers_valid(headers: dict[str, str]) -> bool:
+    return (
+        set(headers) == OBSERVER_HEADER_NAMES
+        and headers["accept"].strip().lower() == "application/json"
+        and headers["content-type"].split(";", 1)[0].strip().lower()
+        == "application/json"
+        and bool(headers["x-nomad-csrf"])
+    )
+
+
+def safe_http_status(value: Any) -> str:
+    if type(value) in (int, float) and 0 <= value <= 599:
+        return str(int(value))
+    return "UNKNOWN"
+
+
+def safe_gateway_command_error(raw: Any) -> str:
+    try:
+        payload = strict_json_object(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return "UNKNOWN"
+    if set(payload) != {"error"} or not isinstance(payload["error"], str):
+        return "UNKNOWN"
+    return payload["error"] if payload["error"] in GATEWAY_COMMAND_ERRORS else "UNKNOWN"
+
+
+def strict_command_request(action: str, raw: Any) -> dict[str, Any]:
+    value = strict_json_object(raw)
+    if set(value) != COMMAND_REQUEST_COMMON_KEYS | COMMAND_REQUEST_ACTION_KEYS.get(action, set()):
+        raise ValueError("shape")
+    if (
+        value.get("schema") != "nomad.gateway.command.v1"
+        or value.get("action") != action
+        or not isinstance(value.get("capability_id"), str)
+        or OPAQUE_ID.fullmatch(value["capability_id"]) is None
+        or not isinstance(value.get("request_id"), str)
+        or OPAQUE_ID.fullmatch(value["request_id"]) is None
+        or not isinstance(value.get("nonce"), str)
+        or OPAQUE_ID.fullmatch(value["nonce"]) is None
+        or type(value.get("command_seq")) is not int or value["command_seq"] <= 0
+        or type(value.get("expected_snapshot_seq")) is not int
+        or value["expected_snapshot_seq"] <= 0
+        or not isinstance(value.get("expected_snapshot_digest"), str)
+        or DIGEST.fullmatch(value["expected_snapshot_digest"]) is None
+        or not isinstance(value.get("issued_at"), str)
+        or RFC3339.fullmatch(value["issued_at"]) is None
+        or not isinstance(value.get("expires_at"), str)
+        or RFC3339.fullmatch(value["expires_at"]) is None
+    ):
+        raise ValueError("binding")
+    if action == "reply" and (
+        not isinstance(value.get("turn_alias"), str)
+        or ACTION_ALIAS["turn_alias"].fullmatch(value["turn_alias"]) is None
+        or not isinstance(value.get("input_alias"), str)
+        or ACTION_ALIAS["input_alias"].fullmatch(value["input_alias"]) is None
+        or not isinstance(value.get("content"), str) or not value["content"].strip()
+    ):
+        raise ValueError("reply")
+    if action == "deny" and (
+        not isinstance(value.get("permission_alias"), str)
+        or ACTION_ALIAS["permission_alias"].fullmatch(value["permission_alias"]) is None
+        or not isinstance(value.get("action_hash"), str)
+        or DIGEST.fullmatch(value["action_hash"]) is None
+        or not isinstance(value.get("permission_expires_at"), str)
+        or RFC3339.fullmatch(value["permission_expires_at"]) is None
+    ):
+        raise ValueError("deny")
+    if action == "stop" and (
+        not isinstance(value.get("turn_alias"), str)
+        or ACTION_ALIAS["turn_alias"].fullmatch(value["turn_alias"]) is None
+    ):
+        raise ValueError("stop")
+    return value
+
+
+def strict_command_receipt(
+    action: str, payload: Any, request: dict[str, Any], *, gateway_schema: bool = True,
+) -> dict[str, Any]:
+    if not isinstance(payload, dict) or set(payload) != RECEIPT_KEYS:
+        raise ValueError("shape")
+    schema = "nomad.gateway.command-receipt.v1" if gateway_schema else "nomad.product-host.command-receipt.v1"
+    if (
+        payload.get("schema") != schema
+        or payload.get("action") != action
+        or payload.get("request_id") != request.get("request_id")
+        or payload.get("snapshot_seq") != request.get("expected_snapshot_seq")
+        or payload.get("snapshot_digest") != request.get("expected_snapshot_digest")
+        or not isinstance(payload.get("receipt_id"), str)
+        or OPAQUE_ID.fullmatch(payload["receipt_id"]) is None
+        or not isinstance(payload.get("accepted_at"), str)
+        or RFC3339.fullmatch(payload["accepted_at"]) is None
+        or payload.get("status") != "DispatchAcknowledged"
+        or payload.get("error_code") != "OK"
+        or payload.get("idempotent_replay") is not False
+    ):
+        raise ValueError("receipt")
+    return payload
+
+
+def observer_captured(
+    action: str, observer: dict[str, Any], request: dict[str, Any],
+    response: dict[str, Any], *, cdp_payload: Any = None,
+    journal_path: Path | None = None,
+) -> dict[str, Any]:
+    prefix = f"VISIBLE_{action.upper()}_OBSERVER_"
+    if not observer_capture_ready(observer):
+        fail(prefix + "STATE_INVALID")
+    try:
+        capture = observer["capture"]
+        observed_request = strict_command_request(action, capture.get("request_body"))
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        fail(prefix + "OBSERVER_REQUEST_INVALID")
+    try:
+        cdp_request = strict_command_request(action, request.get("postData"))
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        fail(prefix + "CDP_REQUEST_INVALID")
+    if observed_request != cdp_request:
+        fail(prefix + "REQUEST_MISMATCH")
+    observer_headers = selected_headers(capture.get("headers"))
+    if not command_headers_valid(observer_headers):
+        fail(prefix + "OBSERVER_HEADERS_INVALID")
+    cdp_headers = selected_headers(request.get("headers"))
+    if not command_headers_valid(cdp_headers):
+        fail(prefix + "CDP_HEADERS_INVALID")
+    if observer_headers != cdp_headers:
+        fail(prefix + "HEADERS_MISMATCH")
+    observer_status = capture.get("status")
+    cdp_status = response.get("status")
+    if type(observer_status) is not int:
+        fail(prefix + "OBSERVER_STATUS_INVALID")
+    if type(cdp_status) not in (int, float):
+        fail(prefix + "CDP_STATUS_INVALID")
+    if observer_status != cdp_status:
+        fail(
+            prefix + "STATUS_MISMATCH_OBSERVER_"
+            + safe_http_status(observer_status) + "_CDP_"
+            + safe_http_status(cdp_status)
+        )
+    if observer_status != 200:
+        gateway_error = safe_gateway_command_error(capture.get("response_body"))
+        journal_state, bound = journal_command_diagnostic(
+            journal_path, observed_request["request_id"]
+        )
+        fail(
+            f"VISIBLE_{action.upper()}_HTTP_{safe_http_status(observer_status)}_"
+            f"{gateway_error}_JOURNAL_{journal_state}_"
+            f"{'BOUND' if bound else 'UNBOUND'}"
+        )
+    try:
+        observed_receipt = strict_command_receipt(
+            action, strict_json_object(capture.get("response_body")), observed_request
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        fail(prefix + "OBSERVER_RECEIPT_INVALID")
+    if cdp_payload is not None:
+        try:
+            cdp_receipt = strict_command_receipt(action, cdp_payload, cdp_request)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            fail(prefix + "CDP_RECEIPT_INVALID")
+        if observed_receipt != cdp_receipt:
+            fail(prefix + "RECEIPT_MISMATCH")
+    return {
+        "body": request.get("postData", ""),
+        "headers": request.get("headers", {}),
+        "status": capture["status"],
+        "payload": observed_receipt,
+    }
 
 
 def refresh_visible_capability(cdp: CDP) -> None:
@@ -879,7 +1277,9 @@ def browser_command(cdp: CDP, action: str, content: str | None = None) -> dict[s
     return result
 
 
-def try_visible_reply(cdp: CDP, content: str) -> dict[str, Any] | None:
+def try_visible_reply(
+    cdp: CDP, content: str, journal_path: Path | None = None,
+) -> dict[str, Any] | None:
     try:
         wait_eval(cdp, """(() => {
           const input=document.querySelector('[aria-label=\"Reply to agent\"]');
@@ -900,117 +1300,527 @@ def try_visible_reply(cdp: CDP, content: str) -> dict[str, Any] | None:
       if (!button || button.disabled) return 'send';
       button.click(); return true;
     })()"""
-    return capture_visible_command(cdp, "reply", click_script)
+    return capture_visible_command(cdp, "reply", click_script, journal_path)
 
 
-def capture_visible_command(cdp: CDP, action: str, click_script: str) -> dict[str, Any]:
+def capture_visible_command(
+    cdp: CDP, action: str, click_script: str, journal_path: Path | None = None,
+) -> dict[str, Any]:
+    install_command_observer(cdp)
+    observer_token = secrets.token_hex(32)
+    begin_command_observer(cdp, observer_token)
+    observer_taken = False
     prior = {
         event.get("params", {}).get("requestId")
         for event in cdp.events
         if event.get("method") == "Network.requestWillBeSent"
     }
-    click_result = cdp.evaluate(click_script)
-    if click_result is not True:
-        fail(f"VISIBLE_{action.upper()}_CONTROL_MISSING_{click_result}")
-    deadline = time.monotonic() + COMMAND_TIMEOUT
-    captured = None
-    browser_request_count = 0
-    browser_response_count = 0
-    requests: dict[str, dict[str, Any]] = {}
-    responses: dict[str, dict[str, Any]] = {}
-    while time.monotonic() < deadline and captured is None:
-        cdp.evaluate("true", timeout=2)
-        requests = {}
-        responses = {}
+    try:
+        click_result = cdp.evaluate(click_script)
+        if click_result is not True:
+            fail(f"VISIBLE_{action.upper()}_CONTROL_MISSING_{click_result}")
+        deadline = time.monotonic() + COMMAND_TIMEOUT
+        captured = None
+        fallback = False
+        observer = {}
+        browser_request_count = 0
+        browser_response_count = 0
+        observed_request_id: str | None = None
+        requests: dict[str, dict[str, Any]] = {}
+        responses: dict[str, dict[str, Any]] = {}
         finished: set[str] = set()
-        for event in cdp.events:
-            params = event.get("params", {})
-            request_id = params.get("requestId")
-            if not request_id or request_id in prior:
-                continue
-            if event.get("method") == "Network.requestWillBeSent":
-                request = params.get("request", {})
-                if request.get("method") == "POST" and urllib.parse.urlsplit(request.get("url", "")).path == "/api/commands":
-                    requests[request_id] = request
-            elif event.get("method") == "Network.responseReceived":
-                responses[request_id] = params.get("response", {})
-            elif event.get("method") == "Network.loadingFinished":
-                finished.add(request_id)
-        browser_request_count = len(requests)
-        browser_response_count = sum(1 for request_id in requests if request_id in responses)
-        if browser_request_count > 1 or browser_response_count > 1:
-            fail(f"VISIBLE_{action.upper()}_BROWSER_POST_COUNT_INVALID")
-        if browser_request_count == 1:
-            request_id, request = next(iter(requests.items()))
-            response = responses.get(request_id)
-            if response is not None and request_id in finished:
-                body = read_response_body(cdp, request_id, 2.0)
-                if body is not None:
+        failed: set[str] = set()
+        while time.monotonic() < deadline:
+            cdp.evaluate("true", timeout=2)
+            observer = peek_command_observer(cdp, observer_token)
+            if (
+                observer.get("active") is not True
+                or observer.get("error") is not None
+                or observer.get("request_count") not in (0, 1)
+                or observer.get("response_count") not in (0, 1)
+                or (
+                    type(observer.get("request_count")) is not int
+                    or type(observer.get("response_count")) is not int
+                )
+            ):
+                fail(f"VISIBLE_{action.upper()}_OBSERVER_STATE_INVALID")
+            requests = {}
+            responses = {}
+            finished = set()
+            failed = set()
+            for event in cdp.events:
+                params = event.get("params", {})
+                request_id = params.get("requestId")
+                if not request_id or request_id in prior:
+                    continue
+                if event.get("method") == "Network.requestWillBeSent":
+                    request = params.get("request", {})
+                    if request.get("method") == "POST" and urllib.parse.urlsplit(request.get("url", "")).path == "/api/commands":
+                        requests[request_id] = request
+                elif event.get("method") == "Network.responseReceived":
+                    responses[request_id] = params.get("response", {})
+                elif event.get("method") == "Network.loadingFinished":
+                    finished.add(request_id)
+                elif event.get("method") == "Network.loadingFailed":
+                    failed.add(request_id)
+            browser_request_count = len(requests)
+            browser_response_count = sum(1 for request_id in requests if request_id in responses)
+            if browser_request_count > 1 or browser_response_count > 1:
+                fail(f"VISIBLE_{action.upper()}_BROWSER_POST_COUNT_INVALID")
+            if browser_request_count == 1:
+                request_id, request = next(iter(requests.items()))
+                response = responses.get(request_id)
+                if response is not None:
+                    observed_request_id = request_id
+                if captured is None and response is not None and request_id in finished and request_id not in failed:
+                    body = read_response_body(cdp, request_id, 2.0)
+                    try:
+                        payload = strict_json_object(body) if body is not None else None
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        payload = None
                     captured = {
                         "body": request.get("postData", ""),
                         "headers": request.get("headers", {}),
                         "status": int(response.get("status", 0)),
-                        "payload": json.loads(body),
+                        "payload": payload,
                     }
-                    break
-        time.sleep(0.05)
-    if captured is None:
-        paths = [
-            urllib.parse.urlsplit(event.get("params", {}).get("request", {}).get("url", "")).path
-            for event in cdp.events
-            if event.get("method") == "Network.requestWillBeSent"
-            and event.get("params", {}).get("requestId") not in prior
-        ]
-        text = cdp.evaluate("document.body.innerText")
-        reason = "unclassified"
-        for marker, code in (("expired", "expired"), ("result unknown", "unknown"), ("not valid", "invalid"), ("not accepted", "rejected"), ("not sent", "not_sent"), ("commands are disabled", "disabled"), ("reply is not enabled", "reply_disabled"), ("sending your denial", "sending"), ("host accepted", "host_accepted"), ("endpoint acknowledged", "acknowledged")):
-            if marker in text.lower():
-                reason = code
+            if captured is not None and observer_capture_ready(observer):
                 break
-        fail(f"VISIBLE_{action.upper()}_POST_NOT_OBSERVED_{reason}_{len(paths)}")
-    # Drain a bounded quiet window before issuing the explicit replay probes.
-    # This catches a delayed duplicate emitted by the original UI action; Host
-    # idempotency must not be allowed to hide duplicate browser submissions.
-    quiet_deadline = time.monotonic() + 0.5
-    while time.monotonic() < quiet_deadline:
-        cdp.evaluate("true", timeout=1)
-        time.sleep(0.05)
-    final_requests = {
+            if browser_request_count == 1 and observer_capture_ready(observer):
+                candidate_id = next(iter(requests))
+                candidate_response = responses.get(candidate_id)
+                if candidate_response is not None and candidate_id not in failed and candidate_id not in finished:
+                    framing, data = unfinished_framing_data(
+                        cdp.events, candidate_id, candidate_response
+                    )
+                    if framing == "CL_VALID_NO_TE" and data == "DATA_COMPLETE":
+                        break
+            time.sleep(0.05)
+        if captured is None:
+            if browser_request_count == 1:
+                request_id = next(iter(requests))
+                if request_id in failed:
+                    fail(f"VISIBLE_{action.upper()}_NETWORK_LOADING_FAILED")
+                if request_id not in responses:
+                    fail(f"VISIBLE_{action.upper()}_RESPONSE_NOT_OBSERVED")
+                if request_id not in finished:
+                    framing, data = unfinished_framing_data(cdp.events, request_id, responses[request_id])
+                    response_headers = responses[request_id].get("headers", {})
+                    content_types = [
+                        value for name, value in response_headers.items()
+                        if isinstance(name, str) and name.lower() == "content-type"
+                    ] if isinstance(response_headers, dict) else []
+                    content_encoded = any(
+                        isinstance(name, str) and name.lower() == "content-encoding"
+                        for name in response_headers
+                    ) if isinstance(response_headers, dict) else True
+                    if (
+                        responses[request_id].get("status") == 200
+                        and framing == "CL_VALID_NO_TE" and data == "DATA_COMPLETE"
+                        and len(content_types) == 1 and isinstance(content_types[0], str)
+                        and content_types[0].split(";", 1)[0].strip().lower() == "application/json"
+                        and not content_encoded
+                    ):
+                        captured = observer_captured(
+                            action, observer, requests[request_id], responses[request_id],
+                            journal_path=journal_path,
+                        )
+                        fallback = True
+                    else:
+                        diagnose_unfinished_response(cdp, action, request_id, requests[request_id], responses[request_id])
+                else:
+                    fail(f"VISIBLE_{action.upper()}_RESPONSE_BODY_UNAVAILABLE")
+            else:
+                text = cdp.evaluate("document.body.innerText")
+                reason = "unclassified"
+                for marker, code in (("expired", "expired"), ("result unknown", "unknown"), ("not valid", "invalid"), ("not accepted", "rejected"), ("not sent", "not_sent"), ("commands are disabled", "disabled"), ("reply is not enabled", "reply_disabled"), ("sending your denial", "sending"), ("host accepted", "host_accepted"), ("endpoint acknowledged", "acknowledged")):
+                    if marker in text.lower():
+                        reason = code
+                        break
+                fail(f"VISIBLE_{action.upper()}_POST_NOT_OBSERVED_{reason}_0")
+        # Drain a bounded quiet window before issuing the explicit replay probes.
+        # This catches a delayed duplicate emitted by the original UI action; Host
+        # idempotency must not be allowed to hide duplicate browser submissions.
+        quiet_deadline = time.monotonic() + 0.5
+        while time.monotonic() < quiet_deadline:
+            cdp.evaluate("true", timeout=1)
+            observer = peek_command_observer(cdp, observer_token)
+            time.sleep(0.05)
+        final_requests = {
         event.get("params", {}).get("requestId")
         for event in cdp.events
         if event.get("method") == "Network.requestWillBeSent"
         and event.get("params", {}).get("requestId") not in prior
         and event.get("params", {}).get("request", {}).get("method") == "POST"
         and urllib.parse.urlsplit(event.get("params", {}).get("request", {}).get("url", "")).path == "/api/commands"
-    }
-    final_responses = {
+        }
+        final_responses = {
         event.get("params", {}).get("requestId")
         for event in cdp.events
         if event.get("method") == "Network.responseReceived"
         and event.get("params", {}).get("requestId") in final_requests
-    }
-    browser_request_count = len(final_requests)
-    browser_response_count = len(final_responses)
-    if browser_request_count != 1 or browser_response_count != 1:
-        fail(f"VISIBLE_{action.upper()}_BROWSER_POST_COUNT_INVALID")
-    browser_headers = {
+        }
+        final_failed = {
+        event.get("params", {}).get("requestId")
+        for event in cdp.events
+        if event.get("method") == "Network.loadingFailed"
+        and event.get("params", {}).get("requestId") in final_requests
+        }
+        browser_request_count = len(final_requests)
+        browser_response_count = len(final_responses)
+        if browser_request_count != 1 or browser_response_count != 1:
+            fail(f"VISIBLE_{action.upper()}_BROWSER_POST_COUNT_INVALID")
+        if final_failed:
+            fail(f"VISIBLE_{action.upper()}_NETWORK_LOADING_FAILED")
+        if observed_request_id is None:
+            fail(f"VISIBLE_{action.upper()}_POST_NOT_OBSERVED_unclassified_{len(final_requests)}")
+        observer = take_command_observer(cdp, observer_token)
+        observer_taken = True
+        observer_captured(
+            action, observer, requests[observed_request_id], responses[observed_request_id],
+            cdp_payload=captured.get("payload"), journal_path=journal_path,
+        )
+        if not isinstance(captured.get("payload"), dict):
+            fail(f"VISIBLE_{action.upper()}_RESPONSE_BODY_UNAVAILABLE")
+        request_object = strict_command_request(action, captured["body"])
+        strict_command_receipt(action, captured["payload"], request_object)
+        if fallback:
+            if journal_path is None:
+                fail("VISIBLE_COMMAND_JOURNAL_VALIDATION_FAILED")
+            validate_journal_receipt(journal_path, request_object, captured["payload"])
+        browser_headers = {
         key: value
         for key, value in captured["headers"].items()
         if key.lower() in ("accept", "content-type", "x-nomad-csrf")
-    }
-    replay_script = f"""(async()=>{{
+        }
+        replay_script = f"""(async()=>{{
       const captured={json.dumps(captured)}; const headers={json.dumps(browser_headers)}; const send=async()=>{{const r=await fetch('/api/commands',{{method:'POST',headers,body:captured.body}});return {{status:r.status,payload:await r.json()}};}};
       return {{stage:'complete',action:{json.dumps(action)},body:captured.body,capability:null,first:{{status:captured.status,payload:captured.payload}},replay:await Promise.all([send(),send()])}};
     }})()"""
-    result = cdp.evaluate(replay_script, timeout=COMMAND_TIMEOUT)
-    if not isinstance(result, dict) or result.get("stage") != "complete":
-        fail(f"VISIBLE_{action.upper()}_FAILED")
-    result["browser_request_count"] = browser_request_count
-    result["browser_response_count"] = browser_response_count
-    return result
+        result = cdp.evaluate(replay_script, timeout=COMMAND_TIMEOUT)
+        if not isinstance(result, dict) or result.get("stage") != "complete":
+            fail(f"VISIBLE_{action.upper()}_FAILED")
+        result["browser_request_count"] = browser_request_count
+        result["browser_response_count"] = browser_response_count
+        return result
+    finally:
+        if not observer_taken:
+            try:
+                take_command_observer(cdp, observer_token)
+            except Exception:
+                pass
 
 
-def visible_deny(cdp: CDP) -> dict[str, Any]:
+def diagnose_unfinished_response(
+    cdp: CDP, action: str, request_id: str,
+    request: dict[str, Any], response: dict[str, Any],
+) -> None:
+    raw: Any = None
+    try:
+        raw = cdp.call(
+            "Network.getResponseBody", {"requestId": request_id}, timeout=1.0
+        )
+    except Exception:
+        raw = None
+    ui_acknowledged = False
+    if action == "stop":
+        try:
+            ui_acknowledged = cdp.evaluate(
+                "document.body.innerText.includes('The Agent endpoint acknowledged Stop')",
+                timeout=1.0,
+            ) is True
+        except Exception:
+            ui_acknowledged = False
+    if any(
+        event.get("method") == "Network.loadingFailed"
+        and event.get("params", {}).get("requestId") == request_id
+        for event in cdp.events
+    ):
+        fail(f"VISIBLE_{action.upper()}_NETWORK_LOADING_FAILED")
+    framing, data = unfinished_framing_data(cdp.events, request_id, response)
+    if ui_acknowledged:
+        fail(
+            f"VISIBLE_STOP_LOADING_NOT_FINISHED_UI_ACKNOWLEDGED_{framing}_{data}"
+        )
+    if diagnostic_receipt_valid(action, request, response, raw):
+        fail(
+            f"VISIBLE_{action.upper()}_LOADING_NOT_FINISHED_"
+            f"BODY_AVAILABLE_VALID_RECEIPT_{framing}_{data}"
+        )
+    fail(
+        f"VISIBLE_{action.upper()}_LOADING_NOT_FINISHED_"
+        f"BODY_UNAVAILABLE_{framing}_{data}"
+    )
+
+
+def unfinished_framing_data(
+    events: list[dict[str, Any]], request_id: str, response: dict[str, Any],
+) -> tuple[str, str]:
+    headers = response.get("headers")
+    if not isinstance(headers, dict):
+        headers = {}
+    transfer_encoding = any(
+        isinstance(name, str) and name.lower() == "transfer-encoding"
+        for name in headers
+    )
+    lengths = [
+        value for name, value in headers.items()
+        if isinstance(name, str) and name.lower() == "content-length"
+    ]
+    content_length: int | None = None
+    if (
+        len(lengths) == 1 and isinstance(lengths[0], str)
+        and re.fullmatch(r"(?:0|[1-9][0-9]*)", lengths[0]) is not None
+    ):
+        content_length = int(lengths[0])
+    framing = (
+        "TE_PRESENT" if transfer_encoding
+        else "CL_VALID_NO_TE" if content_length is not None
+        else "CL_INVALID"
+    )
+    samples = [
+        event.get("params", {})
+        for event in events
+        if event.get("method") == "Network.dataReceived"
+        and event.get("params", {}).get("requestId") == request_id
+    ]
+    if not samples:
+        return framing, "DATA_NONE"
+    total = 0
+    for sample in samples:
+        values = (sample.get("dataLength"), sample.get("encodedDataLength"))
+        if any(type(value) not in (int, float) or value < 0 for value in values):
+            return framing, "DATA_UNKNOWN"
+        total += values[0]
+    if content_length is None:
+        return framing, "DATA_UNKNOWN"
+    if total == content_length:
+        return framing, "DATA_COMPLETE"
+    if total < content_length:
+        return framing, "DATA_PARTIAL"
+    return framing, "DATA_UNKNOWN"
+
+
+def diagnostic_receipt_valid(
+    action: str, request: dict[str, Any], response: dict[str, Any], raw: Any,
+) -> bool:
+    try:
+        if type(response.get("status")) is not int or response["status"] != 200:
+            return False
+        if not isinstance(raw, dict) or set(raw) not in ({"body"}, {"body", "base64Encoded"}):
+            return False
+        request_body = strict_json_object(request.get("postData"))
+        payload = strict_json_object(decode_response_body(raw))
+        if set(payload) != RECEIPT_KEYS:
+            return False
+        return (
+            payload.get("schema") == "nomad.gateway.command-receipt.v1"
+            and payload.get("action") == action
+            and request_body.get("action") == action
+            and isinstance(request_body.get("request_id"), str)
+            and payload.get("request_id") == request_body["request_id"]
+            and isinstance(payload.get("receipt_id"), str)
+            and OPAQUE_ID.fullmatch(payload["receipt_id"]) is not None
+            and OPAQUE_ID.fullmatch(payload["request_id"]) is not None
+            and type(payload.get("snapshot_seq")) is int
+            and payload["snapshot_seq"] > 0
+            and isinstance(payload.get("snapshot_digest"), str)
+            and DIGEST.fullmatch(payload["snapshot_digest"]) is not None
+            and isinstance(payload.get("accepted_at"), str)
+            and RFC3339.fullmatch(payload["accepted_at"]) is not None
+            and payload.get("status") == "DispatchAcknowledged"
+            and payload.get("error_code") == "OK"
+            and payload.get("idempotent_replay") is False
+        )
+    except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+
+
+def strict_json_object(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, str):
+        raise ValueError("invalid")
+
+    def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate")
+            value[key] = item
+        return value
+
+    value = json.loads(raw, object_pairs_hook=unique)
+    if not isinstance(value, dict):
+        raise ValueError("object")
+    return value
+
+
+def _private_file_identity(path: Path) -> tuple[int, int, int, int, int]:
+    info = path.lstat()
+    if (
+        stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_nlink != 1
+    ):
+        raise ValueError("file")
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_nlink)
+
+
+def _private_journal_files(
+    journal_path: Path,
+) -> tuple[Path, tuple[int, int, int, int, int], tuple[Path, ...], dict[Path, tuple[int, int, int, int, int]]]:
+    path = Path(journal_path)
+    parent = path.parent
+    parent_info = parent.lstat()
+    if (
+        stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode)
+        or parent_info.st_uid != os.geteuid()
+        or stat.S_IMODE(parent_info.st_mode) != 0o700
+    ):
+        raise ValueError("parent")
+    parent_identity = (
+        parent_info.st_dev, parent_info.st_ino, parent_info.st_mode,
+        parent_info.st_uid, parent_info.st_nlink,
+    )
+    candidates = (path, Path(str(path) + "-wal"), Path(str(path) + "-shm"))
+    tracked = {}
+    for candidate in candidates:
+        try:
+            tracked[candidate] = _private_file_identity(candidate)
+        except FileNotFoundError:
+            if candidate == path:
+                raise
+    return path, parent_identity, candidates, tracked
+
+
+def _revalidate_private_journal_files(
+    path: Path, parent_identity: tuple[int, int, int, int, int],
+    candidates: tuple[Path, ...], tracked: dict[Path, tuple[int, int, int, int, int]],
+) -> None:
+    current_parent = path.parent.lstat()
+    if (
+        current_parent.st_dev, current_parent.st_ino, current_parent.st_mode,
+        current_parent.st_uid, current_parent.st_nlink,
+    ) != parent_identity:
+        raise ValueError("parent replacement")
+    current_paths = {candidate for candidate in candidates if os.path.lexists(candidate)}
+    if current_paths != set(tracked):
+        raise ValueError("sidecar replacement")
+    for candidate, identity in tracked.items():
+        if _private_file_identity(candidate) != identity:
+            raise ValueError("replacement")
+
+
+def journal_command_diagnostic(
+    journal_path: Path | None, request_id: str,
+) -> tuple[str, bool]:
+    if journal_path is None:
+        return "OTHER", False
+    try:
+        path, parent_identity, candidates, tracked = _private_journal_files(journal_path)
+        uri = "file:" + urllib.parse.quote(str(path), safe="/") + "?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, timeout=0.2)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("PRAGMA busy_timeout=200")
+            connection.execute("BEGIN")
+            rows = connection.execute(
+                """
+                SELECT c.status,
+                       CASE WHEN b.request_id IS NULL THEN 0 ELSE 1 END
+                  FROM commands c
+                  LEFT JOIN host_authority_bindings b ON b.request_id=c.request_id
+                 WHERE c.request_id=?
+                """,
+                (request_id,),
+            ).fetchall()
+            connection.rollback()
+        finally:
+            connection.close()
+        _revalidate_private_journal_files(path, parent_identity, candidates, tracked)
+        if len(rows) == 0:
+            return "NO_ROW", False
+        if len(rows) != 1:
+            return "OTHER", False
+        status, bound = rows[0]
+        return JOURNAL_STATUS_CODES.get(status, "OTHER"), bound == 1
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return "OTHER", False
+
+
+def validate_journal_receipt(
+    journal_path: Path, request: dict[str, Any], gateway_receipt: dict[str, Any],
+) -> None:
+    """Read-only proof that Host durably committed the observer receipt.
+
+    Every externally controlled value is kept out of diagnostics; callers only
+    receive one fixed failure code.  Revalidation after closing SQLite detects
+    replacement of the database or any sidecar during the proof.
+    """
+    try:
+        path, parent_identity, candidates, tracked = _private_journal_files(journal_path)
+
+        uri = "file:" + urllib.parse.quote(str(path), safe="/") + "?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, timeout=0.2)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("PRAGMA busy_timeout=200")
+            connection.execute("BEGIN")
+            rows = connection.execute(
+                """
+                SELECT c.command_type,c.seq,c.status,c.accepted_at_seq,c.result_json,
+                       b.binding_digest,b.receipt_id,b.authority_scope,b.command_seq,b.nonce_digest,
+                       s.reconciliation_required,s.active_request_id
+                  FROM commands c
+                  JOIN host_authority_bindings b ON b.request_id=c.request_id
+                  JOIN host_authority_scopes s ON s.authority_scope=b.authority_scope
+                 WHERE c.request_id=?
+                """,
+                (request["request_id"],),
+            ).fetchall()
+            connection.rollback()
+        finally:
+            connection.close()
+
+        if len(rows) != 1:
+            raise ValueError("cardinality")
+        (command_type, seq, status, accepted_at_seq, result_raw, binding_digest,
+         receipt_id, authority_scope, command_seq, nonce_digest,
+         reconciliation_required, active_request_id) = rows[0]
+        host_receipt = strict_json_object(result_raw)
+        if set(host_receipt) != {
+            "receipt_id", "request_id", "kind", "accepted_at", "status",
+            "error_code", "accepted_at_seq", "idempotent_replay",
+        }:
+            raise ValueError("host receipt shape")
+        commitments = (binding_digest, authority_scope, nonce_digest)
+        if any(
+            not isinstance(value, str) or HEX_COMMITMENT.fullmatch(value) is None
+            or value == "0" * 64 for value in commitments
+        ):
+            raise ValueError("commitment")
+        if (
+            command_type != request["action"] or status != "DispatchAcknowledged"
+            or type(seq) is not int or seq != request["command_seq"]
+            or type(command_seq) is not int or command_seq != request["command_seq"]
+            or receipt_id != gateway_receipt["receipt_id"]
+            or type(accepted_at_seq) is not int or accepted_at_seq <= 0
+            or reconciliation_required != 0 or active_request_id is not None
+            or host_receipt.get("receipt_id") != gateway_receipt["receipt_id"]
+            or host_receipt.get("request_id") != gateway_receipt["request_id"]
+            or host_receipt.get("kind") != gateway_receipt["action"]
+            or host_receipt.get("accepted_at") != gateway_receipt["accepted_at"]
+            or host_receipt.get("status") != gateway_receipt["status"]
+            or (host_receipt.get("error_code") or "OK") != gateway_receipt["error_code"]
+            or host_receipt.get("accepted_at_seq") != accepted_at_seq
+            or host_receipt.get("idempotent_replay") is not False
+        ):
+            raise ValueError("semantic")
+        _revalidate_private_journal_files(path, parent_identity, candidates, tracked)
+    except (KeyError, OSError, sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
+        fail("VISIBLE_COMMAND_JOURNAL_VALIDATION_FAILED")
+
+
+def visible_deny(cdp: CDP, journal_path: Path | None = None) -> dict[str, Any]:
     return capture_visible_command(cdp, "deny", """(async () => {
       const review=Array.from(document.querySelectorAll('button')).find(b=>b.textContent.trim()==='Review request'&&!b.disabled);
       if (!review) return 'review'; review.click();
@@ -1030,10 +1840,10 @@ def visible_deny(cdp: CDP) -> dict[str, Any]:
         return 'deny_disabled';
       }
       deny.click(); return true;
-    })()""")
+    })()""", journal_path)
 
 
-def visible_stop(cdp: CDP) -> dict[str, Any]:
+def visible_stop(cdp: CDP, journal_path: Path | None = None) -> dict[str, Any]:
     return capture_visible_command(cdp, "stop", """(async () => {
       let open=null;
       for (let attempt=0; attempt<50 && !open; attempt+=1) {
@@ -1048,18 +1858,73 @@ def visible_stop(cdp: CDP) -> dict[str, Any]:
         confirm=dialog&&Array.from(dialog.querySelectorAll('button')).find(b=>b.textContent.trim()==='Stop task'&&!b.disabled);
       }
       if (!confirm) return 'confirm'; confirm.click(); return true;
-    })()""")
+    })()""", journal_path)
 
 
 def assert_receipts(result: dict[str, Any], expected: str) -> None:
-    first = result["first"]
-    if first.get("status") != 200 or first.get("payload", {}).get("status") != expected:
-        fail(f"COMMAND_{result['action'].upper()}_{expected.upper()}_MISSING")
-    receipt = first["payload"].get("receipt_id")
-    for replay in result["replay"]:
-        payload = replay.get("payload") or {}
-        if replay.get("status") != 200 or payload.get("receipt_id") != receipt or payload.get("status") != expected or payload.get("idempotent_replay") is not True:
-            fail(f"COMMAND_{result['action'].upper()}_REPLAY_FAILED")
+    action = result.get("action") if isinstance(result, dict) else None
+    action_code = action.upper() if action in {"reply", "deny", "stop"} else "UNKNOWN"
+    expected_code = RECEIPT_STATUSES.get(expected)
+    first = result.get("first") if isinstance(result, dict) else None
+    if (
+        expected_code is None or not isinstance(first, dict)
+        or set(first) != {"status", "payload"} or type(first.get("status")) is not int
+        or first["status"] != 200 or not isinstance(first.get("payload"), dict)
+        or set(first["payload"]) != RECEIPT_KEYS
+        or first["payload"].get("schema") != "nomad.gateway.command-receipt.v1"
+        or first["payload"].get("action") != action
+        or first["payload"].get("status") != expected
+    ):
+        fail(f"COMMAND_{action_code}_{expected_code or 'UNKNOWN'}_MISSING")
+    first_payload = first["payload"]
+    expected_error = "ERR_OUTCOME_UNKNOWN" if expected == "OutcomeUnknown" else "OK"
+    if first_payload.get("error_code") != expected_error:
+        fail(f"COMMAND_{action_code}_{expected_code}_MISSING")
+    replays = result.get("replay")
+    if not isinstance(replays, list) or len(replays) != 2:
+        fail(f"COMMAND_{action_code}_REPLAY_A_BODY_INVALID")
+    for index, replay in enumerate(replays):
+        label = "A" if index == 0 else "B"
+        prefix = f"COMMAND_{action_code}_REPLAY_{label}_"
+        assert_replay_receipt(prefix, replay, first_payload, action, expected, expected_error)
+
+
+def assert_replay_receipt(
+    prefix: str, replay: Any, first: dict[str, Any], action: str,
+    expected_status: str, expected_error: str,
+) -> None:
+    if not isinstance(replay, dict) or set(replay) != {"status", "payload"} or type(replay.get("status")) is not int:
+        fail(prefix + "BODY_INVALID")
+    status_code = replay["status"]
+    payload = replay.get("payload")
+    if status_code != 200:
+        fail(prefix + f"HTTP_{status_code}_{receipt_error_enum(payload)}")
+    if not isinstance(payload, dict) or set(payload) != RECEIPT_KEYS:
+        fail(prefix + "BODY_INVALID")
+    if payload.get("schema") != "nomad.gateway.command-receipt.v1":
+        fail(prefix + "SCHEMA_INVALID")
+    if payload.get("request_id") != first.get("request_id"):
+        fail(prefix + "REQUEST_MISMATCH")
+    if payload.get("action") != action:
+        fail(prefix + "ACTION_MISMATCH")
+    immutable = ("receipt_id", "snapshot_seq", "snapshot_digest", "accepted_at")
+    if any(payload.get(field) != first.get(field) for field in immutable):
+        fail(prefix + "RECEIPT_MISMATCH")
+    if payload.get("status") != expected_status:
+        fail(prefix + "STATUS_" + RECEIPT_STATUSES.get(payload.get("status"), "UNKNOWN"))
+    if payload.get("error_code") != expected_error:
+        fail(prefix + "ERROR_" + receipt_error_enum(payload))
+    if payload.get("idempotent_replay") is not True:
+        fail(prefix + "IDEMPOTENT_FALSE")
+
+
+def receipt_error_enum(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return "NO_ERROR"
+    value = payload.get("error_code", payload.get("error"))
+    if value is None:
+        return "NO_ERROR"
+    return value if value in RECEIPT_ERRORS else "UNKNOWN"
 
 
 def expected_journal(run_id: str, run_dir: Path) -> Path:
@@ -1129,6 +1994,7 @@ def remove_file(path: Path) -> None:
 
 
 def run_smoke(timeout: float, chrome_path: Path, keep_bundle: Path | None) -> dict[str, Any]:
+    heartbeat("C3_STAGE_START")
     started = time.monotonic()
     processes_owned: list[dict[str, Any]] = []
     fake: FakeController | None = None
@@ -1151,11 +2017,13 @@ def run_smoke(timeout: float, chrome_path: Path, keep_bundle: Path | None) -> di
         bundle = keep_bundle or root / "bundle"
         if keep_bundle is None:
             materialize(REPO, bundle)
+        bundle, node = verified_bundle_runtime(bundle)
         host_binary = bundle / "bin" / "nomad-product-host"
         gateway_script = bundle / "gateway" / "server.mjs"
         web = bundle / "web"
         if not host_binary.is_file() or not gateway_script.is_file() or not (web / "index.html").is_file():
             fail("MATERIALIZED_COMPONENT_MISSING")
+        heartbeat("BUNDLE_READY")
 
         runtime = root / "run"
         logs = root / "logs"
@@ -1211,6 +2079,7 @@ def run_smoke(timeout: float, chrome_path: Path, keep_bundle: Path | None) -> di
                 logs / "fake.log",
             )
             cleanup_pids.append(fake.process.pid)
+            heartbeat("FAKE_READY")
 
             bootstrap_parent, bootstrap_child = socket.socketpair()
             host = _spawn_product_host(host_binary, bundle, logs / "product-host.log", bootstrap_child)
@@ -1230,15 +2099,14 @@ def run_smoke(timeout: float, chrome_path: Path, keep_bundle: Path | None) -> di
                 fail(f"HOST_BOOTSTRAP_FAILED_RC_{processes.ownership(host)}_GETS_{observed.get('get_attempts', 0)}_AUTH_{observed.get('authorization_failures', 0)}_{error}")
             bootstrap_parent.close()
             password = ""
+            heartbeat("HOST_READY")
 
             key_read, key_write = os.pipe()
             for descriptor in (key_read, key_write):
                 os.set_inheritable(descriptor, False)
             _write_fd_secret(key_write, transport_key)
             key_write = -1
-            node = shutil.which("node")
-            if not node:
-                fail("NODE_MISSING")
+            gateway_log = logs / "gateway.log"
             gateway = processes.spawn(
                 "gateway",
                 [
@@ -1252,16 +2120,23 @@ def run_smoke(timeout: float, chrome_path: Path, keep_bundle: Path | None) -> di
                     "--product-host-socket-ino", str(socket_identity["socket_ino"]),
                     "--command-key-fd", "11",
                 ],
-                bundle / "gateway", processes.minimal_env({}), logs / "gateway.log",
+                bundle / "gateway", processes.minimal_env({}), gateway_log,
                 extra_fd_actions=((key_read, 11),), close_fds=(key_read,),
             )
             os.close(key_read)
             processes_owned.append(gateway); cleanup_pids.append(int(gateway["pid"]))
             base = f"http://127.0.0.1:{gateway_port}"
-            wait_json(base + "/api/alpha/session", timeout)
+            wait_json(
+                base + "/api/alpha/session", timeout,
+                "GATEWAY_HTTP_SERVICE_TIMEOUT",
+                child=gateway, early_exit_code="GATEWAY_HTTP_EARLY_EXIT",
+                early_exit_log=gateway_log,
+            )
+            heartbeat("GATEWAY_READY")
 
             chrome = Chrome(root, logs / "chrome.log", chrome_path)
             cleanup_pids.append(chrome.process.pid)
+            heartbeat("CHROME_READY")
 
             desktop = chrome.page(base + "/", 1440, 900, False)
             pages.append(desktop)
@@ -1277,6 +2152,7 @@ def run_smoke(timeout: float, chrome_path: Path, keep_bundle: Path | None) -> di
                 fail("VISIBLE_REPLY_" + reason.upper() + f"_CAP_{shape.get('status')}_{int(bool(shape.get('reply')))}_{int(bool(shape.get('summary')))}_{int(bool(shape.get('schema')))}")
             desktop_projection = wait_session_response(desktop, timeout)
             desktop_shot = screenshot_digest(desktop)
+            heartbeat("DESKTOP_READY")
 
             mobile_baseline = chrome.page(base + "/", 390, 844, True)
             pages.append(mobile_baseline)
@@ -1285,6 +2161,7 @@ def run_smoke(timeout: float, chrome_path: Path, keep_bundle: Path | None) -> di
             if desktop_projection != mobile_projection:
                 fail("DESKTOP_MOBILE_PROJECTION_MISMATCH")
             mobile_shot = screenshot_digest(mobile_baseline)
+            heartbeat("MOBILE_READY")
             browser_surfaces.append(browser_private_surface(mobile_baseline))
             mobile_baseline.close(); pages.remove(mobile_baseline)
             browser_surfaces.append(browser_private_surface(desktop))
@@ -1294,32 +2171,41 @@ def run_smoke(timeout: float, chrome_path: Path, keep_bundle: Path | None) -> di
             # comparison above can outlive it, so acquire a fresh browser page
             # and exercise the visible control immediately; never extend the
             # product TTL or retry the original action.
-            reply_page = chrome.page(base + "/", 1440, 900, False)
+            reply_page = chrome.page(
+                base + "/", 1440, 900, False, action_observer=True,
+            )
             pages.append(reply_page)
             wait_eval(reply_page, "document.body.innerText.includes('Provide a short reply for: deployment region.')", timeout)
-            reply_result = try_visible_reply(reply_page, reply_content)
+            reply_result = try_visible_reply(reply_page, reply_content, journal)
             if reply_result is None:
                 fail("VISIBLE_REPLY_CONTROL_MISSING")
             reply_mode = "visible_control"
             assert_receipts(reply_result, "DispatchAcknowledged")
+            heartbeat("REPLY_DONE")
             browser_surfaces.append(browser_private_surface(reply_page))
             reply_page.close(); pages.remove(reply_page)
 
             fake.phase("deny")
-            mobile = chrome.page(base + "/", 390, 844, True)
+            mobile = chrome.page(
+                base + "/", 390, 844, True, action_observer=True,
+            )
             pages.append(mobile)
             wait_eval(mobile, "document.body.innerText.includes('The agent is waiting before a change')", timeout)
-            deny_result = visible_deny(mobile)
+            deny_result = visible_deny(mobile, journal)
             assert_receipts(deny_result, "DispatchAcknowledged")
+            heartbeat("DENY_DONE")
             browser_surfaces.append(browser_private_surface(mobile))
             mobile.close(); pages.remove(mobile)
 
             fake.phase("running")
-            stop_page = chrome.page(base + "/", 390, 844, True)
+            stop_page = chrome.page(
+                base + "/", 390, 844, True, action_observer=True,
+            )
             pages.append(stop_page)
             wait_eval(stop_page, "document.body.innerText.includes('No action needed')", timeout)
-            stop_result = visible_stop(stop_page)
+            stop_result = visible_stop(stop_page, journal)
             assert_receipts(stop_result, "DispatchAcknowledged")
+            heartbeat("STOP_DONE")
             browser_surfaces.append(browser_private_surface(stop_page))
             stop_page.close(); pages.remove(stop_page)
 
@@ -1330,6 +2216,7 @@ def run_smoke(timeout: float, chrome_path: Path, keep_bundle: Path | None) -> di
             fake.drop("unknown")
             unknown_result = browser_command(unknown_page, "reply", unknown_content)
             assert_receipts(unknown_result, "OutcomeUnknown")
+            heartbeat("UNKNOWN_DONE")
             wait_eval(unknown_page, "true", 0.1)
 
             browser_surfaces.append(browser_private_surface(unknown_page))
@@ -1390,6 +2277,7 @@ def run_smoke(timeout: float, chrome_path: Path, keep_bundle: Path | None) -> di
             )
             if any(needle in argv_surface for needle in sensitive):
                 fail("SECRET_OR_RAW_ID_IN_ARGV")
+            heartbeat("AUDIT_DONE")
 
             result = {
                 "marker": MARKER, "mechanical_e2": True, "provider_e3": False,
@@ -1410,6 +2298,7 @@ def run_smoke(timeout: float, chrome_path: Path, keep_bundle: Path | None) -> di
                 "elapsed_seconds": round(time.monotonic() - started, 3),
             }
         finally:
+            heartbeat("CLEANUP_BEGIN")
             for page in pages:
                 try:
                     page.close()
@@ -1455,8 +2344,10 @@ def run_smoke(timeout: float, chrome_path: Path, keep_bundle: Path | None) -> di
                 fail("JOURNAL_CLEANUP_FAILED")
             if device_registry is not None and (device_registry.exists() or device_registry.parent.exists()):
                 fail("DEVICE_REGISTRY_CLEANUP_FAILED")
+            heartbeat("CLEANUP_DONE")
 
         result["cleanup"] = {"processes": True, "ports": True, "uds": True, "journal": True, "gateway_db": True, "device_registry": True}
+        heartbeat("PASS")
         return result
 
 

@@ -1,9 +1,11 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CommandResponseError, HttpSessionClient } from './http-client';
 import { AlphaAvailabilityError, AlphaResponseError } from './alpha-decoder';
 import { sessionModeFromSearch, type BrowserCommandCapability, type CapabilityCommandIntent, type SessionView } from './types';
 
 const fakeView = { provenance: 'alpha-readonly', mode: 'readonly-alpha', writable: false } as SessionView;
+
+afterEach(() => vi.useRealTimers());
 
 function failure(status: 'unavailable' | 'unknown') {
   return {
@@ -166,8 +168,10 @@ describe('HttpSessionClient', () => {
     ['reply', { turn_alias: 'turn_alias_000001', input_alias: 'input_alias_00001', content: 'Continue safely' }],
     ['deny', { permission_alias: 'permission_alias_1', action_hash: `sha256:${'b'.repeat(64)}`, permission_expires_at: 'CAPABILITY_EXPIRY' }],
     ['stop', { turn_alias: 'turn_alias_000001' }],
-  ] as const)('posts exact %s command with CSRF, capability CAS, and no raw identifiers', async (action, fields) => {
+  ] as const)('posts exact %s command using the capability issued_at when local time is two seconds later', async (action, fields) => {
     const capabilityPayload = capabilityEnvelope();
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.parse(capabilityPayload.capability.issued_at) + 2_000);
     const calls: GatewayCall[] = [];
     const fetchImpl = vi.fn<typeof fetch>().mockImplementation(async (url, init) => {
       calls.push({ url: String(url), init });
@@ -194,7 +198,7 @@ describe('HttpSessionClient', () => {
       schema: 'nomad.gateway.command.v1', capability_id: 'capability_00000001',
       request_id: expect.stringMatching(/^req_[0-9a-f]{32}$/), nonce: expect.stringMatching(/^nonce_[0-9a-f]{32}$/),
       command_seq: 19, expected_snapshot_seq: 17, expected_snapshot_digest: DIGEST_A,
-      issued_at: expect.any(String), expires_at: capabilityPayload.capability.expires_at, action, ...normalizedFields,
+      issued_at: capabilityPayload.capability.issued_at, expires_at: capabilityPayload.capability.expires_at, action, ...normalizedFields,
     });
     expect(JSON.stringify(body)).not.toMatch(/session_id|turn_id|permission_id|credential|provider|allow/i);
     expect(JSON.stringify(body)).not.toContain('pending-question-summary');

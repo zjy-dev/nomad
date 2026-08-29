@@ -56,7 +56,7 @@ export class HttpSessionClient implements SessionClient {
       command_seq: binding.capability.next_command_seq,
       expected_snapshot_seq: binding.capability.snapshot_seq,
       expected_snapshot_digest: binding.capability.snapshot_digest,
-      issued_at: now.toISOString(),
+      issued_at: binding.capability.issued_at,
       expires_at: binding.capability.expires_at,
     };
     const request: GatewayCommandRequest = intent.action === 'reply'
