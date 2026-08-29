@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import shutil
@@ -15,7 +17,7 @@ import subprocess
 import tempfile
 import uuid
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any, Mapping
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -27,6 +29,10 @@ EXTERNAL_GATES = (
 )
 REQUIRED = ("A_remote_local_evidence", "B_c3_local", "C_lifecycle")
 MAX_CLI_OUTPUT_BYTES = 4 * 1024 * 1024
+MAX_QA_DRIVER_BYTES = 2 * 1024 * 1024
+QA_DRIVER_CLASSIFICATION = "external-qa-not-shipped-product-closure"
+QA_DRIVER_SOURCE_SHA256 = "f521f5b71e84b50013b98dd3010de601b79ccfecb79e73aba2a2d8e081a817b9"
+CHROME = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
 ONBOARDING_STATES = {
     "NOT_INSTALLED", "INSTALLED_NEEDS_START",
     "INSTALLED_BLOCKED_HOST_IDENTITY", "RUNNING_NEEDS_PAIRING",
@@ -100,6 +106,199 @@ def _bundle_digest(bundle: Path) -> str:
     return item
 
 
+def _read_regular_file(path: Path, limit: int, code: str) -> bytes:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise RuntimeError(code) from error
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+            or before.st_uid != os.geteuid()
+            or not 0 < before.st_size <= limit
+        ):
+            raise RuntimeError(code)
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise RuntimeError(code)
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns
+        ):
+            raise RuntimeError(code)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _stage_qa_driver(
+    source: Path, stage_root: Path, installed_bundle: Path,
+    installed_bundle_digest: str,
+) -> tuple[Path, dict[str, str]]:
+    raw = _read_regular_file(source, MAX_QA_DRIVER_BYTES, "P8H_QA_DRIVER_SOURCE_INVALID")
+    if hashlib.sha256(raw).hexdigest() != QA_DRIVER_SOURCE_SHA256:
+        raise RuntimeError("P8H_QA_DRIVER_SOURCE_DIGEST_MISMATCH")
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", installed_bundle_digest) is None
+        or installed_bundle.resolve(strict=True).name != installed_bundle_digest
+    ):
+        raise RuntimeError("P8H_INSTALLED_BUNDLE_BINDING_INVALID")
+    repo_binding = (
+        b"REPO = Path(__file__).resolve().parents[2]\n"
+        b"if __package__ in (None, \"\"):\n"
+        b"    sys.path.insert(0, str(REPO))\n"
+    )
+    tools_import = b"from tools.nomad_web"
+    if raw.count(repo_binding) != 1 or raw.count(tools_import) != 3:
+        raise RuntimeError("P8H_QA_DRIVER_SOURCE_INVALID")
+    stage_root = stage_root.absolute()
+    installed_lib = (installed_bundle / "lib").resolve(strict=True)
+    raw = raw.replace(
+        repo_binding,
+        (
+            f"REPO = Path({json.dumps(str(stage_root))})\n"
+            f"sys.path.insert(0, {json.dumps(str(installed_lib))})\n"
+        ).encode("utf-8"),
+    ).replace(tools_import, b"from nomad_web")
+    generated_digest = hashlib.sha256(raw).hexdigest()
+    binding = {
+        "classification": QA_DRIVER_CLASSIFICATION,
+        "trusted_source_sha256": QA_DRIVER_SOURCE_SHA256,
+        "generated_sha256": generated_digest,
+        "installed_bundle_digest": installed_bundle_digest,
+    }
+    binding["closure_digest"] = hashlib.sha256(canonical(binding)).hexdigest()
+    stage_root.mkdir(mode=0o700)
+    os.chmod(stage_root, 0o700)
+    root_info = stage_root.lstat()
+    if (
+        not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode)
+        or root_info.st_uid != os.geteuid() or stat.S_IMODE(root_info.st_mode) != 0o700
+    ):
+        raise RuntimeError("P8H_QA_DRIVER_STAGE_INVALID")
+    staged = stage_root / "c3_local_command_smoke.py"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(staged, flags, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(raw)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise RuntimeError("P8H_QA_DRIVER_STAGE_FAILED")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    _verified_qa_driver_bytes(staged, binding)
+    return staged, binding
+
+
+def _verified_qa_driver_bytes(path: Path, binding: Mapping[str, str]) -> bytes:
+    parent = path.parent.lstat()
+    if (
+        not stat.S_ISDIR(parent.st_mode) or stat.S_ISLNK(parent.st_mode)
+        or parent.st_uid != os.geteuid() or stat.S_IMODE(parent.st_mode) != 0o700
+    ):
+        raise RuntimeError("P8H_QA_DRIVER_STAGE_INVALID")
+    raw = _read_regular_file(path, MAX_QA_DRIVER_BYTES, "P8H_QA_DRIVER_STAGE_INVALID")
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+        raise RuntimeError("P8H_QA_DRIVER_STAGE_INVALID")
+    expected = {
+        "classification": QA_DRIVER_CLASSIFICATION,
+        "trusted_source_sha256": QA_DRIVER_SOURCE_SHA256,
+        "generated_sha256": binding.get("generated_sha256"),
+        "installed_bundle_digest": binding.get("installed_bundle_digest"),
+    }
+    if (
+        set(binding) != {*expected, "closure_digest"}
+        or any(re.fullmatch(r"[0-9a-f]{64}", str(expected[field])) is None for field in ("generated_sha256", "installed_bundle_digest"))
+        or hashlib.sha256(canonical(expected)).hexdigest() != binding.get("closure_digest")
+        or hashlib.sha256(raw).hexdigest() != expected["generated_sha256"]
+    ):
+        raise RuntimeError("P8H_QA_DRIVER_DIGEST_MISMATCH")
+    return raw
+
+
+class _PinnedSubprocess:
+    def __init__(self, raw: bytes):
+        self._encoded = base64.b64encode(raw).decode("ascii")
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(subprocess, name)
+
+    def Popen(self, argv: Any, *args: Any, **kwargs: Any) -> Any:
+        if (
+            isinstance(argv, list) and len(argv) >= 3
+            and argv[0] == os.sys.executable and "--fake" in argv
+        ):
+            bootstrap = (
+                "import base64,os;"
+                "raw=base64.b64decode(os.environ.pop('P8H_PINNED_QA_DRIVER'),validate=True);"
+                "scope={'__name__':'__main__','__file__':'<pinned-c3-qa-driver>',"
+                "'__package__':None};"
+                "exec(compile(raw,'<pinned-c3-qa-driver>','exec'),scope,scope)"
+            )
+            environment = dict(kwargs.get("env") or {})
+            environment["P8H_PINNED_QA_DRIVER"] = self._encoded
+            kwargs["env"] = environment
+            argv = [argv[0], "-I", "-B", "-c", bootstrap, *argv[2:]]
+        return subprocess.Popen(argv, *args, **kwargs)
+
+
+def _load_qa_driver(
+    path: Path, binding: Mapping[str, str], installed_bundle: Path,
+    expected_bundle_digest: str,
+) -> Any:
+    raw = _verified_qa_driver_bytes(path, binding)
+    installed_bundle = installed_bundle.resolve(strict=True)
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", expected_bundle_digest) is None
+        or installed_bundle.parent.name != "bundles"
+        or installed_bundle.name != expected_bundle_digest
+        or binding.get("installed_bundle_digest") != expected_bundle_digest
+    ):
+        raise RuntimeError("P8H_INSTALLED_BUNDLE_BINDING_INVALID")
+    installed_lib = (installed_bundle / "lib").resolve(strict=True)
+    name = "p8g_c3_" + str(binding["closure_digest"])[:16]
+    module = ModuleType(name)
+    module.__file__ = "<pinned-c3-qa-driver>"
+    module.__package__ = ""
+    previous_path = list(os.sys.path)
+    displaced = {
+        key: value for key, value in tuple(os.sys.modules.items())
+        if key == "nomad_web" or key.startswith("nomad_web.")
+    }
+    for key in displaced:
+        os.sys.modules.pop(key, None)
+    os.sys.path.insert(0, str(installed_lib))
+    previous_dont_write_bytecode = os.sys.dont_write_bytecode
+    os.sys.dont_write_bytecode = True
+    try:
+        exec(compile(raw, "<pinned-c3-qa-driver>", "exec"), module.__dict__, module.__dict__)
+    finally:
+        os.sys.dont_write_bytecode = previous_dont_write_bytecode
+        for key in tuple(os.sys.modules):
+            if key == "nomad_web" or key.startswith("nomad_web."):
+                os.sys.modules.pop(key, None)
+        os.sys.modules.update(displaced)
+        os.sys.path[:] = previous_path
+    module.subprocess = _PinnedSubprocess(raw)
+    return module
+
+
 def _facts_from_result(result: Any) -> dict[str, Any]:
     if not isinstance(result, dict):
         return {"result_type": type(result).__name__}
@@ -139,9 +338,9 @@ def _c3_projection(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def _run_a(bundle: Path, evidence: Path, parent_digest: str, tls_descriptors: tuple[int, int, int] | None = None) -> dict[str, Any]:
-    module = _load(ROOT / "testkit/remote-v2/run_m3e_product_slice.py", "p8g_m3e")
     if tls_descriptors is None:
         return _stage("A_remote_local_evidence", "NOT_RUN", "P8G_TLS_CONTROL_INPUT_REQUIRED", parent_evidence_digest=parent_digest)
+    module = _load(ROOT / "testkit/remote-v2/run_m3e_product_slice.py", "p8g_m3e")
     try:
         result = module.run_slice(bundle, evidence, False, False, parent_digest, tls_descriptors)
     except Exception as error:
@@ -151,44 +350,163 @@ def _run_a(bundle: Path, evidence: Path, parent_digest: str, tls_descriptors: tu
     return _stage("A_remote_local_evidence", "PASS", "M3E_REAL_PRODUCT_SLICE_PASS", result=_facts_from_result(result), parent_evidence_digest=parent_digest)
 
 
-def _run_b(bundle: Path, parent_digest: str) -> dict[str, Any]:
-    module = _load(ROOT / "testkit/browser/c3_local_command_smoke.py", "p8g_c3")
-    chrome = getattr(module, "CHROME", None)
-    if not isinstance(chrome, Path) or not chrome.is_file():
-        return _stage("B_c3_local", "NOT_RUN", "P8G_CHROME_NOT_AVAILABLE", parent_evidence_digest=parent_digest)
-    try:
-        result = module.run_smoke(60.0, chrome, bundle)
-    except Exception as error:
-        candidate = str(error).strip()
-        code = candidate if re.fullmatch(r"[A-Z][A-Z0-9_]+", candidate) else "P8G_C3_SMOKE_FAILED"
-        return _stage("B_c3_local", "BLOCK", code, error_type=type(error).__name__, error_message=error.args[0] if error.args and isinstance(error.args[0], str) and re.fullmatch(r"[A-Za-z0-9_ .:-]{1,160}", error.args[0]) else None, parent_evidence_digest=parent_digest)
-    required_actions = {"reply", "deny", "stop", "uncertainty"}
+def _exact_int(value: Any, expected: int | None = None, *, minimum: int | None = None) -> bool:
+    return (
+        type(value) is int
+        and (expected is None or value == expected)
+        and (minimum is None or value >= minimum)
+    )
+
+
+def _valid_c3_browser(value: Any) -> bool:
+    keys = {
+        "engine", "desktop", "mobile", "same_projection",
+        "desktop_screenshot_sha256", "mobile_screenshot_sha256",
+    }
+    return (
+        isinstance(value, dict) and set(value) == keys
+        and value.get("engine") == "Google Chrome headless via CDP"
+        and value.get("desktop") == "1440x900"
+        and value.get("mobile") == "390x844"
+        and value.get("same_projection") is True
+        and all(
+            isinstance(value.get(field), str)
+            and re.fullmatch(r"[0-9a-f]{64}", value[field]) is not None
+            for field in ("desktop_screenshot_sha256", "mobile_screenshot_sha256")
+        )
+    )
+
+
+def _valid_c3_actions(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != {"reply", "deny", "stop", "uncertainty"}:
+        return False
+    action_keys = {
+        "browser_path", "browser_requests", "browser_responses",
+        "posts", "replay_side_effects",
+    }
+    for name in ("reply", "deny", "stop"):
+        item = value.get(name)
+        if (
+            not isinstance(item, dict) or set(item) != action_keys
+            or item.get("browser_path") != "visible_control"
+            or not all(_exact_int(item.get(field), 1) for field in ("browser_requests", "browser_responses", "posts"))
+            or not _exact_int(item.get("replay_side_effects"), 0)
+        ):
+            return False
+    uncertainty = value.get("uncertainty")
+    return (
+        isinstance(uncertainty, dict)
+        and set(uncertainty) == {"status", "posts", "automatic_retries"}
+        and uncertainty.get("status") == "OutcomeUnknown"
+        and _exact_int(uncertainty.get("posts"), 1)
+        and _exact_int(uncertainty.get("automatic_retries"), 0)
+    )
+
+
+def _valid_sqlite_modes(value: Any) -> bool:
+    if not isinstance(value, dict) or len(value) != 6 or set(value.values()) != {"0600"}:
+        return False
+    command_bases = {
+        match.group(1)
+        for name in value
+        if (match := re.fullmatch(r"(command-[0-9a-f]{24}\.sqlite3)(?:-wal|-shm)?", name)) is not None
+    }
+    if len(command_bases) != 1:
+        return False
+    command = next(iter(command_bases))
+    return set(value) == {
+        command, command + "-wal", command + "-shm",
+        "gateway.sqlite3", "gateway.sqlite3-wal", "gateway.sqlite3-shm",
+    }
+
+
+def _valid_c3_containment(value: Any) -> bool:
+    keys = {
+        "fd_10_bootstrap", "fd_11_transport_key", "independent_keys",
+        "browser_has_no_uds", "gateway_browser_have_no_upstream_connection",
+        "uds_mode", "uds_parent_mode", "sqlite_modes",
+    }
+    return (
+        isinstance(value, dict) and set(value) == keys
+        and all(value.get(field) is True for field in (
+            "fd_10_bootstrap", "fd_11_transport_key", "independent_keys",
+            "browser_has_no_uds", "gateway_browser_have_no_upstream_connection",
+        ))
+        and value.get("uds_mode") == "0600"
+        and value.get("uds_parent_mode") == "0700"
+        and _valid_sqlite_modes(value.get("sqlite_modes"))
+    )
+
+
+def _valid_c3_result(result: Any) -> bool:
     required_component_keys = {"marker", "mechanical_e2", "provider_e3", "production_ready", "run_binding", "materialized_product_host", "materialized_gateway", "materialized_web", "fake_boundary", "browser", "actions", "fresh_five_route_reads", "privacy", "containment", "journal", "elapsed_seconds", "cleanup"}
-    valid = (
+    freshness = result.get("fresh_five_route_reads") if isinstance(result, dict) else None
+    journal = result.get("journal") if isinstance(result, dict) else None
+    elapsed = result.get("elapsed_seconds") if isinstance(result, dict) else None
+    return (
         isinstance(result, dict)
         and set(result) == required_component_keys
         and result.get("marker") == "C3_LOCAL_COMMAND_MECHANICAL_E2_PASS"
         and result.get("mechanical_e2") is True
         and result.get("provider_e3") is False
         and result.get("production_ready") is False
-        and isinstance(result.get("actions"), dict)
-        and set(result["actions"]) == required_actions
-        and result["actions"]["uncertainty"].get("status") == "OutcomeUnknown"
-        and result["actions"]["uncertainty"].get("posts") == 1
-        and result["actions"]["uncertainty"].get("automatic_retries") == 0
-        and all(result["actions"][name].get("browser_path") == "visible_control" for name in ("reply", "deny", "stop"))
-        and all(result["actions"][name].get("browser_requests") == 1 for name in ("reply", "deny", "stop"))
-        and all(result["actions"][name].get("browser_responses") == 1 for name in ("reply", "deny", "stop"))
-        and all(result["actions"][name].get("posts") == 1 for name in ("reply", "deny", "stop"))
-        and all(result["actions"][name].get("replay_side_effects") == 0 for name in ("reply", "deny", "stop"))
+        and isinstance(result.get("run_binding"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", result["run_binding"]) is not None
+        and result.get("fake_boundary") == "external_loopback_opencode_shape"
+        and _valid_c3_browser(result.get("browser"))
+        and _valid_c3_actions(result.get("actions"))
+        and isinstance(freshness, dict)
+        and set(freshness) == {"minimum_per_route"}
+        and _exact_int(freshness.get("minimum_per_route"), minimum=5)
         and result.get("cleanup") == {"processes": True, "ports": True, "uds": True, "journal": True, "gateway_db": True, "device_registry": True}
-        and result.get("materialized_product_host") is True and result.get("materialized_gateway") is True and result.get("materialized_web") is True
+        and all(type(item) is bool for item in result.get("cleanup", {}).values())
+        and result.get("materialized_product_host") is True
+        and result.get("materialized_gateway") is True
+        and result.get("materialized_web") is True
         and result.get("privacy") == {"browser": True, "logs": True, "persistent_sqlite": True, "argv": True}
-        and result.get("journal", {}).get("mode") == "wal" and result.get("journal", {}).get("synchronous") == "FULL"
+        and all(type(item) is bool for item in result.get("privacy", {}).values())
+        and _valid_c3_containment(result.get("containment"))
+        and isinstance(journal, dict)
+        and set(journal) == {"mode", "synchronous", "rows"}
+        and journal.get("mode") == "wal"
+        and journal.get("synchronous") == "FULL"
+        and _exact_int(journal.get("rows"), 4)
+        and type(elapsed) in {int, float}
+        and math.isfinite(elapsed) and elapsed >= 0
     )
-    if not valid:
-        return _stage("B_c3_local", "BLOCK", "P8G_C3_RESULT_CONTRACT_INVALID")
-    return _stage("B_c3_local", "PASS", "C3_LOCAL_COMMAND_MECHANICAL_E2_PASS", result=_c3_projection(result), parent_evidence_digest=parent_digest)
+
+
+def _run_b(
+    bundle: Path, bundle_digest: str, qa_driver: Path,
+    qa_driver_binding: Mapping[str, str], parent_digest: str,
+) -> dict[str, Any]:
+    try:
+        module = _load_qa_driver(
+            qa_driver, qa_driver_binding, bundle, bundle_digest,
+        )
+    except Exception as error:
+        return _stage(
+            "B_c3_local", "BLOCK",
+            _safe_code(error, "P8H_QA_DRIVER_LOAD_FAILED"),
+            error_type=type(error).__name__, parent_evidence_digest=parent_digest,
+            qa_driver=dict(qa_driver_binding),
+        )
+    chrome = getattr(module, "CHROME", None)
+    if not isinstance(chrome, Path) or not chrome.is_file():
+        return _stage(
+            "B_c3_local", "NOT_RUN", "P8G_CHROME_NOT_AVAILABLE",
+            parent_evidence_digest=parent_digest,
+            qa_driver=dict(qa_driver_binding),
+        )
+    try:
+        result = module.run_smoke(60.0, chrome, bundle)
+    except Exception as error:
+        candidate = str(error).strip()
+        code = candidate if re.fullmatch(r"[A-Z][A-Z0-9_]+", candidate) else "P8G_C3_SMOKE_FAILED"
+        return _stage("B_c3_local", "BLOCK", code, error_type=type(error).__name__, error_message=error.args[0] if error.args and isinstance(error.args[0], str) and re.fullmatch(r"[A-Za-z0-9_ .:-]{1,160}", error.args[0]) else None, parent_evidence_digest=parent_digest, qa_driver=dict(qa_driver_binding))
+    if not _valid_c3_result(result):
+        return _stage("B_c3_local", "BLOCK", "P8G_C3_RESULT_CONTRACT_INVALID", qa_driver=dict(qa_driver_binding))
+    return _stage("B_c3_local", "PASS", "C3_LOCAL_COMMAND_MECHANICAL_E2_PASS", result=_c3_projection(result), parent_evidence_digest=parent_digest, qa_driver=dict(qa_driver_binding))
 
 
 def _config(home: Path, repo: Path) -> Any:
@@ -238,6 +556,19 @@ def _installed_json(
 ) -> dict[str, Any]:
     result = _run_process([str(launcher), "--json", *arguments], cwd)
     if result.returncode != expected_exit:
+        try:
+            failure = json.loads(result.stdout, object_pairs_hook=_unique_object)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            failure = None
+        if (
+            isinstance(failure, dict)
+            and failure.get("schema") == "nomad.web-companion.error.v1"
+            and failure.get("state") == "BLOCKED"
+            and failure.get("production_ready") is False
+            and isinstance(failure.get("error"), str)
+            and re.fullmatch(r"[A-Z][A-Z0-9_]{2,95}", failure["error"])
+        ):
+            raise RuntimeError(failure["error"])
         raise RuntimeError("P8H_INSTALLED_CLI_EXIT_INVALID")
     if result.stderr != b"" or not 0 < len(result.stdout) <= MAX_CLI_OUTPUT_BYTES:
         raise RuntimeError("P8H_INSTALLED_CLI_OUTPUT_INVALID")
@@ -366,6 +697,8 @@ def _run_c_install(bundle: Path, home: Path, repo: Path) -> tuple[Path | None, P
         selected = (home / "bundles" / installed_digest).resolve(strict=True)
         if selected.parent != (home / "bundles").resolve(strict=True):
             raise RuntimeError("P8G_INSTALL_PATH_INVALID")
+        if _bundle_digest(selected) != installed_digest:
+            raise RuntimeError("P8G_INSTALLED_BUNDLE_VERIFY_FAILED")
         stable = home / "bin" / "nomad-web"
         stable_info = stable.lstat()
         if (not stat.S_ISREG(stable_info.st_mode) or stat.S_ISLNK(stable_info.st_mode)
@@ -480,10 +813,20 @@ def run_journey(bundle: Path, *, repo: Path = ROOT, work_root: Path | None = Non
         install_source = root / "install-source"
         shutil.copytree(bundle, install_source, copy_function=shutil.copy2)
         selected_bundle, stable_launcher, lifecycle_stages = _run_c_install(install_source, home, repo)
+        qa_driver: Path | None = None
+        qa_driver_binding: dict[str, str] | None = None
+        if selected_bundle is not None:
+            if selected_bundle.name != source_bundle_digest:
+                raise RuntimeError("P8H_INSTALLED_BUNDLE_BINDING_INVALID")
+            qa_driver, qa_driver_binding = _stage_qa_driver(
+                repo / "testkit/browser/c3_local_command_smoke.py",
+                root / "qa-driver", selected_bundle, source_bundle_digest,
+            )
         shutil.rmtree(install_source)
         if selected_bundle is not None and stable_launcher is not None:
             _run_c_installed_prepare(stable_launcher, selected_bundle, install_source, runtime_cwd, lifecycle_stages)
-        b_stage = (_run_b(selected_bundle, parent_digest) if selected_bundle is not None
+        b_stage = (_run_b(selected_bundle, source_bundle_digest, qa_driver, qa_driver_binding, parent_digest)
+                   if selected_bundle is not None and qa_driver is not None and qa_driver_binding is not None
                    else _stage("B_c3_local", "NOT_RUN", "P8G_INSTALLED_BUNDLE_REQUIRED", parent_evidence_digest=parent_digest))
         a_stage = _run_a(selected_bundle or bundle, root / "a.json", parent_digest)
         c_stage = (_run_c_cleanup(stable_launcher, selected_bundle, home, runtime_cwd, root, lifecycle_stages)

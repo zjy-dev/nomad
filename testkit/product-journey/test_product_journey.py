@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import importlib.util
 import json
 import os
@@ -53,28 +54,191 @@ class ProductJourneyTests(unittest.TestCase):
             "run_binding": "a" * 64,
             "materialized_product_host": True, "materialized_gateway": True, "materialized_web": True,
             "fake_boundary": "external_loopback_opencode_shape",
-            "browser": {"engine": "Google Chrome headless via CDP", "desktop": "1440x900", "mobile": "390x844", "same_projection": True},
+            "browser": {"engine": "Google Chrome headless via CDP", "desktop": "1440x900", "mobile": "390x844", "same_projection": True, "desktop_screenshot_sha256": "b" * 64, "mobile_screenshot_sha256": "c" * 64},
             "actions": actions,
             "fresh_five_route_reads": {"minimum_per_route": 5},
             "privacy": {"browser": True, "logs": True, "persistent_sqlite": True, "argv": True},
-            "containment": {"fd_10_bootstrap": True, "fd_11_transport_key": True, "independent_keys": True, "browser_has_no_uds": True, "gateway_browser_have_no_upstream_connection": True, "uds_mode": "0600", "uds_parent_mode": "0700", "sqlite_modes": {}},
+            "containment": {"fd_10_bootstrap": True, "fd_11_transport_key": True, "independent_keys": True, "browser_has_no_uds": True, "gateway_browser_have_no_upstream_connection": True, "uds_mode": "0600", "uds_parent_mode": "0700", "sqlite_modes": {"command-1234567890abcdef12345678.sqlite3": "0600", "command-1234567890abcdef12345678.sqlite3-wal": "0600", "command-1234567890abcdef12345678.sqlite3-shm": "0600", "gateway.sqlite3": "0600", "gateway.sqlite3-wal": "0600", "gateway.sqlite3-shm": "0600"}},
             "journal": {"mode": "wal", "synchronous": "FULL", "rows": 4},
             "elapsed_seconds": 0.1,
             "cleanup": {"processes": True, "ports": True, "uds": True,
                          "journal": True, "gateway_db": True, "device_registry": True},
         }
 
+    def _qa_binding(self, bundle_digest: str = "c" * 64) -> dict[str, str]:
+        core = {
+            "classification": runner.QA_DRIVER_CLASSIFICATION,
+            "trusted_source_sha256": runner.QA_DRIVER_SOURCE_SHA256,
+            "generated_sha256": "a" * 64,
+            "installed_bundle_digest": bundle_digest,
+        }
+        return {**core, "closure_digest": runner.hashlib.sha256(runner.canonical(core)).hexdigest()}
+
     def test_c3_parser_requires_exact_contract(self):
         fake_module = SimpleNamespace(CHROME=Path(__file__), run_smoke=mock.Mock(return_value=self._c3_result()))
-        with mock.patch.object(runner, "_load", return_value=fake_module):
-            result = runner._run_b(Path("/installed"), "sha256:" + "b" * 64)
+        with mock.patch.object(runner, "_load_qa_driver", return_value=fake_module):
+            result = runner._run_b(Path("/installed"), "c" * 64, Path("/staged-driver"), self._qa_binding(), "sha256:" + "b" * 64)
         self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["facts"]["qa_driver"], self._qa_binding())
         invalid = self._c3_result()
         invalid["cleanup"]["ports"] = False
         fake_module.run_smoke.return_value = invalid
-        with mock.patch.object(runner, "_load", return_value=fake_module):
-            result = runner._run_b(Path("/installed"), "sha256:" + "b" * 64)
+        with mock.patch.object(runner, "_load_qa_driver", return_value=fake_module):
+            result = runner._run_b(Path("/installed"), "c" * 64, Path("/staged-driver"), self._qa_binding(), "sha256:" + "b" * 64)
         self.assertEqual(result["code"], "P8G_C3_RESULT_CONTRACT_INVALID")
+
+    def test_c3_parser_table_driven_strict_shape_mutations_block(self):
+        def replace(path: tuple[str, ...], value: object):
+            def mutate(result: dict) -> None:
+                target = result
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = value
+            return mutate
+
+        def remove(path: tuple[str, ...]):
+            def mutate(result: dict) -> None:
+                target = result
+                for key in path[:-1]:
+                    target = target[key]
+                del target[path[-1]]
+            return mutate
+
+        cases = {
+            "run-binding-short": replace(("run_binding",), "a" * 63),
+            "run-binding-uppercase": replace(("run_binding",), "A" * 64),
+            "fake-boundary": replace(("fake_boundary",), "other"),
+            "browser-extra-key": replace(("browser", "unexpected"), True),
+            "browser-engine": replace(("browser", "engine"), "Chrome"),
+            "browser-desktop-size": replace(("browser", "desktop"), "1x1"),
+            "browser-mobile-size": replace(("browser", "mobile"), "1x1"),
+            "browser-same-projection-type": replace(("browser", "same_projection"), 1),
+            "browser-screenshot": replace(("browser", "desktop_screenshot_sha256"), "A" * 64),
+            "freshness-extra-key": replace(("fresh_five_route_reads", "route"), 5),
+            "freshness-below-five": replace(("fresh_five_route_reads", "minimum_per_route"), 4),
+            "freshness-bool": replace(("fresh_five_route_reads", "minimum_per_route"), True),
+            "containment-missing-key": remove(("containment", "fd_10_bootstrap")),
+            "containment-non-bool": replace(("containment", "independent_keys"), 1),
+            "containment-uds-mode": replace(("containment", "uds_mode"), "0644"),
+            "containment-parent-mode": replace(("containment", "uds_parent_mode"), "0755"),
+            "sqlite-file-set": remove(("containment", "sqlite_modes", "gateway.sqlite3-shm")),
+            "sqlite-mode": replace(("containment", "sqlite_modes", "gateway.sqlite3"), "0644"),
+            "journal-extra-key": replace(("journal", "unexpected"), True),
+            "journal-mode": replace(("journal", "mode"), "delete"),
+            "journal-synchronous": replace(("journal", "synchronous"), "NORMAL"),
+            "journal-rows": replace(("journal", "rows"), 3),
+            "journal-rows-bool": replace(("journal", "rows"), True),
+            "elapsed-negative": replace(("elapsed_seconds",), -0.1),
+            "elapsed-nan": replace(("elapsed_seconds",), float("nan")),
+            "elapsed-bool": replace(("elapsed_seconds",), True),
+        }
+        fake_module = SimpleNamespace(CHROME=Path(__file__), run_smoke=mock.Mock())
+        for name, mutate in cases.items():
+            invalid = copy.deepcopy(self._c3_result())
+            mutate(invalid)
+            fake_module.run_smoke.return_value = invalid
+            with self.subTest(name=name), mock.patch.object(
+                runner, "_load_qa_driver", return_value=fake_module,
+            ):
+                stage = runner._run_b(
+                    Path("/installed"), "c" * 64, Path("/staged-driver"),
+                    self._qa_binding(), "sha256:" + "b" * 64,
+                )
+            self.assertEqual(stage["status"], "BLOCK", name)
+            self.assertEqual(stage["code"], "P8G_C3_RESULT_CONTRACT_INVALID", name)
+
+    def test_staged_qa_driver_is_hash_pinned_and_repo_source_independent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            installed = root / "home" / "bundles" / ("c" * 64)
+            package = installed / "lib" / "nomad_web"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            (package / "processes.py").write_text("ORIGIN = 'installed'\n", encoding="utf-8")
+            (package / "launcher.py").write_text(
+                "_bootstrap_host = object()\n"
+                "_cleanup_product_host_socket = object()\n"
+                "_random_command_key = object()\n"
+                "_spawn_product_host = object()\n"
+                "_write_fd_secret = object()\n", encoding="utf-8",
+            )
+            (package / "materialize.py").write_text("materialize = object()\n", encoding="utf-8")
+            source = repo / "testkit" / "browser" / "c3_local_command_smoke.py"
+            source.parent.mkdir(parents=True)
+            source_raw = (
+                "from pathlib import Path\n"
+                "import sys\n"
+                "REPO = Path(__file__).resolve().parents[2]\n"
+                "if __package__ in (None, \"\"):\n"
+                "    sys.path.insert(0, str(REPO))\n"
+                "from tools.nomad_web import processes\n"
+                "from tools.nomad_web.launcher import (\n"
+                "    _bootstrap_host, _cleanup_product_host_socket,\n"
+                "    _random_command_key, _spawn_product_host, _write_fd_secret,\n"
+                ")\n"
+                "from tools.nomad_web.materialize import materialize\n"
+                "IMPORT_ORIGIN = processes.ORIGIN\n"
+                f"CHROME = Path({str(runner.CHROME)!r})\n"
+                f"def run_smoke(timeout, chrome, bundle): return {self._c3_result()!r}\n"
+            )
+            source.write_text(source_raw, encoding="utf-8")
+            trusted = runner.hashlib.sha256(source_raw.encode()).hexdigest()
+            with mock.patch.object(runner, "QA_DRIVER_SOURCE_SHA256", trusted):
+                staged, binding = runner._stage_qa_driver(
+                    source, root / "owned-stage", installed, installed.name,
+                )
+            staged_raw = staged.read_bytes()
+            self.assertNotIn(str(repo).encode(), staged_raw)
+            self.assertNotIn(b"from tools.nomad_web", staged_raw)
+            with mock.patch.object(runner, "QA_DRIVER_SOURCE_SHA256", trusted):
+                loaded = runner._load_qa_driver(staged, binding, installed, installed.name)
+            self.assertEqual(loaded.IMPORT_ORIGIN, "installed")
+
+            source.write_text("raise RuntimeError('MUTATED_REPO_DRIVER_USED')\n", encoding="utf-8")
+            with mock.patch.object(runner, "QA_DRIVER_SOURCE_SHA256", trusted):
+                mutated = runner._run_b(
+                    installed, installed.name, staged, binding,
+                    "sha256:" + "b" * 64,
+                )
+                source.unlink()
+                removed = runner._run_b(
+                    installed, installed.name, staged, binding,
+                    "sha256:" + "b" * 64,
+                )
+
+            self.assertEqual(mutated["status"], "PASS")
+            self.assertEqual(removed["status"], "PASS")
+            self.assertEqual(staged.read_bytes(), staged_raw)
+            self.assertEqual(binding["generated_sha256"], runner.hashlib.sha256(staged_raw).hexdigest())
+            self.assertEqual(staged.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(staged.parent.stat().st_mode & 0o777, 0o700)
+            staged.write_text("tampered\n", encoding="utf-8")
+            with mock.patch.object(runner, "QA_DRIVER_SOURCE_SHA256", trusted):
+                blocked = runner._run_b(
+                    installed, installed.name, staged, binding,
+                    "sha256:" + "b" * 64,
+                )
+            self.assertEqual(blocked["code"], "P8H_QA_DRIVER_DIGEST_MISMATCH")
+            staged.unlink()
+            symlink_target = root / "symlink-target.py"
+            symlink_target.write_bytes(staged_raw)
+            staged.symlink_to(symlink_target)
+            with mock.patch.object(runner, "QA_DRIVER_SOURCE_SHA256", trusted):
+                symlinked = runner._run_b(
+                    installed, installed.name, staged, binding,
+                    "sha256:" + "b" * 64,
+                )
+            self.assertEqual(symlinked["code"], "P8H_QA_DRIVER_STAGE_INVALID")
+
+    def test_a_without_tls_does_not_import_repo_runner(self):
+        with mock.patch.object(runner, "_load", side_effect=AssertionError("repo import")):
+            result = runner._run_a(
+                Path("/installed"), Path("/evidence"),
+                "sha256:" + "b" * 64,
+            )
+        self.assertEqual(result["status"], "NOT_RUN")
+        self.assertEqual(result["code"], "P8G_TLS_CONTROL_INPUT_REQUIRED")
 
     def test_installed_cli_parser_requires_exit_canonical_json_and_clean_launch(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -105,9 +269,9 @@ class ProductJourneyTests(unittest.TestCase):
             c = {"name": "C_lifecycle", "status": "PASS", "code": "LIFECYCLE_COMPLETE", "facts": {}}
             b = {"name": "B_c3_local", "status": "PASS", "code": "C3_LOCAL_COMMAND_MECHANICAL_E2_PASS", "facts": {}}
             a = {"name": "A_real_product", "status": "NOT_RUN", "code": "P8G_TLS_CONTROL_INPUT_REQUIRED", "facts": {}}
-            selected = root / "selected"
+            selected = root / ("a" * 64)
             stable = root / "stable"
-            with mock.patch.object(runner, "_run_c_install", return_value=(selected, stable, [])), mock.patch.object(runner, "_run_c_installed_prepare"), mock.patch.object(runner, "_run_b", return_value=b), mock.patch.object(runner, "_run_a", return_value=a), mock.patch.object(runner, "_run_c_cleanup", return_value=c), mock.patch.object(runner, "_bundle_digest", return_value="a" * 64):
+            with mock.patch.object(runner, "_run_c_install", return_value=(selected, stable, [])), mock.patch.object(runner, "_stage_qa_driver", return_value=(root / "qa", self._qa_binding("a" * 64))), mock.patch.object(runner, "_run_c_installed_prepare"), mock.patch.object(runner, "_run_b", return_value=b), mock.patch.object(runner, "_run_a", return_value=a), mock.patch.object(runner, "_run_c_cleanup", return_value=c), mock.patch.object(runner, "_bundle_digest", return_value="a" * 64):
                 result = runner.run_journey(source, work_root=root / "work")
         self.assertEqual(result["repo_owned_status"], "PASS")
         self.assertEqual(result["external_readiness"], "NOT_RUN")

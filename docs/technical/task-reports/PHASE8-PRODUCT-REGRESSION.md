@@ -13,8 +13,11 @@ external readiness claim.
 ## Installed journey contract
 
 The source runner verifies and installs an owned copy of the candidate once.
-It then removes that source-bundle copy before the lifecycle continues. From
-that point, C runs only the canonical installed launcher at
+Before deleting that source-bundle copy, it also snapshots the external C3 QA
+driver into a private mode-0700 staging directory, rewrites only the driver's
+Nomad imports to the exact installed bundle, and pins the resulting mode-0600
+bytes by SHA-256. It then removes the source-bundle copy before the lifecycle continues.
+From that point, C runs only the canonical installed launcher at
 `$NOMAD_WEB_HOME/bin/nomad-web --json` from a mode-0700 working directory
 outside the repository and with a clean environment that contains no
 `PYTHONPATH`, `PYTHONHOME`, or `NOMAD_WEB_BUNDLE`.
@@ -41,7 +44,18 @@ longer exist.
 
 B continues to run the exact installed bundle through C3, covering the
 materialized Product Host, Gateway, Web app, browser-visible reply/deny/Stop,
-idempotency, and OutcomeUnknown behavior. A remains internal remote-local
+idempotency, and OutcomeUnknown behavior. At action time B verifies and loads
+only the staged hash-pinned QA driver, so later mutation or removal of the
+repo-local `c3_local_command_smoke.py` cannot change the run. The parent executes
+the already-verified bytes with `compile/exec`; its fake child receives those
+same bytes through an isolated bootstrap, closing verify-then-reopen races. A
+symlink or byte change at the staged pathname fails closed before loading. B
+also binds the selected `home/bundles/<digest>` path to the source candidate
+digest. B evidence records only the driver SHA-256 and its fixed classification
+`external-qa-not-shipped-product-closure`. The QA driver executes its pinned
+orchestration bytes and imports Nomad modules only from the exact installed
+bundle `lib`; it has no action-time repo QA-helper import. It is deliberately not included in, or
+represented as part of, the shipped product bundle closure. A remains internal remote-local
 evidence; without operator-owned TLS descriptors it is explicitly
 `NOT_RUN/P8G_TLS_CONTROL_INPUT_REQUIRED`. Provider E3 is a separate
 `NOT_RUN/PROVIDER_E3_EVIDENCE_NOT_RUN` gate.
@@ -53,13 +67,20 @@ modified.
 
 ## Executed evidence
 
-- Final product-journey suite: 8/8 PASS. The suite includes a real materialized
+- Final product-journey suite: 11/11 PASS. The suite includes a real materialized
   candidate, first install, source-copy removal, exact installed C3, canonical
   launcher lifecycle, installed diagnostics verification, uninstall, and no
   owned HOME residue.
 - Focused parser and contract tests cover noncanonical output, exit mismatch,
-  fixed external fields, expected missing-credential block, evidence mode, and
-  non-overwrite behavior.
+  fixed external fields, expected missing-credential block, evidence mode,
+  non-overwrite behavior, staged-driver hash drift, and independence from later
+  repo-driver mutation or removal, symlink rejection, and no-TLS A short-circuit
+  before repo-runner import.
+- The table-driven C3 parser regression mutates run binding, fake-boundary,
+  browser shape and digests, freshness count/type, containment flags and modes,
+  exact SQLite file set, journal fields, and elapsed time. Every mutation is
+  rejected with `P8G_C3_RESULT_CONTRACT_INVALID`; the evidence projection was
+  not weakened.
 
 These results do not satisfy real Provider E3, physical iPhone Safari, a
 clean-machine install, Developer ID signing, Apple notarization, or publication
