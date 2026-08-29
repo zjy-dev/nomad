@@ -1,26 +1,66 @@
-# Phase 8 Product Regression (P8-G)
+# Phase 8 Final Installed Product Regression (P8-H4)
 
 ## Verdict
 
-The journey harness is mechanical-local-non-provider regression coverage only. `repo_owned_status` and the compatibility `status` are PASS only when the lifecycle-owned checks and B C3 pass: install, onboarding, C3, diagnostics, reset, uninstall, and no owned residue. A is an external-readiness subjourney and is reported separately as `external_readiness` (`NOT_RUN` or `BLOCK` when TLS/identity control input is unavailable); it does not make the repo-owned status fail. The record always emits `production_ready: false`; external gates are explicitly `NOT_RUN`.
+The final repo-owned installed journey passes from the exact installed bundle.
+This is mechanical local evidence, not an external-readiness or production
+release verdict. `status` is only a compatibility alias of
+`repo_owned_status`; `external_readiness` is fixed to `NOT_RUN`, all six
+external gates are `NOT_RUN`, and `production_ready` is false. Internal A
+evidence is named `remote_local_evidence_status` and is not promoted into an
+external readiness claim.
 
-## Scope
+## Installed journey contract
 
-The runner installs a verified bundle first, resolves the canonical selected path under the isolated HOME, and composes three subjourneys in order: B uses `c3_local_command_smoke.py` against that installed path and validates its exact mechanical marker/action/cleanup contract; A remains `NOT_RUN` unless the M3-E API receives operator-owned TLS descriptors in a controlled invocation; C completes diagnostics, reset, uninstall, and residue verification.
+The source runner verifies and installs an owned copy of the candidate once.
+It then removes that source-bundle copy before the lifecycle continues. From
+that point, C runs only the canonical installed launcher at
+`$NOMAD_WEB_HOME/bin/nomad-web --json` from a mode-0700 working directory
+outside the repository and with a clean environment that contains no
+`PYTHONPATH`, `PYTHONHOME`, or `NOMAD_WEB_BUNDLE`.
 
-Missing Chrome/TLS/identity/helper prerequisites are BLOCK or NOT_RUN. Symbol existence and directory acceptance are never PASS. Evidence is canonical, content-free, mode 0600, atomically created with exclusive non-overwriting publication.
+The installed command sequence is:
 
-Provider credentials are outside this harness. Real Provider E3 remains `NOT_RUN`; no credential, session content, raw process output, or protected transcript is included in evidence.
+1. `install-status`
+2. `onboarding`
+3. `start --provider OPENAI_API_KEY --workspace <outside-repo-cwd>` without
+   `--credential-stdin`, which must deterministically return exit 1 and the
+   content-free `AGENT_START_INPUTS_INCOMPLETE` error; this is recorded as
+   `expected_block=true`, not as a failed stage or Provider E3 evidence
+4. `diagnostics --output <mode-0700-parent>/support.json`
+5. `reset-remote-access --confirm`
+6. `uninstall --confirm`
+
+Every installed CLI result must have the exact expected exit status, empty
+stderr, duplicate-key-free canonical JSON, the frozen schema and safe fields.
+The diagnostics export must be canonical mode-0600 JSON and is verified through
+`diagnostics.verify` loaded from the exact installed content-addressed bundle.
+Verification occurs before uninstall; after uninstall the harness does not call
+the removed launcher and only asserts that the launcher and owned HOME no
+longer exist.
+
+B continues to run the exact installed bundle through C3, covering the
+materialized Product Host, Gateway, Web app, browser-visible reply/deny/Stop,
+idempotency, and OutcomeUnknown behavior. A remains internal remote-local
+evidence; without operator-owned TLS descriptors it is explicitly
+`NOT_RUN/P8G_TLS_CONTROL_INPUT_REQUIRED`. Provider E3 is a separate
+`NOT_RUN/PROVIDER_E3_EVIDENCE_NOT_RUN` gate.
+
+No command result, parent evidence, or diagnostic record contains Provider
+credentials, raw prompt or response bodies, bearer values, browser storage, or
+raw logs. The protected process-loop transcript is not read, diffed, or
+modified.
 
 ## Executed evidence
 
-- Focused passive-CDP browser tests: 4/4 PASS, including rejection of duplicate browser POST observations without wrapping or delaying the page's fetch implementation.
-- Consecutive final passive-CDP real C3 runs: 2/2 PASS. Each run used the materialized Product Host, Gateway, Web bundle, headless Chrome, and a separate deterministic OpenCode-shape process. Each observed exactly one browser request, one browser response, and one upstream side effect for `reply`, `deny`, and `Stop`; the forced-uncertainty request had one upstream post and zero automatic retries.
-- Product journey tests: 7/7 PASS, including a real verified install and complete lifecycle cleanup with no owned HOME residue.
-- Launcher and C3 focused regression: 26/26 PASS.
+- Final product-journey suite: 8/8 PASS. The suite includes a real materialized
+  candidate, first install, source-copy removal, exact installed C3, canonical
+  launcher lifecycle, installed diagnostics verification, uninstall, and no
+  owned HOME residue.
+- Focused parser and contract tests cover noncanonical output, exit mismatch,
+  fixed external fields, expected missing-credential block, evidence mode, and
+  non-overwrite behavior.
 
-These results are E2 mechanical evidence. They do not satisfy Provider E3, physical-phone, clean-machine, signing, notarization, or publication gates.
-
-## Required future proof
-
-To upgrade product readiness, execute Provider E3 against an official Agent child, physical-phone Safari, clean-machine installation, and the signed/notarized publication chain while preserving the content-free evidence contract.
+These results do not satisfy real Provider E3, physical iPhone Safari, a
+clean-machine install, Developer ID signing, Apple notarization, or publication
+provenance. Those gates remain `NOT_RUN`.

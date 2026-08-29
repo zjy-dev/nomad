@@ -8,7 +8,10 @@ import importlib.util
 import json
 import os
 import re
+import shutil
+import signal
 import stat
+import subprocess
 import tempfile
 import uuid
 from pathlib import Path
@@ -22,7 +25,25 @@ EXTERNAL_GATES = (
     "CLEAN_MACHINE_INSTALL_NOT_RUN", "DEVELOPER_ID_SIGNING_NOT_RUN",
     "APPLE_NOTARIZATION_NOT_RUN", "PUBLICATION_PROVENANCE_NOT_RUN",
 )
-REQUIRED = ("A_real_product", "B_c3_local", "C_lifecycle")
+REQUIRED = ("A_remote_local_evidence", "B_c3_local", "C_lifecycle")
+MAX_CLI_OUTPUT_BYTES = 4 * 1024 * 1024
+ONBOARDING_STATES = {
+    "NOT_INSTALLED", "INSTALLED_NEEDS_START",
+    "INSTALLED_BLOCKED_HOST_IDENTITY", "RUNNING_NEEDS_PAIRING",
+    "RUNNING_PAIRED", "RUNNING_DEGRADED_RECOVERY_REQUIRED",
+}
+ONBOARDING_KEYS = {
+    "schema", "state", "production_ready", "external_readiness",
+    "external_gates", "installed_bundle_digest", "install_sequence",
+    "run_identity", "paired_device_commitment", "pairing_epoch",
+    "blockers", "next_action",
+}
+HOST_IDENTITY_BLOCKERS = {
+    "HOST_IDENTITY_AUTH_REQUIRED", "HOST_IDENTITY_USER_DENIED",
+    "HOST_IDENTITY_KEYCHAIN_LOCKED", "HOST_IDENTITY_CORRUPT",
+    "HOST_IDENTITY_UNAVAILABLE", "HOST_IDENTITY_PREFLIGHT_INVALID",
+    "HOST_IDENTITY_PREFLIGHT_TIMEOUT", "HOST_IDENTITY_PREFLIGHT_FAILED",
+}
 
 
 def canonical(value: Any) -> bytes:
@@ -120,14 +141,14 @@ def _c3_projection(result: dict[str, Any]) -> dict[str, Any]:
 def _run_a(bundle: Path, evidence: Path, parent_digest: str, tls_descriptors: tuple[int, int, int] | None = None) -> dict[str, Any]:
     module = _load(ROOT / "testkit/remote-v2/run_m3e_product_slice.py", "p8g_m3e")
     if tls_descriptors is None:
-        return _stage("A_real_product", "NOT_RUN", "P8G_TLS_CONTROL_INPUT_REQUIRED", parent_evidence_digest=parent_digest)
+        return _stage("A_remote_local_evidence", "NOT_RUN", "P8G_TLS_CONTROL_INPUT_REQUIRED", parent_evidence_digest=parent_digest)
     try:
         result = module.run_slice(bundle, evidence, False, False, parent_digest, tls_descriptors)
     except Exception as error:
-        return _stage("A_real_product", "BLOCK", str(error) if str(error).isupper() else "P8G_M3E_RUN_FAILED", error_type=type(error).__name__)
+        return _stage("A_remote_local_evidence", "BLOCK", str(error) if str(error).isupper() else "P8G_M3E_RUN_FAILED", error_type=type(error).__name__)
     if not isinstance(result, dict) or result.get("marker") != "M3E_REAL_PRODUCT_SLICE_PASS" or result.get("production_ready") is not False:
-        return _stage("A_real_product", "BLOCK", "P8G_M3E_RESULT_CONTRACT_INVALID", result=_facts_from_result(result))
-    return _stage("A_real_product", "PASS", "M3E_REAL_PRODUCT_SLICE_PASS", result=_facts_from_result(result), parent_evidence_digest=parent_digest)
+        return _stage("A_remote_local_evidence", "BLOCK", "P8G_M3E_RESULT_CONTRACT_INVALID", result=_facts_from_result(result))
+    return _stage("A_remote_local_evidence", "PASS", "M3E_REAL_PRODUCT_SLICE_PASS", result=_facts_from_result(result), parent_evidence_digest=parent_digest)
 
 
 def _run_b(bundle: Path, parent_digest: str) -> dict[str, Any]:
@@ -176,11 +197,167 @@ def _config(home: Path, repo: Path) -> Any:
                            relay_device_v2_port=18091, relay_admin_port=18092, relay_device_v1_port=18093)
 
 
-def _run_c_prepare(bundle: Path, home: Path, repo: Path) -> tuple[Any, Path | None, list[dict[str, Any]]]:
+def _safe_code(error: Exception, fallback: str) -> str:
+    candidate = str(error).strip()
+    return candidate if re.fullmatch(r"[A-Z][A-Z0-9_]{2,95}", candidate) else fallback
+
+
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON key")
+        value[key] = item
+    return value
+
+
+def _clean_cli_environment() -> dict[str, str]:
+    return {
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "LANG": "C",
+        "LC_ALL": "C",
+    }
+
+
+def _run_process(argv: list[str], cwd: Path, *, timeout: float = 60.0) -> subprocess.CompletedProcess[bytes]:
+    process = subprocess.Popen(
+        argv, cwd=cwd, env=_clean_cli_environment(), stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.communicate()
+        raise RuntimeError("P8H_INSTALLED_CLI_TIMEOUT")
+    return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+
+
+def _installed_json(
+    launcher: Path, cwd: Path, arguments: tuple[str, ...], *, expected_exit: int = 0,
+) -> dict[str, Any]:
+    result = _run_process([str(launcher), "--json", *arguments], cwd)
+    if result.returncode != expected_exit:
+        raise RuntimeError("P8H_INSTALLED_CLI_EXIT_INVALID")
+    if result.stderr != b"" or not 0 < len(result.stdout) <= MAX_CLI_OUTPUT_BYTES:
+        raise RuntimeError("P8H_INSTALLED_CLI_OUTPUT_INVALID")
+    try:
+        value = json.loads(result.stdout, object_pairs_hook=_unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise RuntimeError("P8H_INSTALLED_CLI_JSON_INVALID") from error
+    if not isinstance(value, dict) or result.stdout != canonical(value):
+        raise RuntimeError("P8H_INSTALLED_CLI_NONCANONICAL")
+    return value
+
+
+def _external_gates(value: Any) -> bool:
+    return value == [{"code": code, "status": "NOT_RUN"} for code in EXTERNAL_GATES]
+
+
+def _fixed_external_gates() -> list[dict[str, str]]:
+    return [{"code": code, "status": "NOT_RUN"} for code in EXTERNAL_GATES]
+
+
+def _blocked_result(code: str) -> dict[str, Any]:
+    return {
+        "schema": SCHEMA, "status": "BLOCK",
+        "repo_owned_status": "BLOCK",
+        "remote_local_evidence_status": "NOT_RUN",
+        "external_readiness": "NOT_RUN",
+        "provider_e3": {
+            "status": "NOT_RUN", "code": "PROVIDER_E3_EVIDENCE_NOT_RUN",
+        },
+        "classification": "mechanical-local-non-provider",
+        "production_ready": False, "code": code,
+        "external_gates": _fixed_external_gates(),
+        "privacy": {
+            "content_free": True, "raw_output_included": False,
+            "credential_values_inspected": False,
+            "protected_transcript_accessed": False,
+        },
+    }
+
+
+def _validate_onboarding(value: Any, installed_digest: str) -> dict[str, Any]:
+    state = value.get("state") if isinstance(value, dict) else None
+    blockers = value.get("blockers") if isinstance(value, dict) else None
+    next_action = value.get("next_action") if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict) or set(value) != ONBOARDING_KEYS
+        or value.get("schema") != "nomad.web-companion.onboarding.v1"
+        or state not in ONBOARDING_STATES
+        or state not in {"INSTALLED_NEEDS_START", "INSTALLED_BLOCKED_HOST_IDENTITY"}
+        or value.get("production_ready") is not False
+        or value.get("external_readiness") != "NOT_RUN"
+        or not _external_gates(value.get("external_gates"))
+        or value.get("installed_bundle_digest") != installed_digest
+        or value.get("install_sequence") != 1
+        or any(value.get(field) is not None for field in ("run_identity", "paired_device_commitment", "pairing_epoch"))
+        or not isinstance(blockers, list)
+        or (state == "INSTALLED_NEEDS_START" and (blockers != [] or next_action != "START_INSTALLED_BUNDLE"))
+        or (state == "INSTALLED_BLOCKED_HOST_IDENTITY" and (len(blockers) != 1 or blockers[0] not in HOST_IDENTITY_BLOCKERS or next_action != "AUTHORIZE_HOST_IDENTITY"))
+    ):
+        raise RuntimeError("P8H_ONBOARDING_SCHEMA_INVALID")
+    return value
+
+
+def _validate_install_status(value: Any, installed_digest: str) -> dict[str, Any]:
+    keys = {"schema", "state", "current_bundle_digest", "bundle_digests", "history", "onboarding"}
+    if (
+        not isinstance(value, dict) or set(value) != keys
+        or value.get("schema") != "nomad.web-companion.install-status.v1"
+        or value.get("state") != "INSTALLED"
+        or value.get("current_bundle_digest") != installed_digest
+        or value.get("bundle_digests") != [installed_digest]
+        or not isinstance(value.get("history"), list) or len(value["history"]) != 1
+    ):
+        raise RuntimeError("P8H_INSTALL_STATUS_SCHEMA_INVALID")
+    entry = value["history"][0]
+    if (
+        not isinstance(entry, dict)
+        or set(entry) != {"sequence", "operation", "from_bundle_digest", "to_bundle_digest", "state_snapshot_digest", "rollback_of_sequence"}
+        or entry != {"sequence": 1, "operation": "install", "from_bundle_digest": None, "to_bundle_digest": installed_digest, "state_snapshot_digest": None, "rollback_of_sequence": None}
+    ):
+        raise RuntimeError("P8H_INSTALL_STATUS_SCHEMA_INVALID")
+    _validate_onboarding(value["onboarding"], installed_digest)
+    return value
+
+
+def _validate_lifecycle_result(value: Any, *, uninstall: bool) -> dict[str, Any]:
+    expected = {
+        "schema": "nomad.web-companion.uninstall-result.v1" if uninstall else "nomad.web-companion.remote-access-reset.v1",
+        "state": "UNINSTALLED" if uninstall else "STOPPED",
+        "mode": "foundation-readonly", "remote_access": "CLEARED",
+        "install_state": "REMOVED" if uninstall else "PRESERVED",
+        "host_identity_disposition": "retained", "production_ready": False,
+    }
+    if value != expected:
+        raise RuntimeError("P8H_UNINSTALL_SCHEMA_INVALID" if uninstall else "P8H_RESET_SCHEMA_INVALID")
+    return value
+
+
+def _verify_installed_diagnostics(bundle: Path, output: Path, cwd: Path) -> str:
+    verifier = (
+        "import json,sys;from pathlib import Path;"
+        "sys.path.insert(0,sys.argv[1]);from nomad_web import diagnostics;"
+        "raw=Path(sys.argv[2]).read_bytes();"
+        "value=json.loads(raw);diagnostics.verify(value);"
+        "assert raw==diagnostics._canonical(value)+b'\\n';"
+        "print(value['manifest_digest'])"
+    )
+    result = _run_process([os.sys.executable, "-I", "-B", "-c", verifier, str(bundle / "lib"), str(output)], cwd)
+    digest_value = result.stdout.decode("ascii", errors="ignore").strip()
+    if result.returncode != 0 or result.stderr != b"" or re.fullmatch(r"[0-9a-f]{64}", digest_value) is None:
+        raise RuntimeError("P8H_DIAGNOSTICS_VERIFY_FAILED")
+    return digest_value
+
+
+def _run_c_install(bundle: Path, home: Path, repo: Path) -> tuple[Path | None, Path | None, list[dict[str, Any]]]:
     from tools.nomad_web import install_lifecycle
     config = _config(home, repo)
     stages: list[dict[str, Any]] = []
     selected: Path | None = None
+    stable: Path | None = None
     try:
         installed = install_lifecycle.install(config, bundle)
         installed_digest = installed.get("current_bundle_digest")
@@ -189,34 +366,60 @@ def _run_c_prepare(bundle: Path, home: Path, repo: Path) -> tuple[Any, Path | No
         selected = (home / "bundles" / installed_digest).resolve(strict=True)
         if selected.parent != (home / "bundles").resolve(strict=True):
             raise RuntimeError("P8G_INSTALL_PATH_INVALID")
-        verified_digest = _bundle_digest(selected)
-        if verified_digest != installed_digest:
-            raise RuntimeError("P8G_INSTALLED_BUNDLE_VERIFY_FAILED")
+        stable = home / "bin" / "nomad-web"
+        stable_info = stable.lstat()
+        if (not stat.S_ISREG(stable_info.st_mode) or stat.S_ISLNK(stable_info.st_mode)
+                or stable_info.st_uid != os.geteuid() or stat.S_IMODE(stable_info.st_mode) != 0o755):
+            raise RuntimeError("P8H_CANONICAL_LAUNCHER_INVALID")
         stages.append(_stage("install", "PASS", "INSTALL_SELECTOR_COMMITTED", bundle_digest=installed_digest))
-        onboarding = install_lifecycle.onboarding_status(config)
-        onboarding_install = onboarding.get("installed", onboarding) if isinstance(onboarding, dict) else {}
-        onboarding_digest = onboarding_install.get("installed_bundle_digest", onboarding_install.get("current_bundle_digest")) if isinstance(onboarding_install, dict) else None
-        if not isinstance(onboarding_install, dict) or onboarding_digest != installed_digest:
-            raise RuntimeError("P8G_ONBOARDING_INSTALL_MISMATCH")
-        stages.append(_stage("onboarding", "PASS", "ONBOARDING_CLASSIFIED", state=onboarding.get("state"), external_readiness=onboarding.get("external_readiness")))
-        for directory in (home / "bin", home / "run", home / "logs"):
-            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     except Exception as error:
-        stages.append(_stage("lifecycle", "BLOCK", str(error) if str(error).isupper() else "P8G_LIFECYCLE_FAILED", error_type=type(error).__name__))
-    return config, selected, stages
+        stages.append(_stage("install", "BLOCK", _safe_code(error, "P8G_LIFECYCLE_FAILED"), error_type=type(error).__name__))
+    return selected, stable, stages
 
 
-def _run_c_cleanup(config: Any, home: Path, stages: list[dict[str, Any]]) -> dict[str, Any]:
-    from tools.nomad_web import diagnostics, launcher
+def _run_c_installed_prepare(
+    launcher: Path, selected: Path, source: Path, cwd: Path, stages: list[dict[str, Any]],
+) -> None:
+    installed_digest = selected.name
     try:
-        diagnostic = diagnostics.collect(config)
-        stages.append(_stage("diagnostics", "PASS", "DIAGNOSTICS_COLLECTED", diagnostic_status=diagnostic.get("status"), production_ready=diagnostic.get("production_ready")))
-        reset = launcher.reset_remote_access(config)
-        stages.append(_stage("reset", "PASS", "REMOTE_ACCESS_RESET", state=reset.get("state")))
-        removed = launcher.uninstall_lifecycle(config)
-        stages.append(_stage("uninstall", "PASS", "INSTALL_LIFECYCLE_REMOVED", state=removed.get("state")))
+        if source.exists():
+            raise RuntimeError("P8H_SOURCE_BUNDLE_STILL_AVAILABLE")
+        status = _validate_install_status(_installed_json(launcher, cwd, ("install-status",)), installed_digest)
+        stages.append(_stage("install-status", "PASS", "INSTALLED_CLI_STATUS_VERIFIED", state=status["state"], bundle_digest=installed_digest, source_bundle_removed=True))
+        onboarding = _validate_onboarding(_installed_json(launcher, cwd, ("onboarding",)), installed_digest)
+        stages.append(_stage("onboarding", "PASS", "INSTALLED_CLI_ONBOARDING_VERIFIED", state=onboarding["state"], external_readiness="NOT_RUN"))
+        missing = _installed_json(
+            launcher, cwd, ("start", "--provider", "OPENAI_API_KEY", "--workspace", str(cwd)),
+            expected_exit=1,
+        )
+        if missing != {"schema": "nomad.web-companion.error.v1", "state": "BLOCKED", "error": "AGENT_START_INPUTS_INCOMPLETE", "production_ready": False}:
+            raise RuntimeError("P8H_MISSING_PROVIDER_CREDENTIAL_CONTRACT_INVALID")
+        stages.append(_stage("missing-provider-credential", "PASS", "AGENT_START_INPUTS_INCOMPLETE", expected_block=True, provider_e3="NOT_RUN"))
     except Exception as error:
-        stages.append(_stage("cleanup", "BLOCK", str(error) if str(error).isupper() else "P8G_CLEANUP_FAILED", error_type=type(error).__name__))
+        stages.append(_stage("installed-prepare", "BLOCK", _safe_code(error, "P8H_INSTALLED_PREPARE_FAILED"), error_type=type(error).__name__))
+
+
+def _run_c_cleanup(launcher: Path, selected: Path, home: Path, cwd: Path, root: Path, stages: list[dict[str, Any]]) -> dict[str, Any]:
+    try:
+        diagnostics_root = root / "diagnostics"
+        diagnostics_root.mkdir(mode=0o700)
+        os.chmod(diagnostics_root, 0o700)
+        diagnostic_path = diagnostics_root / "support.json"
+        diagnostic = _installed_json(launcher, cwd, ("diagnostics", "--output", str(diagnostic_path)))
+        if diagnostic.get("schema") != "nomad.web-companion.support-diagnostics.v1" or diagnostic.get("classification") != "support-only-not-readiness-evidence" or diagnostic.get("production_ready") is not False or diagnostic.get("readiness_evidence") is not False:
+            raise RuntimeError("P8H_DIAGNOSTICS_SCHEMA_INVALID")
+        if diagnostic_path.read_bytes() != canonical(diagnostic) or stat.S_IMODE(diagnostic_path.stat().st_mode) != 0o600:
+            raise RuntimeError("P8H_DIAGNOSTICS_FILE_INVALID")
+        manifest_digest = _verify_installed_diagnostics(selected, diagnostic_path, cwd)
+        stages.append(_stage("diagnostics", "PASS", "INSTALLED_DIAGNOSTICS_VERIFIED", classification=diagnostic["classification"], manifest_digest=manifest_digest, production_ready=False))
+        reset = _validate_lifecycle_result(_installed_json(launcher, cwd, ("reset-remote-access", "--confirm")), uninstall=False)
+        stages.append(_stage("reset", "PASS", "REMOTE_ACCESS_RESET", state=reset["state"], install_state=reset["install_state"]))
+        removed = _validate_lifecycle_result(_installed_json(launcher, cwd, ("uninstall", "--confirm")), uninstall=True)
+        stages.append(_stage("uninstall", "PASS", "INSTALL_LIFECYCLE_REMOVED", state=removed["state"], install_state=removed["install_state"]))
+        if launcher.exists():
+            raise RuntimeError("P8H_LAUNCHER_RESIDUE_REMAINS")
+    except Exception as error:
+        stages.append(_stage("cleanup", "BLOCK", _safe_code(error, "P8G_CLEANUP_FAILED"), error_type=type(error).__name__))
     residue = home.exists()
     stages.append(_stage("residue", "PASS" if not residue else "BLOCK", "NO_OWNED_RESIDUE" if not residue else "OWNED_RESIDUE_REMAINS"))
     status = "PASS" if all(item["status"] == "PASS" for item in stages) else "BLOCK"
@@ -269,14 +472,26 @@ def run_journey(bundle: Path, *, repo: Path = ROOT, work_root: Path | None = Non
     source_bundle_digest = _bundle_digest(bundle)
     parent_digest = digest({"bundle_digest": source_bundle_digest})
     try:
-        config, selected_bundle, lifecycle_stages = _run_c_prepare(bundle, home, repo)
+        runtime_cwd = root / "installed-cwd"
+        runtime_cwd.mkdir(mode=0o700)
+        os.chmod(runtime_cwd, 0o700)
+        if runtime_cwd.resolve().is_relative_to(repo.resolve()):
+            raise RuntimeError("P8H_INSTALLED_CWD_INSIDE_REPO")
+        install_source = root / "install-source"
+        shutil.copytree(bundle, install_source, copy_function=shutil.copy2)
+        selected_bundle, stable_launcher, lifecycle_stages = _run_c_install(install_source, home, repo)
+        shutil.rmtree(install_source)
+        if selected_bundle is not None and stable_launcher is not None:
+            _run_c_installed_prepare(stable_launcher, selected_bundle, install_source, runtime_cwd, lifecycle_stages)
         b_stage = (_run_b(selected_bundle, parent_digest) if selected_bundle is not None
                    else _stage("B_c3_local", "NOT_RUN", "P8G_INSTALLED_BUNDLE_REQUIRED", parent_evidence_digest=parent_digest))
         a_stage = _run_a(selected_bundle or bundle, root / "a.json", parent_digest)
-        c_stage = _run_c_cleanup(config, home, lifecycle_stages)
+        c_stage = (_run_c_cleanup(stable_launcher, selected_bundle, home, runtime_cwd, root, lifecycle_stages)
+                   if selected_bundle is not None and stable_launcher is not None
+                   else _stage("C_lifecycle", "BLOCK", "P8G_LIFECYCLE_INCOMPLETE", stages=lifecycle_stages))
         stages = [b_stage, a_stage, c_stage]
         repo_owned_pass = b_stage["status"] == "PASS" and c_stage["status"] == "PASS"
-        result = {"schema": SCHEMA, "status": "PASS" if repo_owned_pass else "BLOCK", "repo_owned_status": "PASS" if repo_owned_pass else "BLOCK", "external_readiness": a_stage["status"], "classification": "mechanical-local-non-provider", "production_ready": False, "parent_evidence_digest": parent_digest, "bundle_digest": source_bundle_digest, "stages": stages, "external_gates":[{"code": code, "status":"NOT_RUN"} for code in EXTERNAL_GATES], "privacy":{"content_free":True,"raw_output_included":False,"credential_values_inspected":False,"protected_transcript_accessed":False}}
+        result = {"schema": SCHEMA, "status": "PASS" if repo_owned_pass else "BLOCK", "repo_owned_status": "PASS" if repo_owned_pass else "BLOCK", "remote_local_evidence_status": a_stage["status"], "external_readiness": "NOT_RUN", "provider_e3": {"status": "NOT_RUN", "code": "PROVIDER_E3_EVIDENCE_NOT_RUN"}, "classification": "mechanical-local-non-provider", "production_ready": False, "parent_evidence_digest": parent_digest, "bundle_digest": source_bundle_digest, "stages": stages, "external_gates": _fixed_external_gates(), "privacy":{"content_free":True,"raw_output_included":False,"credential_values_inspected":False,"protected_transcript_accessed":False}}
         if evidence is not None:
             _write_atomic(evidence, result)
         return result
@@ -294,13 +509,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = run_journey(args.bundle, work_root=args.work_root, evidence=args.evidence)
     except Exception as error:
-        result = {"schema": SCHEMA, "status":"BLOCK", "classification":"mechanical-local-non-provider", "production_ready":False, "code":str(error) if str(error).isupper() else "P8G_RUNNER_FAILED", "privacy":{"content_free":True,"protected_transcript_accessed":False}}
+        result = _blocked_result(_safe_code(error, "P8G_RUNNER_FAILED"))
         _write_atomic(args.evidence, result)
     print(json.dumps({
         "schema": SCHEMA,
         "status": result["status"],
         "repo_owned_status": result.get("repo_owned_status", result["status"]),
-        "external_readiness": result.get("external_readiness", "NOT_RUN"),
+        "remote_local_evidence_status": result.get("remote_local_evidence_status", "NOT_RUN"),
+        "external_readiness": "NOT_RUN",
         "production_ready": False,
     }, sort_keys=True))
     return 0 if result["status"] == "PASS" else 2
