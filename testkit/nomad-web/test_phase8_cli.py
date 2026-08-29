@@ -249,6 +249,32 @@ class Phase8CliTests(unittest.TestCase):
             "Host identity: retained\n",
         )
 
+    def test_operation_status_routes_and_exit_semantics(self) -> None:
+        base = {
+            "schema": "nomad.web-companion.lifecycle-operation-status.v1",
+            "operation_id": "operation_0123456789",
+            "operation": "uninstall", "terminal": True,
+            "error": None, "recovery": None,
+            "latest_known": False,
+        }
+        for arguments, state, expected in (
+            (("--operation-id", "operation_0123456789"), "completed", 0),
+            (("--latest",), "outcome_unknown", 2),
+            (("--latest",), "failed", 1),
+        ):
+            result = {**base, "state": state, "latest_known": "--latest" in arguments}
+            with self.subTest(state=state), mock.patch.object(cli, "operation_status", return_value=result) as status:
+                code, emitted = self.invoke_json("operation-status", *arguments)
+            self.assertEqual((code, emitted), (expected, result))
+            status.assert_called_once_with(
+                self.config,
+                "operation_0123456789" if "--operation-id" in arguments else None,
+                latest="--latest" in arguments,
+            )
+        with mock.patch.object(cli, "operation_status", return_value=base):
+            _, rendered = self.invoke_text("operation-status", "--latest")
+        self.assertNotIn("Error: None", rendered)
+
     def test_destructive_lifecycle_commands_require_confirmation(self) -> None:
         for command, handler_name, expected in (
             (

@@ -13,6 +13,7 @@ import fcntl
 import json
 import os
 import re
+import select
 import secrets
 import socket
 import stat
@@ -32,7 +33,11 @@ MAX_FRAME_BYTES = 4096
 REQUEST_SCHEMA = "nomad.web-companion.lifecycle-request.v1"
 COMMIT_SCHEMA = "nomad.web-companion.lifecycle-commit.v1"
 RESPONSE_SCHEMA = "nomad.web-companion.lifecycle-response.v1"
-JOURNAL_SCHEMA = "nomad.web-companion.lifecycle-journal.v1"
+GATEWAY_BOOTSTRAP_SCHEMA = "nomad.web-companion.lifecycle-bootstrap.v1"
+WORKER_READY_SCHEMA = "nomad.web-companion.lifecycle-worker-ready.v1"
+WORKER_OPERATIONAL_SCHEMA = "nomad.web-companion.lifecycle-worker-operational.v1"
+JOURNAL_SCHEMA = "nomad.web-companion.lifecycle-journal.v2"
+LEGACY_JOURNAL_SCHEMA = "nomad.web-companion.lifecycle-journal.v1"
 MARKER_SCHEMA = "nomad.web-companion.lifecycle-journal-root.v1"
 OPERATIONS = {"reset_remote_access", "uninstall"}
 JOURNAL_STATES = {"ACCEPTED", "COMMITTED", "COMPLETED", "FAILED", "OUTCOME_UNKNOWN"}
@@ -55,6 +60,7 @@ WORKER_CONFIG_KEYS = {
 }
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _REQUEST_ID = re.compile(r"[A-Za-z0-9_-]{16,128}")
+PUBLIC_STATUS_SCHEMA = "nomad.web-companion.lifecycle-operation-status.v1"
 
 
 def canonical_json(value: Any) -> bytes:
@@ -220,6 +226,11 @@ def _verify_runtime_binding_unlocked(
     matches = [item for item in workload if item.get("name") == "desktop-gateway"]
     if len(matches) != 1 or process_binding(matches[0]) != dict(gateway_binding):
         raise RuntimeError("LIFECYCLE_GATEWAY_BINDING_MISMATCH")
+    if process_binding(running.get("lifecycle_coordinator", {})) != process_binding({
+        "pid": os.getpid(), "process_group": os.getpgrp(),
+        "identity": request["coordinator_identity"],
+    }):
+        raise RuntimeError("LIFECYCLE_PROCESS_BINDING_MISMATCH")
     return workload
 
 
@@ -247,7 +258,10 @@ class OperationJournal:
         except OSError:
             pass
 
-    def accept(self, request: Mapping[str, Any]) -> dict[str, Any]:
+    def accept(
+        self, request: Mapping[str, Any],
+        worker_binding: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         _validate_request_fields(request)
         if request["schema"] != REQUEST_SCHEMA:
             raise RuntimeError("LIFECYCLE_MESSAGE_INVALID")
@@ -259,7 +273,8 @@ class OperationJournal:
                 return existing
             if any(item["state"] in {"ACCEPTED", "COMMITTED"} for item in self._records_unlocked()):
                 raise RuntimeError("LIFECYCLE_OPERATION_IN_PROGRESS")
-            value = self._record(dict(request), "ACCEPTED", secrets.token_hex(32), None, None)
+            worker = process_binding(worker_binding) if worker_binding is not None else None
+            value = self._record(dict(request), "ACCEPTED", secrets.token_hex(32), None, None, worker)
             self._create(self._name(request["request_id"]), canonical_json(value) + b"\n")
             return value
 
@@ -273,7 +288,7 @@ class OperationJournal:
                 raise RuntimeError("LIFECYCLE_REQUEST_ID_CONFLICT")
             if current["state"] != "ACCEPTED" or challenge != current["commit_challenge"]:
                 raise RuntimeError("LIFECYCLE_COMMIT_MISMATCH")
-            value = self._record(dict(request), "COMMITTED", challenge, None, None)
+            value = self._record(dict(request), "COMMITTED", challenge, None, None, current["worker_binding"])
             self._replace(self._name(request["request_id"]), canonical_json(value) + b"\n")
             return value
 
@@ -287,7 +302,7 @@ class OperationJournal:
             if current is None or current["request"] != dict(request) or current["state"] != "COMMITTED":
                 raise RuntimeError("LIFECYCLE_JOURNAL_STATE_INVALID")
             state = "COMPLETED" if error is None else "FAILED"
-            value = self._record(dict(request), state, current["commit_challenge"], dict(result) if result is not None else None, error)
+            value = self._record(dict(request), state, current["commit_challenge"], dict(result) if result is not None else None, error, current["worker_binding"])
             self._replace(self._name(request["request_id"]), canonical_json(value) + b"\n")
             return value
 
@@ -304,7 +319,7 @@ class OperationJournal:
             for current in self._records_unlocked():
                 request = current["request"]
                 if current["state"] == "ACCEPTED":
-                    value = self._record(request, "FAILED", current["commit_challenge"], None, "LIFECYCLE_COMMIT_NOT_OBSERVED")
+                    value = self._record(request, "FAILED", current["commit_challenge"], None, "LIFECYCLE_COMMIT_NOT_OBSERVED", current["worker_binding"])
                 elif current["state"] == "COMMITTED":
                     result = None
                     try:
@@ -318,7 +333,7 @@ class OperationJournal:
                                         result = launcher._reset_result()
                     except (OSError, RuntimeError):
                         result = None
-                    value = self._record(request, "COMPLETED" if result is not None else "OUTCOME_UNKNOWN", current["commit_challenge"], result, None if result is not None else "LIFECYCLE_OUTCOME_UNKNOWN")
+                    value = self._record(request, "COMPLETED" if result is not None else "OUTCOME_UNKNOWN", current["commit_challenge"], result, None if result is not None else "LIFECYCLE_OUTCOME_UNKNOWN", current["worker_binding"])
                 else:
                     continue
                 self._replace(self._name(request["request_id"]), canonical_json(value) + b"\n")
@@ -348,8 +363,8 @@ class OperationJournal:
         return [self._read_name(name) for name in names]
 
     @staticmethod
-    def _record(request: dict[str, Any], state: str, challenge: str, result: dict[str, Any] | None, error: str | None) -> dict[str, Any]:
-        return {"schema": JOURNAL_SCHEMA, "request": request, "state": state, "commit_challenge": challenge, "result": result, "error": error}
+    def _record(request: dict[str, Any], state: str, challenge: str, result: dict[str, Any] | None, error: str | None, worker_binding: dict[str, Any] | None) -> dict[str, Any]:
+        return {"schema": JOURNAL_SCHEMA, "request": request, "state": state, "commit_challenge": challenge, "result": result, "error": error, "worker_binding": worker_binding}
 
     @staticmethod
     def _name(request_id: str) -> str:
@@ -371,12 +386,27 @@ class OperationJournal:
             value = json.loads(raw)
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise RuntimeError("LIFECYCLE_JOURNAL_INVALID") from error
-        keys = {"schema", "request", "state", "commit_challenge", "result", "error"}
-        if raw != canonical_json(value) + b"\n" or not isinstance(value, dict) or set(value) != keys or value["schema"] != JOURNAL_SCHEMA or value["state"] not in JOURNAL_STATES or not isinstance(value["commit_challenge"], str) or _HEX64.fullmatch(value["commit_challenge"]) is None:
+        keys = {"schema", "request", "state", "commit_challenge", "result", "error", "worker_binding"}
+        legacy_keys = keys - {"worker_binding"}
+        if raw != canonical_json(value) + b"\n" or not isinstance(value, dict):
+            raise RuntimeError("LIFECYCLE_JOURNAL_INVALID")
+        legacy = value.get("schema") == LEGACY_JOURNAL_SCHEMA and set(value) == legacy_keys
+        if not legacy and (set(value) != keys or value.get("schema") != JOURNAL_SCHEMA):
+            raise RuntimeError("LIFECYCLE_JOURNAL_INVALID")
+        if legacy:
+            value = {**value, "schema": JOURNAL_SCHEMA, "worker_binding": None}
+            if value["state"] in {"ACCEPTED", "COMMITTED"}:
+                value["state"] = "OUTCOME_UNKNOWN"
+                value["result"] = None
+                value["error"] = "LIFECYCLE_OUTCOME_UNKNOWN"
+            self._replace(name, canonical_json(value) + b"\n")
+        if value["state"] not in JOURNAL_STATES or not isinstance(value["commit_challenge"], str) or _HEX64.fullmatch(value["commit_challenge"]) is None:
             raise RuntimeError("LIFECYCLE_JOURNAL_INVALID")
         _validate_request_fields(value["request"] if isinstance(value["request"], dict) else {})
         if value["request"]["schema"] != REQUEST_SCHEMA:
             raise RuntimeError("LIFECYCLE_JOURNAL_INVALID")
+        if value["worker_binding"] is not None:
+            process_binding(value["worker_binding"])
         if value["state"] in {"ACCEPTED", "COMMITTED"} and (value["result"] is not None or value["error"] is not None):
             raise RuntimeError("LIFECYCLE_JOURNAL_INVALID")
         if value["state"] == "COMPLETED":
@@ -462,6 +492,73 @@ def home_commitment(home: Path) -> str:
     ).hexdigest()
 
 
+def operation_status(config: Any, operation_id: str | None = None, *, latest: bool = False) -> dict[str, Any]:
+    if latest is (operation_id is not None):
+        raise RuntimeError("LIFECYCLE_OPERATION_ID_INVALID")
+    if operation_id is not None and _REQUEST_ID.fullmatch(operation_id) is None:
+        raise RuntimeError("LIFECYCLE_OPERATION_ID_INVALID")
+    root = journal_root(Path(config.home), "reset_remote_access")
+    if not root.exists():
+        raise RuntimeError("LIFECYCLE_OPERATION_NOT_FOUND")
+    journal = OperationJournal(root, home_commitment=home_commitment(Path(config.home)))
+    try:
+        records = journal.records()
+        if latest:
+            operation_id = _latest_operation_id(journal, records)
+        matches = [
+            record for record in records
+            if record["request"]["request_id"] == operation_id
+        ]
+        if len(matches) == 1 and matches[0]["state"] in {"ACCEPTED", "COMMITTED"}:
+            worker = matches[0]["worker_binding"]
+            ownership = processes.ownership(worker) if isinstance(worker, dict) else "mismatch"
+            if ownership == "absent":
+                journal.reconcile(config)
+            elif ownership == "mismatch":
+                request = matches[0]["request"]
+                with journal._locked():
+                    current = journal._read(request["request_id"])
+                    if current is not None and current["state"] in {"ACCEPTED", "COMMITTED"}:
+                        value = journal._record(request, "OUTCOME_UNKNOWN", current["commit_challenge"], None, "LIFECYCLE_OUTCOME_UNKNOWN", current["worker_binding"])
+                        journal._replace(journal._name(operation_id), canonical_json(value) + b"\n")
+        matches = [
+            record for record in journal.records()
+            if record["request"]["request_id"] == operation_id
+        ]
+    finally:
+        journal.close()
+    if len(matches) != 1:
+        raise RuntimeError("LIFECYCLE_OPERATION_NOT_FOUND")
+    record = matches[0]
+    state = record["state"].lower()
+    recovery = (
+        "RUN_DIAGNOSTICS" if state == "failed"
+        else "RUN_OPERATION_STATUS" if state == "outcome_unknown"
+        else None
+    )
+    return {
+        "schema": PUBLIC_STATUS_SCHEMA,
+        "operation_id": operation_id,
+        "operation": record["request"]["operation"],
+        "state": state,
+        "terminal": state in {"completed", "failed", "outcome_unknown"},
+        "error": record["error"],
+        "recovery": recovery,
+        "latest_known": latest,
+    }
+
+
+def _latest_operation_id(journal: OperationJournal, records: list[dict[str, Any]]) -> str:
+    if not records:
+        raise RuntimeError("LIFECYCLE_OPERATION_NOT_FOUND")
+    ranked = []
+    for record in records:
+        request_id = record["request"]["request_id"]
+        info = os.stat(journal._name(request_id), dir_fd=journal._dir_fd, follow_symlinks=False)
+        ranked.append((info.st_mtime_ns, request_id))
+    return max(ranked)[1]
+
+
 def _validate_result(operation: str, result: Any) -> None:
     if not isinstance(result, dict) or set(result) != {
         "schema", "state", "mode", "remote_access", "install_state",
@@ -494,7 +591,8 @@ def journal_root(home: Path, operation: str) -> Path:
 
 def execute_operation(
     config: Any, operation: str, *, request: Mapping[str, Any],
-    gateway: Mapping[str, Any], journal: OperationJournal,
+    gateway: Mapping[str, Any], coordinator: Mapping[str, Any],
+    journal: OperationJournal,
 ) -> dict[str, Any]:
     from . import launcher
 
@@ -508,9 +606,13 @@ def execute_operation(
             config, request, process_binding(gateway),
         )
         if operation == "reset_remote_access":
-            result = launcher._reset_remote_access_unlocked(config)
+            result = launcher._reset_remote_access_unlocked(
+                config, preserve_lifecycle_coordinator=process_binding(coordinator),
+            )
         elif operation == "uninstall":
-            launcher._reset_remote_access_unlocked(config)
+            launcher._reset_remote_access_unlocked(
+                config, preserve_lifecycle_coordinator=process_binding(coordinator),
+            )
             result = launcher._uninstall_lifecycle_unlocked(config)
         else:
             raise RuntimeError("LIFECYCLE_OPERATION_INVALID")
@@ -533,8 +635,10 @@ def execute_operation(
 
 
 def spawn_worker(
-    config: Any, *, gateway: Mapping[str, Any],
-) -> tuple[dict[str, Any], socket.socket]:
+    config: Any, *, gateway: Mapping[str, Any], run_id: str | None = None,
+    bundle_digest: str | None = None, install_sequence: int | None = None,
+    channel: socket.socket | None = None,
+) -> tuple[dict[str, Any], socket.socket | None, int, int]:
     """Spawn one fresh-interpreter coordinator outside the workload.
 
     The returned socket is intended to be inherited by the desktop Gateway on
@@ -543,14 +647,31 @@ def spawn_worker(
     every process in that array before performing destructive cleanup.
     """
     process_binding(gateway)
-    parent, child = socket.socketpair()
+    parent = None
+    if channel is None:
+        parent, child = socket.socketpair()
+    else:
+        child = channel
     bootstrap_read, bootstrap_write = os.pipe()
+    ready_read, ready_write = os.pipe()
+    release_read, release_write = os.pipe()
+    keep_ready_read = False
     try:
         worker_fd = fcntl.fcntl(child.fileno(), fcntl.F_DUPFD_CLOEXEC, 20)
         bootstrap_fd = fcntl.fcntl(bootstrap_read, fcntl.F_DUPFD_CLOEXEC, 20)
+        ready_fd = fcntl.fcntl(ready_write, fcntl.F_DUPFD_CLOEXEC, 20)
+        release_fd = fcntl.fcntl(release_read, fcntl.F_DUPFD_CLOEXEC, 20)
+        lifecycle_binding = {
+            "run_id": run_id, "bundle_digest": bundle_digest,
+            "install_sequence": install_sequence,
+        }
+        if any(value is None for value in lifecycle_binding.values()):
+            # Kept only for focused protocol tests that own the returned end.
+            lifecycle_binding = None
         bootstrap = canonical_json({
             "config": _worker_config(config),
             "gateway_binding": process_binding(gateway),
+            "lifecycle_binding": lifecycle_binding,
         })
         if len(bootstrap) > MAX_FRAME_BYTES:
             raise RuntimeError("LIFECYCLE_WORKER_BOOTSTRAP_INVALID")
@@ -569,6 +690,10 @@ def spawn_worker(
             (os.POSIX_SPAWN_CLOSE, worker_fd),
             (os.POSIX_SPAWN_DUP2, bootstrap_fd, 11),
             (os.POSIX_SPAWN_CLOSE, bootstrap_fd),
+            (os.POSIX_SPAWN_DUP2, ready_fd, 13),
+            (os.POSIX_SPAWN_CLOSE, ready_fd),
+            (os.POSIX_SPAWN_DUP2, release_fd, 14),
+            (os.POSIX_SPAWN_CLOSE, release_fd),
         ]
         pid = os.posix_spawn(
             sys.executable,
@@ -576,19 +701,33 @@ def spawn_worker(
                 sys.executable, "-I", "-B", "-c", code,
                 str(import_root), module_name,
                 "--channel-fd", "10", "--bootstrap-fd", "11",
+                "--ready-fd", "13",
+                "--release-fd", "14",
             ],
             processes.minimal_env(),
             file_actions=actions, setsid=True,
         )
+    except BaseException:
+        if parent is not None:
+            parent.close()
+        processes.close_fd(ready_read)
+        processes.close_fd(release_write)
+        raise
     finally:
         child.close()
         os.close(bootstrap_read)
+        os.close(ready_write)
+        os.close(release_read)
         if bootstrap_write >= 0:
             os.close(bootstrap_write)
         if "worker_fd" in locals():
             os.close(worker_fd)
         if "bootstrap_fd" in locals():
             os.close(bootstrap_fd)
+        if "ready_fd" in locals():
+            os.close(ready_fd)
+        if "release_fd" in locals():
+            os.close(release_fd)
     try:
         record = {
             "name": "lifecycle-coordinator", "pid": pid,
@@ -596,9 +735,20 @@ def spawn_worker(
         }
         if processes.ownership(record) != "owned":
             raise RuntimeError("LIFECYCLE_COORDINATOR_IDENTITY_UNAVAILABLE")
-        return record, parent
+        ready = _receive_worker_signal(ready_read, WORKER_READY_SCHEMA)
+        if ready != {
+            "schema": WORKER_READY_SCHEMA,
+            "pid": record["pid"],
+            "process_group": record["process_group"],
+            "identity": record["identity"],
+        } or processes.ownership(record) != "owned":
+            raise RuntimeError("LIFECYCLE_COORDINATOR_START_FAILED")
+        keep_ready_read = True
+        return record, parent, release_write, ready_read
     except Exception:
-        parent.close()
+        if parent is not None:
+            parent.close()
+        os.close(release_write)
         try:
             os.killpg(pid, 9)
         except ProcessLookupError:
@@ -608,18 +758,21 @@ def spawn_worker(
         except ChildProcessError:
             pass
         raise
+    finally:
+        if not keep_ready_read:
+            os.close(ready_read)
 
 
 def _worker_main() -> int:
     try:
         arguments = sys.argv[1:]
-        if arguments != ["--channel-fd", "10", "--bootstrap-fd", "11"]:
+        if arguments != ["--channel-fd", "10", "--bootstrap-fd", "11", "--ready-fd", "13", "--release-fd", "14"]:
             raise RuntimeError("LIFECYCLE_WORKER_ARGUMENTS_INVALID")
         raw = os.read(11, MAX_FRAME_BYTES + 1)
         if not raw or len(raw) > MAX_FRAME_BYTES or os.read(11, 1):
             raise RuntimeError("LIFECYCLE_WORKER_BOOTSTRAP_INVALID")
         bootstrap = json.loads(raw)
-        if not isinstance(bootstrap, dict) or set(bootstrap) != {"config", "gateway_binding"} or raw != canonical_json(bootstrap):
+        if not isinstance(bootstrap, dict) or set(bootstrap) != {"config", "gateway_binding", "lifecycle_binding"} or raw != canonical_json(bootstrap):
             raise RuntimeError("LIFECYCLE_WORKER_BOOTSTRAP_INVALID")
         config_values = bootstrap["config"]
         if not isinstance(config_values, dict) or set(config_values) != WORKER_CONFIG_KEYS:
@@ -629,7 +782,41 @@ def _worker_main() -> int:
         gateway = process_binding(bootstrap["gateway_binding"])
         channel = socket.socket(fileno=10)
         coordinator = {"pid": os.getpid(), "process_group": os.getpgrp(), "identity": processes.process_identity(os.getpid())}
-        serve_once(config, channel, gateway=gateway, coordinator=coordinator)
+        journal = OperationJournal(
+            journal_root(config.home, "reset_remote_access"),
+            home_commitment=home_commitment(config.home),
+        )
+        ready = canonical_json({
+            "schema": WORKER_READY_SCHEMA,
+            "pid": coordinator["pid"],
+            "process_group": coordinator["process_group"],
+            "identity": coordinator["identity"],
+        })
+        _write_all(13, len(ready).to_bytes(4, "big") + ready)
+        if _read_fd_exact(14, 1) != b"1" or os.read(14, 1):
+            raise RuntimeError("LIFECYCLE_COORDINATOR_RELEASE_INVALID")
+        os.close(14)
+        lifecycle_binding = bootstrap["lifecycle_binding"]
+        if lifecycle_binding is not None:
+            if not isinstance(lifecycle_binding, dict) or set(lifecycle_binding) != {"run_id", "bundle_digest", "install_sequence"}:
+                raise RuntimeError("LIFECYCLE_GATEWAY_BOOTSTRAP_INVALID")
+            ready = gateway_bootstrap(
+                **lifecycle_binding, gateway=gateway, coordinator=coordinator,
+            )
+            channel.sendall(len(ready).to_bytes(4, "big") + ready)
+        journal.reconcile(config)
+        operational = canonical_json({
+            "schema": WORKER_OPERATIONAL_SCHEMA,
+            "pid": coordinator["pid"],
+            "process_group": coordinator["process_group"],
+            "identity": coordinator["identity"],
+        })
+        _write_all(13, len(operational).to_bytes(4, "big") + operational)
+        os.close(13)
+        serve_once(
+            config, channel, gateway=gateway, coordinator=coordinator,
+            journal=journal, reconcile=False,
+        )
         return 0
     except BaseException:
         return 1
@@ -640,20 +827,26 @@ def serve_once(
     coordinator: Mapping[str, Any], journal: OperationJournal | None = None,
     verifier: Callable[..., None] = verify_binding,
     executor: Callable[[Any, str], dict[str, Any]] = execute_operation,
+    reconcile: bool = True,
 ) -> dict[str, Any]:
-    channel.settimeout(30.0)
+    # A coordinator is created with the remote run and may remain idle for the
+    # whole run.  Only the accepted -> commit window is bounded.
+    channel.settimeout(None)
     journal = journal or OperationJournal(
         journal_root(Path(config.home), "reset_remote_access"),
         home_commitment=home_commitment(Path(config.home)),
     )
-    journal.reconcile(config)
+    if reconcile:
+        journal.reconcile(config)
     request = receive_message(channel, schema=REQUEST_SCHEMA)
     verifier(config, request, gateway=gateway, coordinator=coordinator)
-    accepted = journal.accept(request)
+    worker_binding = process_binding(coordinator)
+    accepted = journal.accept(request, worker_binding)
     _checkpoint("after_accept")
     send_message(channel, _response(request, accepted["state"], accepted.get("result"), accepted.get("error"), accepted.get("commit_challenge")))
     if accepted["state"] in {"COMPLETED", "FAILED", "OUTCOME_UNKNOWN"}:
         return accepted
+    channel.settimeout(30.0)
     commit_message = receive_message(channel, schema=COMMIT_SCHEMA)
     committed_request = request_from_commit(commit_message)
     if committed_request != request or commit_message["commit_challenge"] != accepted["commit_challenge"]:
@@ -665,7 +858,7 @@ def serve_once(
         if executor is execute_operation:
             result = executor(
                 config, request["operation"], request=request, gateway=gateway,
-                journal=journal,
+                coordinator=coordinator, journal=journal,
             )
         else:
             result = executor(config, request["operation"])
@@ -675,7 +868,13 @@ def serve_once(
     else:
         _checkpoint("after_execute")
         completed = journal.complete(request, result=result)
-    send_message(channel, _response(request, completed["state"], completed["result"], completed["error"], None))
+    try:
+        send_message(channel, _response(request, completed["state"], completed["result"], completed["error"], None))
+    except (BrokenPipeError, ConnectionResetError, RuntimeError, OSError):
+        # Both operations stop the Gateway.  Its channel disappearing after
+        # the durable terminal journal record is expected, not an operation
+        # failure.
+        pass
     return completed
 
 
@@ -689,6 +888,90 @@ def _worker_config(config: Any) -> dict[str, Any]:
             raise RuntimeError("LIFECYCLE_WORKER_BOOTSTRAP_INVALID")
         value[name] = item
     return value
+
+
+def gateway_bootstrap(
+    *, run_id: str, bundle_digest: str, install_sequence: int,
+    gateway: Mapping[str, Any], coordinator: Mapping[str, Any],
+) -> bytes:
+    value = {
+        "schema": GATEWAY_BOOTSTRAP_SCHEMA,
+        "run_id": run_id,
+        "bundle_digest": bundle_digest,
+        "install_sequence": install_sequence,
+        "gateway_identity": process_binding(gateway)["identity"],
+        "coordinator_identity": process_binding(coordinator)["identity"],
+    }
+    if (
+        _HEX64.fullmatch(run_id) is None
+        or _HEX64.fullmatch(bundle_digest) is None
+        or type(install_sequence) is not int
+        or install_sequence <= 0
+    ):
+        raise RuntimeError("LIFECYCLE_GATEWAY_BOOTSTRAP_INVALID")
+    raw = canonical_json(value)
+    if not raw or len(raw) > MAX_FRAME_BYTES:
+        raise RuntimeError("LIFECYCLE_GATEWAY_BOOTSTRAP_INVALID")
+    return raw
+
+
+def _receive_worker_signal(
+    descriptor: int, schema: str, timeout: float = 5.0,
+) -> dict[str, Any]:
+    readable, _, _ = select.select([descriptor], [], [], timeout)
+    if not readable:
+        raise RuntimeError("LIFECYCLE_COORDINATOR_START_TIMEOUT")
+    size_raw = _read_fd_exact(descriptor, 4)
+    size = int.from_bytes(size_raw, "big")
+    if not 0 < size <= MAX_FRAME_BYTES:
+        raise RuntimeError("LIFECYCLE_COORDINATOR_START_FAILED")
+    raw = _read_fd_exact(descriptor, size)
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("LIFECYCLE_COORDINATOR_START_FAILED") from error
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schema", "pid", "process_group", "identity"}
+        or value.get("schema") != schema
+        or raw != canonical_json(value)
+    ):
+        raise RuntimeError("LIFECYCLE_COORDINATOR_START_FAILED")
+    process_binding(value)
+    return value
+
+
+def _read_fd_exact(descriptor: int, size: int) -> bytes:
+    value = bytearray()
+    while len(value) < size:
+        chunk = os.read(descriptor, size - len(value))
+        if not chunk:
+            raise RuntimeError("LIFECYCLE_COORDINATOR_START_FAILED")
+        value.extend(chunk)
+    return bytes(value)
+
+
+def release_worker(descriptor: int) -> None:
+    try:
+        _write_all(descriptor, b"1")
+    finally:
+        os.close(descriptor)
+
+
+def confirm_worker_operational(
+    descriptor: int, record: Mapping[str, Any],
+) -> None:
+    try:
+        ready = _receive_worker_signal(descriptor, WORKER_OPERATIONAL_SCHEMA)
+        if ready != {
+            "schema": WORKER_OPERATIONAL_SCHEMA,
+            "pid": record["pid"],
+            "process_group": record["process_group"],
+            "identity": record["identity"],
+        } or os.read(descriptor, 1) or processes.ownership(record) != "owned":
+            raise RuntimeError("LIFECYCLE_COORDINATOR_START_FAILED")
+    finally:
+        os.close(descriptor)
 
 
 def _checkpoint(_stage: str) -> None:

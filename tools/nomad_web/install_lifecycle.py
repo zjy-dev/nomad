@@ -539,6 +539,10 @@ def _running_drift(installed: dict[str, Any], run_state: Any) -> str | None:
     ownership = [processes.ownership(item) for item in run_state.get("processes", [])]
     if not ownership or any(value != "owned" for value in ownership):
         return "RUNNING_PROCESS_SET_DEGRADED"
+    if run_state.get("mode") == "remote-local-evidence":
+        sidecar = run_state.get("lifecycle_coordinator")
+        if not isinstance(sidecar, dict) or processes.ownership(sidecar) != "owned":
+            return "RUNNING_PROCESS_SET_DEGRADED"
     return None
 
 

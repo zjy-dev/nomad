@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import io
 import os
+import re
+import shutil
 import socket
 import stat
 import subprocess
@@ -195,7 +197,7 @@ class M3ELauncherTests(unittest.TestCase):
                 pid += 1
                 child_secrets = {}
                 for source, target in extra_fd_actions:
-                    if target in (11, 12) and name != "https-ingress" or target == 12 and name == "https-ingress":
+                    if (target in (11, 12) and name not in {"desktop-gateway", "https-ingress"}) or target == 11 and name == "desktop-gateway" or target == 12 and name == "https-ingress":
                         child_secrets[target] = os.read(source, 4097)
                     if name == "https-ingress" and target == 13:
                         ready = b'{"schema":"nomad.https-ingress.ready.v1","ready":true}'
@@ -223,7 +225,10 @@ class M3ELauncherTests(unittest.TestCase):
                 return {"name": "opencode", "pid": pid, "process_group": pid, "identity": f"{pid:064x}", "log": str(log_path), "origin": f"http://127.0.0.1:{port}", "_server_password": "agent-password-canary", "_workspace_binding_digest": "b" * 64}
 
             tls_context = object()
-            with mock.patch.object(launcher, "select_bundle_for_start", return_value=bundle), mock.patch.object(launcher, "_selected_bundle_digest", return_value="9" * 64), mock.patch.object(launcher, "install_status_unlocked", return_value={"state": "INSTALLED", "current_bundle_digest": "9" * 64, "history": [{"sequence": 1}]}), mock.patch.object(launcher, "_validate_remote_inputs", return_value=("https://pair.example:8443", "192.0.2.10:8443", [])), mock.patch.object(launcher, "_listen_address_free", return_value=True), mock.patch.object(launcher, "_require_host_identity_ready"), mock.patch.object(launcher, "_tls_probe_context", return_value=tls_context), mock.patch.object(launcher, "_spawn_product_host_with_fds", side_effect=fake_host), mock.patch.object(launcher, "start_agent", side_effect=fake_agent), mock.patch.object(launcher, "_create_run_session", return_value="ses_raw"), mock.patch.object(launcher, "_bootstrap_host", side_effect=fake_bootstrap), mock.patch.object(processes, "spawn", side_effect=fake_spawn), mock.patch.object(launcher, "_wait_relay_role"), mock.patch.object(launcher, "_wait_gateway_route"), mock.patch.object(launcher, "_probe_public_negative_routes") as negative, mock.patch.object(processes, "ownership", return_value="owned"), mock.patch.object(launcher.secrets, "token_bytes", side_effect=lambda _size: next(raw_values)), mock.patch.object(launcher.secrets, "token_urlsafe", return_value="relay-admin-canary-value-0123456789"):
+            coordinator_record = {"name": "lifecycle-coordinator", "pid": 999, "process_group": 999, "identity": "f" * 64}
+            release_read, release_write = os.pipe(); os.close(release_read)
+            operational_read, operational_write = os.pipe(); os.close(operational_write)
+            with mock.patch.object(launcher, "select_bundle_for_start", return_value=bundle), mock.patch.object(launcher, "_selected_bundle_digest", return_value="9" * 64), mock.patch.object(launcher, "install_status_unlocked", return_value={"state": "INSTALLED", "current_bundle_digest": "9" * 64, "history": [{"sequence": 1}]}), mock.patch.object(launcher, "_validate_remote_inputs", return_value=("https://pair.example:8443", "192.0.2.10:8443", [])), mock.patch.object(launcher, "_listen_address_free", return_value=True), mock.patch.object(launcher, "_require_host_identity_ready"), mock.patch.object(launcher, "_tls_probe_context", return_value=tls_context), mock.patch.object(launcher, "_spawn_product_host_with_fds", side_effect=fake_host), mock.patch.object(launcher, "start_agent", side_effect=fake_agent), mock.patch.object(launcher, "_create_run_session", return_value="ses_raw"), mock.patch.object(launcher, "_bootstrap_host", side_effect=fake_bootstrap), mock.patch.object(processes, "spawn", side_effect=fake_spawn), mock.patch.object(launcher.lifecycle_coordinator, "spawn_worker", return_value=(coordinator_record, None, release_write, operational_read)) as coordinator_spawn, mock.patch.object(launcher, "_activate_lifecycle_worker") as activate, mock.patch.object(launcher, "_wait_relay_role"), mock.patch.object(launcher, "_wait_gateway_route"), mock.patch.object(launcher, "_probe_public_negative_routes") as negative, mock.patch.object(processes, "ownership", return_value="owned"), mock.patch.object(launcher.secrets, "token_bytes", side_effect=lambda _size: next(raw_values)), mock.patch.object(launcher.secrets, "token_urlsafe", return_value="relay-admin-canary-value-0123456789"):
                 result = launcher._start_remote_unlocked(config, provider_name="OPENAI_API_KEY", credential_fd=credential, workspace=workspace, public_origin="https://pair.example:8443", https_listen="192.0.2.10:8443", tls_cert_fd=cert, tls_key_fd=key)
 
             names = [item["name"] for item in result["processes"]]
@@ -235,6 +240,12 @@ class M3ELauncherTests(unittest.TestCase):
             self.assertEqual(relay_host[relay_host.index("--v2-db") + 1], relay_device[relay_device.index("--v2-db") + 1])
             self.assertEqual(secrets_by_child["relay-host"][11], secrets_by_child["product-host"][11])
             self.assertNotEqual(secrets_by_child["desktop-gateway"][11], secrets_by_child["join-gateway"][11])
+            self.assertNotIn(12, secrets_by_child["desktop-gateway"])
+            coordinator_spawn.assert_called_once()
+            activate.assert_called_once_with(config, release_write, operational_read, coordinator_record)
+            os.close(release_write); os.close(operational_read)
+            self.assertNotIn("lifecycle-coordinator", names)
+            self.assertEqual(result["lifecycle_coordinator"], coordinator_record)
             self.assertEqual(secrets_by_child["join-gateway"][12], secrets_by_child["https-ingress"][12])
             self.assertEqual(host_seen["remote"]["relay_device_public_base_url"], "https://pair.example:8443")
             self.assertEqual(result["schema"], state.REMOTE_STATE_SCHEMA)
@@ -249,6 +260,69 @@ class M3ELauncherTests(unittest.TestCase):
             surface = (config.home / "run" / "status.json").read_bytes() + json.dumps(calls).encode()
             for secret in (b"c" * 32, b"j" * 32, b"a" * 32, b"t" * 32, b"relay-admin-canary", b"provider-canary", b"cert-canary", b"key-canary", b"agent-password-canary"):
                 self.assertNotIn(secret, surface)
+
+    def test_real_remote_launcher_tracks_and_reaps_lifecycle_sidecar_on_stop(self) -> None:
+        repo = Path(__file__).resolve().parents[2]
+        addresses = re.findall(r"\binet (?!127\.)((?:[0-9]{1,3}\.){3}[0-9]{1,3})\b", subprocess.run(["ifconfig"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True).stdout)
+        if not addresses:
+            self.skipTest("non-loopback IPv4 unavailable")
+        address = addresses[0]
+        with tempfile.TemporaryDirectory(prefix="nomad-p8h-launcher-") as temporary:
+            root = Path(temporary); bundle = root / "bundle"; workspace = root / "workspace"
+            (bundle / "bin").mkdir(parents=True); workspace.mkdir(mode=0o700)
+            shutil.copytree(repo / "mobile-reference" / "pilot-gateway", bundle / "gateway")
+            (bundle / "web").mkdir(); (bundle / "web" / "index.html").write_text("<!doctype html>")
+            for target, package in (("nomad-relay", "./cmd/relay"), ("nomad-ingress", "./cmd/nomad-ingress")):
+                subprocess.run(["go", "build", "-o", str(bundle / "bin" / target), package], cwd=repo / "relay", check=True)
+            (bundle / "bin" / "nomad-product-host").write_bytes(b"placeholder")
+            cert, key = root / "cert.pem", root / "key.pem"
+            subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key), "-out", str(cert), "-days", "1", "-subj", f"/CN={address}", "-addext", f"subjectAltName=IP:{address}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            os.chmod(key, 0o600)
+            config = self.config(root, bundle); state.initialize_home(config)
+            for name in ("bin", "run", "logs"): (config.home / name).mkdir(mode=0o700, exist_ok=True)
+            credential = self.credential_fd(); cert_fd = os.open(cert, os.O_RDONLY); key_fd = os.open(key, os.O_RDONLY)
+            public_port = free_port(); public_origin = f"https://{address}:{public_port}"; digest = "9" * 64
+            installed = {"state": "INSTALLED", "current_bundle_digest": digest, "history": [{"sequence": 1}]}
+            host_sockets = []
+            def fake_host(_binary, _cwd, log_path, _bootstrap_child, **_kwargs):
+                return processes.spawn("product-host", ["/bin/sleep", "30"], root, processes.minimal_env(), log_path)
+            def fake_agent(_bundle, _workspace, _runtime, port, _provider, fd, log_path):
+                os.close(fd); record = processes.spawn("opencode", ["/bin/sleep", "30"], root, processes.minimal_env(), log_path)
+                return {**record, "origin": f"http://127.0.0.1:{port}", "_server_password": "test-only", "_workspace_binding_digest": "8" * 64}
+            def fake_bootstrap(_channel, **kwargs):
+                path = kwargs["product_host_socket_path"]
+                listener = socket.socket(socket.AF_UNIX); listener.bind(str(path)); os.chmod(path, 0o600); listener.listen()
+                host_sockets.append(listener)
+                return launcher._socket_identity(path, launcher._socket_parent_identity(path))
+            sidecar = None
+            try:
+                with mock.patch.object(launcher, "select_bundle_for_start", return_value=bundle.resolve()), mock.patch.object(launcher, "_selected_bundle_digest", return_value=digest), mock.patch.object(launcher, "install_status_unlocked", return_value=installed), mock.patch.object(launcher, "_require_host_identity_ready"), mock.patch.object(launcher, "_spawn_product_host_with_fds", side_effect=fake_host), mock.patch.object(launcher, "start_agent", side_effect=fake_agent), mock.patch.object(launcher, "_create_run_session", return_value="ses-test"), mock.patch.object(launcher, "_bootstrap_host", side_effect=fake_bootstrap), mock.patch.object(launcher, "_probe_public_negative_routes"):
+                    try:
+                        started = launcher._start_remote_unlocked(config, provider_name="OPENAI_API_KEY", credential_fd=credential, workspace=workspace, public_origin=public_origin, https_listen=f"{address}:{public_port}", tls_cert_fd=cert_fd, tls_key_fd=key_fd)
+                    except Exception as error:
+                        logs = "\n".join(path.read_text(errors="replace") for path in (config.home / "logs").glob("*.log"))
+                        raise AssertionError(logs) from error
+                    sidecar = started["lifecycle_coordinator"]
+                    self.assertNotIn(sidecar, started["processes"]); self.assertEqual(processes.ownership(sidecar), "owned")
+                    self.assertEqual(os.getsid(sidecar["pid"]), sidecar["pid"]); self.assertEqual(state.read_run_state(config)["lifecycle_coordinator"], sidecar)
+                    self.assertEqual(launcher.stop_foundation(config)["state"], "STOPPED"); self.assertEqual(processes.ownership(sidecar), "absent"); self.assertIsNone(state.read_run_state(config))
+                    for artifact in (config.home / "private").iterdir():
+                        if artifact.is_file(): os.chmod(artifact, 0o600)
+                    # Restart creates a new exact-bound sidecar and normal stop
+                    # reaps that process too; no stale coordinator is adopted.
+                    credential = self.credential_fd(); cert_fd = os.open(cert, os.O_RDONLY); key_fd = os.open(key, os.O_RDONLY)
+                    restarted = launcher._start_remote_unlocked(config, provider_name="OPENAI_API_KEY", credential_fd=credential, workspace=workspace, public_origin=public_origin, https_listen=f"{address}:{public_port}", tls_cert_fd=cert_fd, tls_key_fd=key_fd)
+                    replacement = restarted["lifecycle_coordinator"]
+                    self.assertNotEqual(replacement["pid"], sidecar["pid"]); self.assertEqual(processes.ownership(replacement), "owned")
+                    self.assertEqual(launcher.stop_foundation(config)["state"], "STOPPED"); self.assertEqual(processes.ownership(replacement), "absent")
+            finally:
+                if sidecar is not None and processes.ownership(sidecar) == "owned": processes.stop(sidecar)
+                if state.read_run_state(config) is not None: launcher.stop_foundation(config)
+                journal = launcher.lifecycle_coordinator.journal_root(config.home, "reset_remote_access")
+                if journal.exists(): shutil.rmtree(journal)
+                for listener in host_sockets:
+                    try: listener.close()
+                    except OSError: pass
 
     def test_running_identity_mismatch_blocks_without_silent_repair(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

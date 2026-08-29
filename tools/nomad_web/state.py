@@ -40,6 +40,7 @@ REMOTE_RUN_KEYS = {
     "join_gateway_port", "relay_host_v2_port",
     "relay_device_v2_port", "relay_admin_port",
     "relay_device_v1_port", "processes", "run_id",
+    "lifecycle_coordinator",
     "session_alias", "workspace_binding_digest",
     "product_host_socket_identity", "identity",
 }
@@ -443,6 +444,18 @@ def _validate_remote_run_state(config: Any, value: dict[str, Any]) -> None:
             raise RuntimeError("INVALID_STATE")
         if not Path(item["log"]).resolve(strict=False).is_relative_to(home / "logs"):
             raise RuntimeError("INVALID_STATE")
+    sidecar = value["lifecycle_coordinator"]
+    if (
+        not isinstance(sidecar, dict)
+        or set(sidecar) != PROCESS_KEYS - {"log"}
+        or sidecar.get("name") != "lifecycle-coordinator"
+        or type(sidecar.get("pid")) is not int
+        or sidecar["pid"] <= 1
+        or sidecar.get("process_group") != sidecar["pid"]
+        or not isinstance(sidecar.get("identity"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", sidecar["identity"]) is None
+    ):
+        raise RuntimeError("INVALID_STATE")
     _validate_identity(
         value["identity"],
         mode=value["mode"],

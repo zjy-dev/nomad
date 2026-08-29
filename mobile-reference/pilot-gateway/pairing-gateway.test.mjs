@@ -7,7 +7,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { AlphaStore } from "./alpha-store.mjs";
-import { createGateway, parseArgs } from "./server.mjs";
+import { PairingSessionError } from "./pairing-session.mjs";
+import { createGateway, createLifecycleBridge, parseArgs } from "./server.mjs";
 import { canonicalJson } from "./product-host-client.mjs";
 
 const PUBLIC_ORIGIN = "https://opaque.pair.nomad.example";
@@ -22,6 +23,93 @@ const KEY_A = Buffer.concat([Buffer.from([4]), Buffer.alloc(64, 1)]).toString(
 const KEY_B = Buffer.concat([Buffer.from([4]), Buffer.alloc(64, 2)]).toString(
   "base64url",
 );
+
+test("lifecycle bridge binds fixed operation to bootstrap identities and hides commit challenge", async () => {
+  const sent = [];
+  const queued = [{
+    schema: "nomad.web-companion.lifecycle-bootstrap.v1",
+    run_id: "1".repeat(64),
+    bundle_digest: "2".repeat(64),
+    install_sequence: 7,
+    gateway_identity: "3".repeat(64),
+    coordinator_identity: "4".repeat(64),
+  }];
+  const waiters = [];
+  const transport = {
+    send(value) { sent.push(value); },
+    receive() {
+      if (queued.length) return Promise.resolve(queued.shift());
+      return new Promise((resolve) => waiters.push(resolve));
+    },
+  };
+  const reply = (value) => waiters.shift()(value);
+  const bridge = createLifecycleBridge({ transport });
+  const beginning = bridge.begin("uninstall", "operation_0123456789");
+  await new Promise((resolve) => setImmediate(resolve));
+  const request = sent[0];
+  assert.deepEqual(
+    Object.keys(request).sort(),
+    ["bundle_digest", "confirm", "coordinator_identity", "gateway_identity",
+      "install_sequence", "operation", "request_id", "run_id", "schema"].sort(),
+  );
+  assert.equal(request.operation, "uninstall");
+  assert.equal(request.request_id, "operation_0123456789");
+  reply({
+    schema: "nomad.web-companion.lifecycle-response.v1",
+    request_id: request.request_id, operation: "uninstall", state: "ACCEPTED",
+    result: null, error: null, commit_challenge: "5".repeat(64),
+  });
+  const accepted = await beginning;
+  assert.deepEqual(accepted, {
+    schema: "nomad.desktop.lifecycle-accepted.v1",
+    state: "accepted", operation_id: request.request_id,
+  });
+  assert.equal(JSON.stringify(accepted).includes("challenge"), false);
+  const committing = bridge.commit();
+  assert.equal(bridge.status().state, "closing");
+  assert.equal(sent[1].commit_challenge, "5".repeat(64));
+  reply({
+    schema: "nomad.web-companion.lifecycle-response.v1",
+    request_id: request.request_id, operation: "uninstall", state: "COMPLETED",
+    result: { safe: "private-to-gateway" }, error: null, commit_challenge: null,
+  });
+  await committing;
+  assert.deepEqual(bridge.status(), {
+    schema: "nomad.desktop.lifecycle-status.v1",
+    operation_id: request.request_id, operation: "uninstall",
+    state: "completed", terminal: true, error: null, recovery: null,
+  });
+});
+
+test("lifecycle begin is single-flight before bootstrap resolves", async () => {
+  const sent = []; const waiters = [];
+  const transport = {
+    send(value) { sent.push(value); },
+    receive() { return new Promise((resolve) => waiters.push(resolve)); },
+  };
+  const bridge = createLifecycleBridge({ transport });
+  const first = bridge.begin("reset_remote_access", "operation_0123456789");
+  await assert.rejects(
+    bridge.begin("uninstall", "operation_9876543210"),
+    { code: "LIFECYCLE_OPERATION_IN_PROGRESS" },
+  );
+  assert.equal(sent.length, 0);
+  waiters.shift()({
+    schema: "nomad.web-companion.lifecycle-bootstrap.v1",
+    run_id: "1".repeat(64), bundle_digest: "2".repeat(64),
+    install_sequence: 7, gateway_identity: "3".repeat(64),
+    coordinator_identity: "4".repeat(64),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(sent.length, 1);
+  waiters.shift()({
+    schema: "nomad.web-companion.lifecycle-response.v1",
+    request_id: sent[0].request_id, operation: "reset_remote_access",
+    state: "ACCEPTED", result: null, error: null,
+    commit_challenge: "5".repeat(64),
+  });
+  await first;
+});
 
 function fakeHost() {
   const envelope = productEnvelope();
@@ -179,24 +267,30 @@ async function gateway(routeTable, host, distDir) {
   const lifecycleBridge =
     routeTable === "desktop"
       ? {
-          async resetRemoteAccess() {
+          current: null,
+          async begin(operation) {
+            if (this.current !== null)
+              throw new PairingSessionError(
+                "LIFECYCLE_OPERATION_IN_PROGRESS",
+                409,
+              );
+            this.current = {
+              schema: "nomad.desktop.lifecycle-status.v1",
+              operation_id: "0123456789abcdef0123456789abcdef",
+              operation,
+              state: "accepted",
+              terminal: false,
+            };
             return {
-              schema: "nomad.desktop.remote-access-reset.v1",
-              state: "STOPPED",
-              remote_access: "cleared",
-              install_state: "preserved",
-              host_identity_disposition: "retained",
+              schema: "nomad.desktop.lifecycle-accepted.v1",
+              state: "accepted",
+              operation_id: this.current.operation_id,
             };
           },
-          async uninstall() {
-            return {
-              schema: "nomad.desktop.uninstall-result.v1",
-              state: "UNINSTALLED",
-              remote_access: "cleared",
-              install_state: "removed",
-              host_identity_disposition: "retained",
-            };
+          async commit() {
+            if (this.current) this.current = { ...this.current, state: "closing" };
           },
+          status() { return this.current; },
         }
       : null;
   const server = createServer(
@@ -442,21 +536,39 @@ test("desktop route table composes official projection, commands, static and pai
       JSON.parse(revoke.text).schema,
       "nomad.product-host.device-revoke.v1",
     );
-    const resetRequest = { schema: "nomad.desktop.remote-access-reset.v1" };
+    const resetRequest = { schema: "nomad.desktop.remote-access-reset.v1", request_id: "reset_0123456789abcdef" };
     const reset = await raw(running.port, "/api/desktop/remote-access/reset", {
       method: "POST",
       headers: desktopHeaders(running.origin),
       body: JSON.stringify(resetRequest),
     });
-    assert.equal(reset.status, 200);
+    assert.equal(reset.status, 202);
     assert.deepEqual(JSON.parse(reset.text), {
-      schema: "nomad.desktop.remote-access-reset.v1",
-      state: "STOPPED",
-      remote_access: "cleared",
-      install_state: "preserved",
-      host_identity_disposition: "retained",
+      schema: "nomad.desktop.lifecycle-accepted.v1",
+      state: "accepted",
+      operation_id: "0123456789abcdef0123456789abcdef",
     });
-    const uninstallRequest = { schema: "nomad.desktop.uninstall.v1" };
+    const lifecycle = await raw(running.port, "/api/desktop/lifecycle/status", {
+      headers: {
+        Host: new URL(running.origin).host,
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
+        "X-Nomad-CSRF": CSRF,
+      },
+    });
+    assert.equal(lifecycle.status, 200);
+    assert.equal(JSON.parse(lifecycle.text).state, "closing");
+    for (const [headers, expected] of [
+      [{ ...desktopHeaders(running.origin), Origin: "http://127.0.0.1:1" }, 403],
+      [{ ...desktopHeaders(running.origin), "X-Nomad-CSRF": "wrong-csrf" }, 403],
+      [{ ...desktopHeaders(running.origin), "X-Nomad-CSRF": undefined }, 403],
+    ]) {
+      assert.equal((await raw(running.port, "/api/desktop/lifecycle/status", { headers })).status, expected);
+    }
+    assert.equal((await raw(running.port, "/api/desktop/lifecycle/status?x=1", { headers: desktopHeaders(running.origin) })).status, 404);
+    assert.equal((await raw(running.port, "/api/desktop/lifecycle/status", { headers: desktopHeaders(running.origin), body: "{}" })).status, 400);
+    const uninstallRequest = { schema: "nomad.desktop.uninstall.v1", request_id: "uninstall_0123456789abcdef" };
     const uninstall = await raw(
       running.port,
       "/api/desktop/install/uninstall",
@@ -466,14 +578,7 @@ test("desktop route table composes official projection, commands, static and pai
         body: JSON.stringify(uninstallRequest),
       },
     );
-    assert.equal(uninstall.status, 200);
-    assert.deepEqual(JSON.parse(uninstall.text), {
-      schema: "nomad.desktop.uninstall-result.v1",
-      state: "UNINSTALLED",
-      remote_access: "cleared",
-      install_state: "removed",
-      host_identity_disposition: "retained",
-    });
+    assert.equal(uninstall.status, 409);
     assert.deepEqual(host.calls, [
       ["create", createRequest],
       ["approve", approveRequest],
@@ -856,6 +961,8 @@ test("CLI route-table contract requires explicit HTTPS public origin for desktop
     ...identity,
     "--command-key-fd",
     "11",
+    "--lifecycle-channel-fd",
+    "12",
     "--public-origin",
     PUBLIC_ORIGIN,
     "--state-db",

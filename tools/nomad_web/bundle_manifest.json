@@ -29,6 +29,12 @@
     "production_ready": false,
     "external_readiness": "NOT_RUN"
   },
+  "lifecycle_coordinator": {
+    "installed_runtime_module": "tools/nomad_web/lifecycle_coordinator.py",
+    "gateway_channel_fd": 12,
+    "execution_model": "separate-session-process-group",
+    "browser_result": "durable-acceptance-only"
+  },
   "ordinary_user_commands": [
     "install",
     "install-status",
@@ -38,6 +44,7 @@
     "status",
     "stop",
     "reset-remote-access",
+    "operation-status",
     "diagnostics",
     "uninstall"
   ],

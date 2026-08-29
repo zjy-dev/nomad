@@ -45,21 +45,24 @@ export interface DesktopPairingRevokeResult {
   revoked_epoch: number;
 }
 
-export interface DesktopRemoteAccessResetResult {
-  schema: "nomad.desktop.remote-access-reset.v1";
-  state: "STOPPED";
-  remote_access: "cleared";
-  install_state: "preserved";
-  host_identity_disposition: "retained";
+export interface DesktopLifecycleAccepted {
+  schema: "nomad.desktop.lifecycle-accepted.v1";
+  state: "accepted";
+  operation_id: string;
 }
 
-export interface DesktopUninstallResult {
-  schema: "nomad.desktop.uninstall-result.v1";
-  state: "UNINSTALLED";
-  remote_access: "cleared";
-  install_state: "removed";
-  host_identity_disposition: "retained";
+export interface DesktopLifecycleStatus {
+  schema: "nomad.desktop.lifecycle-status.v1";
+  operation_id: string;
+  operation: "reset_remote_access" | "uninstall";
+  state: "accepted" | "closing" | "completed" | "failed" | "outcome_unknown";
+  terminal: boolean;
+  error: "LIFECYCLE_COMMIT_NOT_OBSERVED" | "LIFECYCLE_OPERATION_FAILED" | "LIFECYCLE_OUTCOME_UNKNOWN" | null;
+  recovery: "RUN_DIAGNOSTICS" | "RUN_OPERATION_STATUS" | null;
 }
+
+export type DesktopRemoteAccessResetResult = DesktopLifecycleAccepted;
+export type DesktopUninstallResult = DesktopLifecycleAccepted;
 
 export interface DesktopPairingClient {
   getCurrentDevice(): Promise<DesktopPairingCurrentDevice>;
@@ -78,6 +81,7 @@ export interface DesktopPairingClient {
   }): Promise<DesktopPairingRevokeResult>;
   resetRemoteAccess(): Promise<DesktopRemoteAccessResetResult>;
   uninstall(): Promise<DesktopUninstallResult>;
+  getLifecycleStatus?(operationId: string): Promise<DesktopLifecycleStatus>;
 }
 
 export interface DesktopPairingClientOptions {
@@ -87,10 +91,12 @@ export interface DesktopPairingClientOptions {
 
 export class DesktopPairingClientError extends Error {
   readonly code: string;
+  readonly operationId: string | null;
 
-  constructor(code: string, message: string) {
+  constructor(code: string, message: string, operationId: string | null = null) {
     super(message);
     this.code = code;
+    this.operationId = operationId;
   }
 }
 
@@ -328,17 +334,44 @@ export function createDesktopPairingClient(
     },
 
     async resetRemoteAccess() {
-      const value = await postJson("/api/desktop/remote-access/reset", {
-        schema: "nomad.desktop.remote-access-reset.v1",
-      }, LIFECYCLE_ROUTE_ERROR_CODES);
-      return decodeReset(value);
+      const requestId = lifecycleRequestId();
+      try {
+        const value = await postJson("/api/desktop/remote-access/reset", {
+          schema: "nomad.desktop.remote-access-reset.v1", request_id: requestId,
+        }, LIFECYCLE_ROUTE_ERROR_CODES);
+        return decodeLifecycleAccepted(value, requestId);
+      } catch (error) {
+        throw lifecycleError(error, requestId);
+      }
     },
 
     async uninstall() {
-      const value = await postJson("/api/desktop/install/uninstall", {
-        schema: "nomad.desktop.uninstall.v1",
-      }, LIFECYCLE_ROUTE_ERROR_CODES);
-      return decodeUninstall(value);
+      const requestId = lifecycleRequestId();
+      try {
+        const value = await postJson("/api/desktop/install/uninstall", {
+          schema: "nomad.desktop.uninstall.v1", request_id: requestId,
+        }, LIFECYCLE_ROUTE_ERROR_CODES);
+        return decodeLifecycleAccepted(value, requestId);
+      } catch (error) {
+        throw lifecycleError(error, requestId);
+      }
+    },
+
+    async getLifecycleStatus(operationId) {
+      const value = await withCsrfRetry((csrf) => readJson(
+        "/api/desktop/lifecycle/status",
+        {
+          method: "GET", credentials: "same-origin",
+          headers: {
+            accept: "application/json",
+            "X-Nomad-CSRF": csrf,
+          },
+        },
+        "CSRF_REJECTED",
+      ));
+      const status = decodeLifecycleStatus(value);
+      if (status.operation_id !== operationId) invalid();
+      return status;
     },
   };
 }
@@ -469,54 +502,46 @@ function decodeRevoke(value: unknown): DesktopPairingRevokeResult {
   };
 }
 
-function decodeReset(value: unknown): DesktopRemoteAccessResetResult {
-  const raw = exactObject(value, [
-    "schema",
-    "state",
-    "remote_access",
-    "install_state",
-    "host_identity_disposition",
-  ]);
+function decodeLifecycleAccepted(value: unknown, requestId: string): DesktopLifecycleAccepted {
+  const raw = exactObject(value, ["schema", "state", "operation_id"]);
   if (
-    raw.schema !== "nomad.desktop.remote-access-reset.v1" ||
-    raw.state !== "STOPPED" ||
-    raw.remote_access !== "cleared" ||
-    raw.install_state !== "preserved" ||
-    raw.host_identity_disposition !== "retained"
-  )
-    invalid();
-  return {
-    schema: raw.schema,
-    state: raw.state,
-    remote_access: raw.remote_access,
-    install_state: raw.install_state,
-    host_identity_disposition: raw.host_identity_disposition,
-  };
+    raw.schema !== "nomad.desktop.lifecycle-accepted.v1" ||
+    raw.state !== "accepted" || raw.operation_id !== requestId
+  ) invalid();
+  return { schema: raw.schema, state: raw.state, operation_id: raw.operation_id };
 }
 
-function decodeUninstall(value: unknown): DesktopUninstallResult {
+function lifecycleRequestId(): string {
+  return globalThis.crypto.randomUUID().replaceAll("-", "");
+}
+
+function lifecycleError(error: unknown, operationId: string): Error {
+  if (error instanceof DesktopPairingClientError)
+    return new DesktopPairingClientError(error.code, error.message, operationId);
+  return new DesktopPairingClientError(
+    "PAIRING_NETWORK_ERROR",
+    "Desktop lifecycle request may have started, but no authoritative response was received.",
+    operationId,
+  );
+}
+
+function decodeLifecycleStatus(value: unknown): DesktopLifecycleStatus {
   const raw = exactObject(value, [
-    "schema",
-    "state",
-    "remote_access",
-    "install_state",
-    "host_identity_disposition",
+    "schema", "operation_id", "operation", "state", "terminal",
+    "error", "recovery",
   ]);
+  const states = ["accepted", "closing", "completed", "failed", "outcome_unknown"];
   if (
-    raw.schema !== "nomad.desktop.uninstall-result.v1" ||
-    raw.state !== "UNINSTALLED" ||
-    raw.remote_access !== "cleared" ||
-    raw.install_state !== "removed" ||
-    raw.host_identity_disposition !== "retained"
-  )
-    invalid();
-  return {
-    schema: raw.schema,
-    state: raw.state,
-    remote_access: raw.remote_access,
-    install_state: raw.install_state,
-    host_identity_disposition: raw.host_identity_disposition,
-  };
+    raw.schema !== "nomad.desktop.lifecycle-status.v1" ||
+    !opaque(raw.operation_id) ||
+    !["reset_remote_access", "uninstall"].includes(String(raw.operation)) ||
+    !states.includes(String(raw.state)) ||
+    typeof raw.terminal !== "boolean" ||
+    raw.terminal !== ["completed", "failed", "outcome_unknown"].includes(String(raw.state))
+  ) invalid();
+  if (raw.error !== null && !["LIFECYCLE_COMMIT_NOT_OBSERVED", "LIFECYCLE_OPERATION_FAILED", "LIFECYCLE_OUTCOME_UNKNOWN"].includes(String(raw.error))) invalid();
+  if (raw.recovery !== null && !["RUN_DIAGNOSTICS", "RUN_OPERATION_STATUS"].includes(String(raw.recovery))) invalid();
+  return raw as unknown as DesktopLifecycleStatus;
 }
 
 function exactObject(value: unknown, keys: string[]): Record<string, unknown> {

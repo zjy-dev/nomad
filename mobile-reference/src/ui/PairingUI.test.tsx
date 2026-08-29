@@ -22,11 +22,12 @@ import type {
   DesktopPairingCurrentDevice,
   DesktopPairingCreatedJoin,
   DesktopPairingJoinStatus,
+  DesktopLifecycleStatus,
   DesktopRemoteAccessResetResult,
   DesktopPairingRevokeResult,
   DesktopUninstallResult,
 } from "./pairing-api";
-import { createDesktopPairingClient } from "./pairing-api";
+import { createDesktopPairingClient, DesktopPairingClientError } from "./pairing-api";
 
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
@@ -225,19 +226,21 @@ describe("PairingConsole", () => {
       }) as DesktopPairingClient["revokeDevice"],
       resetRemoteAccess: vi.fn(
         async (): Promise<DesktopRemoteAccessResetResult> => ({
-          schema: "nomad.desktop.remote-access-reset.v1",
-          state: "STOPPED",
-          remote_access: "cleared",
-          install_state: "preserved",
-          host_identity_disposition: "retained",
+          schema: "nomad.desktop.lifecycle-accepted.v1",
+          state: "accepted",
+          operation_id: "reset_0123456789abcdef",
         }),
       ),
       uninstall: vi.fn(async (): Promise<DesktopUninstallResult> => ({
-        schema: "nomad.desktop.uninstall-result.v1",
-        state: "UNINSTALLED",
-        remote_access: "cleared",
-        install_state: "removed",
-        host_identity_disposition: "retained",
+        schema: "nomad.desktop.lifecycle-accepted.v1",
+        state: "accepted",
+        operation_id: "uninstall_0123456789abcdef",
+      })),
+      getLifecycleStatus: vi.fn(async (): Promise<DesktopLifecycleStatus> => ({
+        schema: "nomad.desktop.lifecycle-status.v1",
+        operation_id: "reset_0123456789abcdef",
+        operation: "reset_remote_access", state: "closing", terminal: false,
+        error: null, recovery: null,
       })),
     };
 
@@ -254,14 +257,37 @@ describe("PairingConsole", () => {
     await act(async () => button("Reset now").click());
     expect(client.resetRemoteAccess).toHaveBeenCalledTimes(1);
     expect(output.textContent).toContain(
-      "Installed bundle and Host identity were kept.",
+      "installed bundle and Host identity are retained.",
     );
+    expect(button("Reset remote access").disabled).toBe(true);
+    expect(button("Uninstall Nomad").disabled).toBe(true);
 
-    await act(async () => button("Uninstall Nomad").click());
-    expect(output.textContent).toContain("Host identity is retained");
-    await act(async () => button("Uninstall now").click());
-    expect(client.uninstall).toHaveBeenCalledTimes(1);
-    expect(output.textContent).toContain("Nomad was uninstalled.");
+    expect(client.uninstall).not.toHaveBeenCalled();
+  });
+
+  it("treats lifecycle network loss as unknown and locks destructive controls", async () => {
+    const client: DesktopPairingClient = {
+      getCurrentDevice: vi.fn(async () => currentDevice(false)),
+      createJoin: vi.fn(async () => { throw new Error("unused"); }),
+      getJoinStatus: vi.fn(async () => { throw new Error("unused"); }),
+      approveJoin: vi.fn(async () => {}), cancelJoin: vi.fn(async () => {}),
+      revokeDevice: vi.fn(async () => { throw new Error("unused"); }),
+      resetRemoteAccess: vi.fn(async () => {
+        throw new DesktopPairingClientError(
+          "PAIRING_NETWORK_ERROR", "lost", "operation_0123456789",
+        );
+      }),
+      uninstall: vi.fn(async () => { throw new Error("unused"); }),
+    };
+    const output = await render(<PairingConsole client={client} />); await flush();
+    await act(async () => button("Reset remote access").click());
+    await act(async () => button("Reset now").click());
+    expect(output.textContent).toContain("Operation outcome unknown. Do not retry.");
+    expect(output.textContent).toContain(
+      "nomad-web operation-status --operation-id operation_0123456789",
+    );
+    expect(button("Reset now").disabled).toBe(true);
+    expect(button("Uninstall Nomad").disabled).toBe(true);
   });
 });
 
@@ -784,21 +810,19 @@ describe("createDesktopPairingClient", () => {
           });
         }
         if (url.endsWith("/api/desktop/remote-access/reset")) {
+          const requestId = JSON.parse(String(init?.body)).request_id;
           return jsonResponse({
-            schema: "nomad.desktop.remote-access-reset.v1",
-            state: "STOPPED",
-            remote_access: "cleared",
-            install_state: "preserved",
-            host_identity_disposition: "retained",
+            schema: "nomad.desktop.lifecycle-accepted.v1",
+            state: "accepted",
+            operation_id: requestId,
           } satisfies DesktopRemoteAccessResetResult);
         }
         if (url.endsWith("/api/desktop/install/uninstall")) {
+          const requestId = JSON.parse(String(init?.body)).request_id;
           return jsonResponse({
-            schema: "nomad.desktop.uninstall-result.v1",
-            state: "UNINSTALLED",
-            remote_access: "cleared",
-            install_state: "removed",
-            host_identity_disposition: "retained",
+            schema: "nomad.desktop.lifecycle-accepted.v1",
+            state: "accepted",
+            operation_id: requestId,
           } satisfies DesktopUninstallResult);
         }
         throw new Error(`Unexpected request: ${url}`);
@@ -820,6 +844,23 @@ describe("createDesktopPairingClient", () => {
     expect(
       requests.every((request) => !request.url.includes("/internal/")),
     ).toBe(true);
+  });
+
+  it("strictly decodes lifecycle status and binds the operation id", async () => {
+    const fetchImpl: typeof fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/api/desktop/security")) return jsonResponse({ schema: "nomad.gateway.desktop-security.v1", csrf_token: "csrf_token_00000001" });
+      if (url.endsWith("/api/desktop/lifecycle/status")) return jsonResponse({
+        schema: "nomad.desktop.lifecycle-status.v1",
+        operation_id: "operation_0123456789", operation: "uninstall",
+        state: "outcome_unknown", terminal: true,
+        error: "LIFECYCLE_OUTCOME_UNKNOWN", recovery: "RUN_OPERATION_STATUS",
+      });
+      throw new Error(`Unexpected request: ${url}`);
+    }) as typeof fetch;
+    const client = createDesktopPairingClient({ baseUrl: "https://nomad.local", fetchImpl });
+    await expect(client.getLifecycleStatus!("operation_0123456789")).resolves.toMatchObject({ state: "outcome_unknown", recovery: "RUN_OPERATION_STATUS" });
+    await expect(client.getLifecycleStatus!("operation_wrong_123456")).rejects.toMatchObject({ code: "PAIRING_INVALID_RESPONSE" });
   });
 
   it("preserves the allowlisted uninstall blocker from the desktop lifecycle route", async () => {

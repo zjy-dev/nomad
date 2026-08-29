@@ -1,12 +1,11 @@
 #!/usr/bin/env node
-import { createReadStream, existsSync, statSync } from "node:fs";
+import { createReadStream, existsSync, fstatSync, statSync } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
+import { Socket } from "node:net";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { TextDecoder } from "node:util";
 import { randomBytes } from "node:crypto";
-import { execFile as execFileCallback } from "node:child_process";
-import { promisify } from "node:util";
 import { AlphaStateError, AlphaStore } from "./alpha-store.mjs";
 import {
   CommandSecurityError,
@@ -18,6 +17,7 @@ import {
   readDesktopJson,
   readTrustedIngressTokenFromFd,
   validateDesktopSecurityRead,
+  validateDesktopRead,
   validateDesktopApprove,
   validateDesktopCancel,
   validateDesktopCreate,
@@ -28,6 +28,7 @@ import {
   validateJoinId,
 } from "./pairing-session.mjs";
 import {
+  canonicalJson,
   ProductHostClient,
   ProductHostClientError,
   readCommandKeyFromFd,
@@ -42,8 +43,17 @@ import {
 const FRAME_ID = /^[0-9a-f]{16}$/;
 const HEX_PAYLOAD = /^(?:[0-9a-fA-F]{2})+$/;
 const MAX_RELAY_FRAMES = 100;
+const MAX_LIFECYCLE_FRAME_BYTES = 4096;
+const LIFECYCLE_BOOTSTRAP_SCHEMA =
+  "nomad.web-companion.lifecycle-bootstrap.v1";
+const LIFECYCLE_REQUEST_SCHEMA =
+  "nomad.web-companion.lifecycle-request.v1";
+const LIFECYCLE_COMMIT_SCHEMA =
+  "nomad.web-companion.lifecycle-commit.v1";
+const LIFECYCLE_RESPONSE_SCHEMA =
+  "nomad.web-companion.lifecycle-response.v1";
+const HEX64 = /^[0-9a-f]{64}$/;
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
-const execFile = promisify(execFileCallback);
 
 export function createGateway(options) {
   const mode = options.mode ?? "foundation-readonly";
@@ -108,8 +118,7 @@ export function createGateway(options) {
       : null;
   const lifecycleBridge =
     routeTable === "desktop"
-      ? (options.lifecycleBridge ??
-        createLifecycleBridge(options.lifecycleBridgeOptions ?? {}))
+      ? lazyLifecycleBridge(options)
       : null;
   let ingestFlight = null;
 
@@ -334,7 +343,9 @@ async function handleDesktopRoute(
     void body;
     if (!lifecycleBridge)
       throw new PairingSessionError("PAIRING_UNAVAILABLE", 503);
-    json(response, 200, await lifecycleBridge.resetRemoteAccess());
+    const accepted = await lifecycleBridge.begin("reset_remote_access", body.request_id);
+    response.once("finish", () => void lifecycleBridge.commit());
+    json(response, 202, accepted);
     return true;
   }
   if (url.pathname === "/api/desktop/install/uninstall") {
@@ -348,7 +359,23 @@ async function handleDesktopRoute(
     void body;
     if (!lifecycleBridge)
       throw new PairingSessionError("PAIRING_UNAVAILABLE", 503);
-    json(response, 200, await lifecycleBridge.uninstall());
+    const accepted = await lifecycleBridge.begin("uninstall", body.request_id);
+    response.once("finish", () => void lifecycleBridge.commit());
+    json(response, 202, accepted);
+    return true;
+  }
+  if (url.pathname === "/api/desktop/lifecycle/status") {
+    if (request.method !== "GET") {
+      json(response, 405, { error: "METHOD_NOT_ALLOWED" });
+      return true;
+    }
+    validateDesktopRead(request, origin, csrf);
+    const projection = lifecycleBridge?.status();
+    if (!projection) {
+      json(response, 404, { error: "LIFECYCLE_OPERATION_NOT_FOUND" });
+      return true;
+    }
+    json(response, 200, projection);
     return true;
   }
   if (url.pathname === "/api/desktop/security") {
@@ -724,122 +751,244 @@ function safePairingHostCode(error) {
     : "PAIRING_UNAVAILABLE";
 }
 
-function createLifecycleBridge(options = {}) {
+export function createLifecycleBridge(options = {}) {
+  const transport = options.transport ?? lifecycleTransport(options.channelFd);
+  const ready = transport.receive().then(validateLifecycleBootstrap);
+  let current = null;
+  let beginning = false;
+  let commitFlight = null;
   return {
-    async resetRemoteAccess() {
-      return invokeLifecycleCommand("reset-remote-access", options);
-    },
-    async uninstall() {
-      return invokeLifecycleCommand("uninstall", options);
-    },
-  };
-}
-
-async function invokeLifecycleCommand(command, options) {
-  const python =
-    options.pythonBin ??
-    process.env.NOMAD_DESKTOP_LIFECYCLE_PYTHON ??
-    "python3";
-  const repoRoot =
-    options.repoRoot ??
-    process.env.NOMAD_DESKTOP_LIFECYCLE_REPO_ROOT ??
-    fileURLToPath(new URL("../../..", import.meta.url));
-  const env = {
-    ...process.env,
-    ...(options.env ?? {}),
-  };
-  try {
-    const { stdout } = await execFile(
-      python,
-      ["-m", "tools.nomad_web.cli", "--json", command],
-      {
-        cwd: repoRoot,
-        env,
-        timeout: 30_000,
-        maxBuffer: 128 * 1024,
-      },
-    );
-    const parsed = JSON.parse(stdout);
-    if (command === "reset-remote-access") return decodeLifecycleReset(parsed);
-    return decodeLifecycleUninstall(parsed);
-  } catch (error) {
-    if (
-      error &&
-      typeof error === "object" &&
-      "stdout" in error &&
-      typeof error.stdout === "string"
-    ) {
+    async begin(operation, requestId) {
+      if (!new Set(["reset_remote_access", "uninstall"]).has(operation))
+        throw new PairingSessionError("LIFECYCLE_UNAVAILABLE", 503);
+      if (beginning || current !== null)
+        throw new PairingSessionError("LIFECYCLE_OPERATION_IN_PROGRESS", 409);
+      if (typeof requestId !== "string" || !/^[A-Za-z0-9_-]{16,128}$/.test(requestId))
+        throw new PairingSessionError("LIFECYCLE_REQUEST_INVALID", 400);
+      beginning = true;
       try {
-        const parsed = JSON.parse(error.stdout);
-        const code =
-          typeof parsed.error === "string"
-            ? parsed.error
-            : "PAIRING_UNAVAILABLE";
-        throw new PairingSessionError(code, 409);
-      } catch (decodeError) {
-        if (decodeError instanceof PairingSessionError) throw decodeError;
+        const binding = await ready;
+        const request = {
+          schema: LIFECYCLE_REQUEST_SCHEMA,
+          operation,
+          confirm: true,
+          request_id: requestId,
+          run_id: binding.run_id,
+          bundle_digest: binding.bundle_digest,
+          install_sequence: binding.install_sequence,
+          gateway_identity: binding.gateway_identity,
+          coordinator_identity: binding.coordinator_identity,
+        };
+        current = {
+          request, challenge: null, publicState: "outcome_unknown",
+          error: "LIFECYCLE_OUTCOME_UNKNOWN",
+        };
+        transport.send(request);
+        const accepted = validateLifecycleResponse(
+          await transport.receive(), request, "ACCEPTED",
+        );
+        current.challenge = accepted.commit_challenge;
+        current.publicState = "accepted";
+        current.error = null;
+        return lifecycleAccepted(request.request_id);
+      } finally {
+        beginning = false;
       }
-    }
-    throw new PairingSessionError("PAIRING_UNAVAILABLE", 503);
+    },
+    commit() {
+      if (commitFlight) return commitFlight;
+      if (current === null) return Promise.resolve();
+      current.publicState = "closing";
+      const commit = {
+        ...current.request,
+        schema: LIFECYCLE_COMMIT_SCHEMA,
+        commit_challenge: current.challenge,
+      };
+      commitFlight = (async () => {
+        transport.send(commit);
+        const completed = validateLifecycleResponse(
+          await transport.receive(),
+          current.request,
+        );
+        current.publicState =
+          completed.state === "COMPLETED"
+            ? "completed"
+            : completed.state === "OUTCOME_UNKNOWN"
+              ? "outcome_unknown"
+              : "failed";
+        current.error = completed.error;
+        current.challenge = null;
+      })().catch(() => {
+        // Closing the Gateway is part of both operations. A lost channel is
+        // therefore not evidence of success or failure; retain closing.
+      });
+      return commitFlight;
+    },
+    status() {
+      if (current === null) return null;
+      return {
+        schema: "nomad.desktop.lifecycle-status.v1",
+        operation_id: current.request.request_id,
+        operation: current.request.operation,
+        state: current.publicState,
+        terminal: new Set(["completed", "failed", "outcome_unknown"]).has(
+          current.publicState,
+        ),
+        error: current.error,
+        recovery: lifecycleRecovery(current.publicState),
+      };
+    },
+  };
+}
+
+function lifecycleRecovery(state) {
+  if (state === "failed") return "RUN_DIAGNOSTICS";
+  if (state === "outcome_unknown") return "RUN_OPERATION_STATUS";
+  return null;
+}
+
+function lazyLifecycleBridge(options) {
+  if (options.lifecycleBridge) return options.lifecycleBridge;
+  let bridge = null;
+  const get = () => {
+    bridge ??= createLifecycleBridge({
+      channelFd: options.lifecycleChannelFd,
+      ...(options.lifecycleBridgeOptions ?? {}),
+    });
+    return bridge;
+  };
+  return {
+    begin(operation, requestId) { return get().begin(operation, requestId); },
+    commit() { return get().commit(); },
+    status() { return get().status(); },
+  };
+}
+
+function lifecycleAccepted(operationId) {
+  return {
+    schema: "nomad.desktop.lifecycle-accepted.v1",
+    state: "accepted",
+    operation_id: operationId,
+  };
+}
+
+function lifecycleTransport(fd) {
+  if (!Number.isInteger(fd) || fd !== 12)
+    throw new PairingSessionError("LIFECYCLE_UNAVAILABLE", 503);
+  let info;
+  try {
+    info = fstatSync(fd);
+  } catch {
+    throw new PairingSessionError("LIFECYCLE_UNAVAILABLE", 503);
   }
-}
-
-function decodeLifecycleReset(value) {
-  const raw = exactObject(value, [
-    "schema",
-    "state",
-    "mode",
-    "remote_access",
-    "install_state",
-    "host_identity_disposition",
-    "production_ready",
-  ]);
-  if (
-    raw.schema !== "nomad.web-companion.remote-access-reset.v1" ||
-    raw.state !== "STOPPED" ||
-    raw.mode !== "foundation-readonly" ||
-    raw.remote_access !== "CLEARED" ||
-    raw.install_state !== "PRESERVED" ||
-    raw.host_identity_disposition !== "retained" ||
-    raw.production_ready !== false
-  )
-    throw new PairingSessionError("PAIRING_UNAVAILABLE", 503);
+  if (!info.isSocket())
+    throw new PairingSessionError("LIFECYCLE_UNAVAILABLE", 503);
+  const channel = new Socket({ fd, readable: true, writable: true });
+  let buffered = Buffer.alloc(0);
+  const frames = [];
+  const waiters = [];
+  let failure = null;
+  const rejectAll = (error) => {
+    if (failure) return;
+    failure = error;
+    while (waiters.length) waiters.shift().reject(error);
+  };
+  channel.on("data", (chunk) => {
+    buffered = Buffer.concat([buffered, chunk]);
+    while (buffered.length >= 4) {
+      const length = buffered.readUInt32BE(0);
+      if (length < 1 || length > MAX_LIFECYCLE_FRAME_BYTES) {
+        rejectAll(new Error("LIFECYCLE_FRAME_INVALID"));
+        channel.destroy();
+        return;
+      }
+      if (buffered.length < length + 4) return;
+      const raw = buffered.subarray(4, length + 4);
+      buffered = buffered.subarray(length + 4);
+      let value;
+      try {
+        const text = utf8Decoder.decode(raw);
+        value = strictLifecycleJson(text);
+        if (canonicalJson(value) !== text) throw new Error("noncanonical");
+      } catch {
+        rejectAll(new Error("LIFECYCLE_FRAME_INVALID"));
+        channel.destroy();
+        return;
+      }
+      if (waiters.length) waiters.shift().resolve(value);
+      else frames.push(value);
+    }
+  });
+  channel.on("error", rejectAll);
+  channel.on("close", () => rejectAll(new Error("LIFECYCLE_CHANNEL_CLOSED")));
   return {
-    schema: "nomad.desktop.remote-access-reset.v1",
-    state: raw.state,
-    remote_access: "cleared",
-    install_state: "preserved",
-    host_identity_disposition: "retained",
+    send(value) {
+      if (failure) throw failure;
+      const raw = Buffer.from(canonicalJson(value), "utf8");
+      if (raw.length < 1 || raw.length > MAX_LIFECYCLE_FRAME_BYTES)
+        throw new Error("LIFECYCLE_FRAME_INVALID");
+      const frame = Buffer.allocUnsafe(raw.length + 4);
+      frame.writeUInt32BE(raw.length, 0);
+      raw.copy(frame, 4);
+      channel.write(frame);
+    },
+    receive() {
+      if (frames.length) return Promise.resolve(frames.shift());
+      if (failure) return Promise.reject(failure);
+      return new Promise((resolve, reject) => waiters.push({ resolve, reject }));
+    },
   };
 }
 
-function decodeLifecycleUninstall(value) {
+function validateLifecycleBootstrap(value) {
   const raw = exactObject(value, [
-    "schema",
-    "state",
-    "mode",
-    "remote_access",
-    "install_state",
-    "host_identity_disposition",
-    "production_ready",
+    "schema", "run_id", "bundle_digest", "install_sequence",
+    "gateway_identity", "coordinator_identity",
   ]);
   if (
-    raw.schema !== "nomad.web-companion.uninstall-result.v1" ||
-    raw.state !== "UNINSTALLED" ||
-    raw.mode !== "foundation-readonly" ||
-    raw.remote_access !== "CLEARED" ||
-    raw.install_state !== "REMOVED" ||
-    raw.host_identity_disposition !== "retained" ||
-    raw.production_ready !== false
+    raw.schema !== LIFECYCLE_BOOTSTRAP_SCHEMA ||
+    !HEX64.test(raw.run_id ?? "") ||
+    !HEX64.test(raw.bundle_digest ?? "") ||
+    !Number.isSafeInteger(raw.install_sequence) ||
+    raw.install_sequence < 1 ||
+    !HEX64.test(raw.gateway_identity ?? "") ||
+    !HEX64.test(raw.coordinator_identity ?? "")
   )
-    throw new PairingSessionError("PAIRING_UNAVAILABLE", 503);
-  return {
-    schema: "nomad.desktop.uninstall-result.v1",
-    state: raw.state,
-    remote_access: "cleared",
-    install_state: "removed",
-    host_identity_disposition: "retained",
-  };
+    throw new PairingSessionError("LIFECYCLE_UNAVAILABLE", 503);
+  return raw;
+}
+
+function validateLifecycleResponse(value, request, requiredState = null) {
+  const raw = exactObject(value, [
+    "schema", "request_id", "operation", "state", "result",
+    "error", "commit_challenge",
+  ]);
+  const states = new Set(["ACCEPTED", "COMPLETED", "FAILED", "OUTCOME_UNKNOWN"]);
+  if (
+    raw.schema !== LIFECYCLE_RESPONSE_SCHEMA ||
+    raw.request_id !== request.request_id ||
+    raw.operation !== request.operation ||
+    !states.has(raw.state) ||
+    (requiredState !== null && raw.state !== requiredState)
+  )
+    throw new PairingSessionError("LIFECYCLE_UNAVAILABLE", 503);
+  if (raw.state === "ACCEPTED") {
+    if (!HEX64.test(raw.commit_challenge ?? "") || raw.result !== null || raw.error !== null)
+      throw new PairingSessionError("LIFECYCLE_UNAVAILABLE", 503);
+  } else if (raw.commit_challenge !== null) {
+    throw new PairingSessionError("LIFECYCLE_UNAVAILABLE", 503);
+  }
+  return raw;
+}
+
+function strictLifecycleJson(raw) {
+  let index = 0; let nodes = 0;
+  const ws = () => { while (" \t\r\n".includes(raw[index] ?? "!")) index += 1; };
+  const value = (depth) => { ws(); if (++nodes > 2048 || depth > 12) throw new Error("budget"); const char = raw[index]; if (char === "{") return objectValue(depth + 1); if (char === "[") return arrayValue(depth + 1); if (char === '"') return stringValue(); for (const pair of [["true", true], ["false", false], ["null", null]]) if (raw.startsWith(pair[0], index)) { index += pair[0].length; return pair[1]; } const match = raw.slice(index).match(/^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?/); if (!match) throw new Error("value"); index += match[0].length; const number = Number(match[0]); if (!Number.isFinite(number)) throw new Error("number"); return number; };
+  const stringValue = () => { const start = index++; while (index < raw.length) { const code = raw.charCodeAt(index++); if (code === 34) return JSON.parse(raw.slice(start, index)); if (code < 32) throw new Error("string"); if (code === 92) { const escaped = raw[index++]; if (escaped === "u") { if (!/^[0-9a-fA-F]{4}$/.test(raw.slice(index, index + 4))) throw new Error("escape"); index += 4; } else if (!'"\\/bfnrt'.includes(escaped ?? "")) throw new Error("escape"); } } throw new Error("string"); };
+  const objectValue = (depth) => { index += 1; ws(); const result = {}; const keys = new Set(); if (raw[index] === "}") { index += 1; return result; } while (true) { ws(); if (raw[index] !== '"') throw new Error("key"); const key = stringValue(); if (keys.has(key)) throw new Error("duplicate"); keys.add(key); ws(); if (raw[index++] !== ":") throw new Error("colon"); result[key] = value(depth); ws(); const delimiter = raw[index++]; if (delimiter === "}") return result; if (delimiter !== ",") throw new Error("delimiter"); } };
+  const arrayValue = (depth) => { index += 1; ws(); const result = []; if (raw[index] === "]") { index += 1; return result; } while (true) { result.push(value(depth)); ws(); const delimiter = raw[index++]; if (delimiter === "]") return result; if (delimiter !== ",") throw new Error("delimiter"); } };
+  const parsed = value(0); ws(); if (index !== raw.length) throw new Error("trailing"); return parsed;
 }
 
 function exactObject(value, expectedKeys) {
@@ -965,6 +1114,7 @@ export function parseArgs(args, env = process.env) {
     routeTable: "legacy",
     publicOrigin: undefined,
     trustedIngressFd: undefined,
+    lifecycleChannelFd: undefined,
   };
   const allowed = new Set([
     "mode",
@@ -982,6 +1132,7 @@ export function parseArgs(args, env = process.env) {
     "command-key-fd",
     "public-origin",
     "trusted-ingress-fd",
+    "lifecycle-channel-fd",
   ]);
   for (let index = 0; index < args.length; index += 2) {
     const name = args[index]?.replace(/^--/, "");
@@ -1023,9 +1174,12 @@ export function parseArgs(args, env = process.env) {
       if (!out.publicOrigin) throw new Error("Missing --public-origin");
     } else if (out.routeTable === "desktop") {
       if (!out.publicOrigin) throw new Error("Missing --public-origin");
+      if (out.lifecycleChannelFd !== "12")
+        throw new Error("Missing or invalid --lifecycle-channel-fd");
+      out.lifecycleChannelFd = 12;
       if (out.trustedIngressFd !== undefined)
         throw new Error("Trusted ingress capability requires join route table");
-    } else if (out.publicOrigin || out.trustedIngressFd !== undefined)
+    } else if (out.publicOrigin || out.trustedIngressFd !== undefined || out.lifecycleChannelFd !== undefined)
       throw new Error(
         "Pairing public origin requires desktop or join route table",
       );

@@ -4,6 +4,7 @@ import type {
   DesktopPairingCreatedJoin,
   DesktopPairingCurrentDevice,
   DesktopPairingJoinStatus,
+  DesktopLifecycleStatus,
   DesktopRemoteAccessResetResult,
   DesktopPairingRevokeResult,
   DesktopUninstallResult,
@@ -33,6 +34,9 @@ export function PairingConsole({ client }: PairingConsoleProps) {
     useState<DesktopRemoteAccessResetResult | null>(null);
   const [uninstallResult, setUninstallResult] =
     useState<DesktopUninstallResult | null>(null);
+  const [lifecycleStatus, setLifecycleStatus] =
+    useState<DesktopLifecycleStatus | null>(null);
+  const [lifecycleUncertain, setLifecycleUncertain] = useState(false);
   const [confirmRevoke, setConfirmRevoke] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
   const [confirmUninstall, setConfirmUninstall] = useState(false);
@@ -121,6 +125,33 @@ export function PairingConsole({ client }: PairingConsoleProps) {
       if (timer !== null) window.clearTimeout(timer);
     };
   }, [client, join?.created.join_id]);
+
+  useEffect(() => {
+    const operationId = resetResult?.operation_id ?? uninstallResult?.operation_id;
+    if (!operationId || lifecycleStatus?.terminal || !client.getLifecycleStatus) return;
+    let active = true;
+    let timer: number | null = null;
+    const tick = async () => {
+      try {
+        const status = await client.getLifecycleStatus!(operationId);
+        if (!active) return;
+        setLifecycleStatus(status);
+        if (!status.terminal) timer = window.setTimeout(() => void tick(), 750);
+      } catch {
+        // Reset and uninstall stop this Gateway. Losing HTTP after durable
+        // acceptance is expected and never proves completion.
+        if (active) setLifecycleUncertain(true);
+      }
+    };
+    timer = window.setTimeout(() => void tick(), 0);
+    return () => {
+      active = false;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [client, lifecycleStatus?.terminal, resetResult?.operation_id, uninstallResult?.operation_id]);
+
+  const destructiveLocked =
+    lifecycleUncertain || resetResult !== null || uninstallResult !== null;
 
   const joinUrl = useMemo(() => {
     if (!join) return null;
@@ -249,17 +280,21 @@ export function PairingConsole({ client }: PairingConsoleProps) {
   async function handleReset() {
     setBusy("reset");
     setError(null);
+    setLifecycleUncertain(false);
     try {
       const result = await client.resetRemoteAccess();
       setResetResult(result);
+      setLifecycleStatus(null);
       setRevokeResult(null);
       setUninstallResult(null);
       setJoin(null);
       setConfirmReset(false);
       setConfirmRevoke(false);
-      setDevice(await client.getCurrentDevice());
     } catch (reason) {
-      setError(messageFromError(reason));
+      if (reason instanceof DesktopPairingClientError && reason.code === "PAIRING_NETWORK_ERROR") {
+        setLifecycleUncertain(true);
+        setError(`Operation outcome unknown. Do not retry. First check the postcondition, then run nomad-web operation-status --operation-id ${reason.operationId ?? "<id>"}.`);
+      } else setError(messageFromError(reason));
     } finally {
       setBusy(null);
     }
@@ -268,9 +303,11 @@ export function PairingConsole({ client }: PairingConsoleProps) {
   async function handleUninstall() {
     setBusy("uninstall");
     setError(null);
+    setLifecycleUncertain(false);
     try {
       const result = await client.uninstall();
       setUninstallResult(result);
+      setLifecycleStatus(null);
       setRevokeResult(null);
       setResetResult(null);
       setJoin(null);
@@ -279,7 +316,10 @@ export function PairingConsole({ client }: PairingConsoleProps) {
       setConfirmReset(false);
       setConfirmRevoke(false);
     } catch (reason) {
-      setError(messageFromError(reason));
+      if (reason instanceof DesktopPairingClientError && reason.code === "PAIRING_NETWORK_ERROR") {
+        setLifecycleUncertain(true);
+        setError(`Operation outcome unknown. Do not retry. First check whether Nomad home remains, then run nomad-web operation-status --operation-id ${reason.operationId ?? "<id>"} from the original release bundle.`);
+      } else setError(messageFromError(reason));
     } finally {
       setBusy(null);
     }
@@ -335,14 +375,22 @@ export function PairingConsole({ client }: PairingConsoleProps) {
         )}
         {resetResult && (
           <div className="command-status" role="status" aria-live="polite">
-            Remote access state was cleared. Installed bundle and Host identity
-            were kept.
+            Reset accepted. Nomad is closing. Run nomad-web operation-status
+            --operation-id {resetResult.operation_id} to confirm completion.
+            The installed bundle and Host identity are retained.
           </div>
         )}
         {uninstallResult && (
           <div className="command-status" role="status" aria-live="polite">
-            Nomad was uninstalled. Remote access state was removed and Host
-            identity was retained on this Mac.
+            Uninstall accepted. Nomad is closing, so this page may disconnect.
+            Run nomad-web operation-status --operation-id {uninstallResult.operation_id}
+            from the release bundle to verify the final outcome. Host identity
+            is retained on this Mac.
+          </div>
+        )}
+        {lifecycleStatus?.terminal && (
+          <div className="command-status" role="status" aria-live="polite">
+            Lifecycle status: {lifecycleStatus.state}. {lifecycleStatus.recovery === "RUN_DIAGNOSTICS" ? "Run nomad-web diagnostics --output nomad-support.json for recovery." : lifecycleStatus.recovery === "RUN_OPERATION_STATUS" ? `Run nomad-web operation-status --operation-id ${lifecycleStatus.operation_id}; do not retry.` : ""}
           </div>
         )}
 
@@ -412,7 +460,7 @@ export function PairingConsole({ client }: PairingConsoleProps) {
                 ref={pairButtonRef}
                 className="btn btn--primary"
                 onClick={handleCreate}
-                disabled={busy !== null}
+                disabled={busy !== null || destructiveLocked}
               >
                 Pair phone
               </button>
@@ -441,7 +489,7 @@ export function PairingConsole({ client }: PairingConsoleProps) {
                 <button
                   className="btn btn--danger-secondary"
                   onClick={() => setConfirmRevoke(true)}
-                  disabled={busy !== null}
+                  disabled={busy !== null || destructiveLocked}
                 >
                   Revoke phone
                 </button>
@@ -500,7 +548,7 @@ export function PairingConsole({ client }: PairingConsoleProps) {
                   setConfirmUninstall(false);
                   setConfirmReset(true);
                 }}
-                disabled={busy !== null}
+                disabled={busy !== null || destructiveLocked}
               >
                 Reset remote access
               </button>
@@ -531,7 +579,7 @@ export function PairingConsole({ client }: PairingConsoleProps) {
                   ref={resetNowRef}
                   className="btn btn--danger-secondary"
                   onClick={handleReset}
-                  disabled={busy !== null}
+                  disabled={busy !== null || destructiveLocked}
                 >
                   Reset now
                 </button>
@@ -546,7 +594,7 @@ export function PairingConsole({ client }: PairingConsoleProps) {
                   setConfirmReset(false);
                   setConfirmUninstall(true);
                 }}
-                disabled={busy !== null}
+                disabled={busy !== null || destructiveLocked}
               >
                 Uninstall Nomad
               </button>
@@ -578,7 +626,7 @@ export function PairingConsole({ client }: PairingConsoleProps) {
                   ref={uninstallNowRef}
                   className="btn btn--danger"
                   onClick={handleUninstall}
-                  disabled={busy !== null}
+                  disabled={busy !== null || destructiveLocked}
                 >
                   Uninstall now
                 </button>

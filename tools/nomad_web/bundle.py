@@ -54,7 +54,7 @@ REQUIRED_PACKAGE = REQUIRED_PACKAGE_V1 | {
     f"lib/nomad_web/{name}"
     for name in (
         "diagnostics.py", "evidence_resume.py", "install_lifecycle.py",
-        "recovery.py", "release_verify.py",
+        "lifecycle_coordinator.py", "recovery.py", "release_verify.py",
     )
 }
 REQUIRED_RUNNER_CLOSURE = {

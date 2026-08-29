@@ -9,6 +9,7 @@ export const MAX_PAIRING_REQUEST_BYTES = 4 * 1024;
 const JOIN_ID = /^join-[0-9a-f]{32}$/;
 const CHALLENGE_ID = /^challenge-[A-Za-z0-9_-]{8,128}$/;
 const DEVICE_ALIAS = /^device-[A-Za-z0-9_-]{8,128}$/;
+const LIFECYCLE_REQUEST_ID = /^[A-Za-z0-9_-]{16,128}$/;
 const BASE64URL = /^[A-Za-z0-9_-]+$/;
 const COMPARISON_CODE = /^[0-9]{6}$/;
 const TRUST_HEADER = "x-nomad-trusted-ingress";
@@ -248,15 +249,15 @@ export function validateDesktopRevoke(value) {
 }
 
 export function validateDesktopReset(value) {
-  exactObject(value, ["schema"]);
-  if (value.schema !== "nomad.desktop.remote-access-reset.v1")
+  exactObject(value, ["schema", "request_id"]);
+  if (value.schema !== "nomad.desktop.remote-access-reset.v1" || !LIFECYCLE_REQUEST_ID.test(value.request_id ?? ""))
     reject("PAIRING_REQUEST_INVALID", 400);
   return value;
 }
 
 export function validateDesktopUninstall(value) {
-  exactObject(value, ["schema"]);
-  if (value.schema !== "nomad.desktop.uninstall.v1")
+  exactObject(value, ["schema", "request_id"]);
+  if (value.schema !== "nomad.desktop.uninstall.v1" || !LIFECYCLE_REQUEST_ID.test(value.request_id ?? ""))
     reject("PAIRING_REQUEST_INVALID", 400);
   return value;
 }
@@ -290,7 +291,7 @@ export function validateDesktopSecurityRead(request, expectedOrigin) {
 export function validateDesktopRead(request, expectedOrigin, csrfToken) {
   const origin = parseLoopbackOrigin(expectedOrigin);
   requireHost(request, origin);
-  exactHeader(request, "origin", origin.origin);
+  optionalExactHeader(request, "origin", origin.origin);
   exactHeader(request, "sec-fetch-site", "same-origin");
   exactHeader(request, "sec-fetch-mode", "cors");
   exactHeader(request, "sec-fetch-dest", "empty");
@@ -300,6 +301,7 @@ export function validateDesktopRead(request, expectedOrigin, csrfToken) {
     validateCapability(csrfToken, "CSRF_REJECTED"),
     "CSRF_REJECTED",
   );
+  validateEmptyRequest(request);
 }
 
 async function readPairingJson(request, origin, token) {

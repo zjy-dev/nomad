@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from . import processes
+from . import lifecycle_coordinator
 from .agent_runtime import _validate_credential_source, _verified_workspace, start_agent
 from .bundle import verify_bundle
 from .install_lifecycle import status_unlocked as install_status_unlocked
@@ -142,6 +143,7 @@ def _running_identity(
     run_id: str | None,
     processes_state: list[dict[str, Any]],
     socket_identity: dict[str, int] | None,
+    lifecycle_sidecar: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if bundle_digest is None or run_id is None:
         return {
@@ -160,6 +162,12 @@ def _running_identity(
         }
         for item in processes_state
     ]
+    if lifecycle_sidecar is not None:
+        process_projection.append({
+            "name": lifecycle_sidecar["name"],
+            "identity": lifecycle_sidecar["identity"],
+            "process_group": lifecycle_sidecar["process_group"],
+        })
     process_commitment = _sha256_json(process_projection)
     socket_commitment = _sha256_json(socket_identity) if socket_identity is not None else None
     return {
@@ -268,6 +276,7 @@ def _compose_identity(
     run_id: str | None,
     processes_state: list[dict[str, Any]],
     socket_identity: dict[str, int] | None,
+    lifecycle_sidecar: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     home = Path(_get(config, "home")).resolve()
     return {
@@ -277,6 +286,7 @@ def _compose_identity(
             run_id=run_id,
             processes_state=processes_state,
             socket_identity=socket_identity,
+            lifecycle_sidecar=lifecycle_sidecar,
         ),
         "host_public_commitment": _host_public_commitment(mode),
         "paired_device": _paired_device_identity(home, mode),
@@ -292,6 +302,7 @@ def _assert_identity_match(
     run_id: str | None,
     processes_state: list[dict[str, Any]],
     socket_identity: dict[str, int] | None,
+    lifecycle_sidecar: dict[str, Any] | None = None,
 ) -> None:
     expected = _compose_identity(
         config,
@@ -300,6 +311,7 @@ def _assert_identity_match(
         run_id=run_id,
         processes_state=processes_state,
         socket_identity=socket_identity,
+        lifecycle_sidecar=lifecycle_sidecar,
     )
     if current.get("identity") != expected:
         raise RuntimeError("RUNNING_IDENTITY_MISMATCH")
@@ -1468,9 +1480,10 @@ def _start_remote_unlocked(
         if existing["bundle_digest"] != bundle_digest:
             raise RuntimeError("RUNNING_BUNDLE_BINDING_MISMATCH")
         ownership = [processes.ownership(item) for item in existing["processes"]]
-        if "mismatch" in ownership:
+        sidecar_ownership = processes.ownership(existing["lifecycle_coordinator"])
+        if "mismatch" in ownership or sidecar_ownership == "mismatch":
             raise RuntimeError("PROCESS_IDENTITY_MISMATCH")
-        if all(item == "owned" for item in ownership):
+        if all(item == "owned" for item in ownership) and sidecar_ownership == "owned":
             for descriptor in (credential_fd, tls_cert_fd, tls_key_fd):
                 processes.close_fd(descriptor)
             if existing["mode"] != "remote-local-evidence" or existing["pairing_public_origin"] != public_origin:
@@ -1483,11 +1496,14 @@ def _start_remote_unlocked(
                 run_id=existing["run_id"],
                 processes_state=existing["processes"],
                 socket_identity=existing["product_host_socket_identity"],
+                lifecycle_sidecar=existing["lifecycle_coordinator"],
             )
             return _status_unlocked(config)
         for child, ownership_state in reversed(list(zip(existing["processes"], ownership))):
             if ownership_state == "owned" and not processes.stop(child):
                 raise RuntimeError("DEGRADED_RECONCILE_FAILED")
+        if sidecar_ownership == "owned" and not processes.stop(existing["lifecycle_coordinator"]):
+            raise RuntimeError("DEGRADED_RECONCILE_FAILED")
         _cleanup_run_artifacts(config, existing)
         state_path(config).unlink(missing_ok=True)
 
@@ -1537,6 +1553,9 @@ def _start_remote_unlocked(
     relay_host_v1_db = run_dir / "relay-host-v1.sqlite3"
     relay_device_v1_db = run_dir / "relay-device-v1.sqlite3"
     children: list[dict[str, Any]] = []
+    lifecycle_process: dict[str, Any] | None = None
+    lifecycle_release_fd: int | None = None
+    lifecycle_operational_fd: int | None = None
     opened: list[int] = []
     sockets: list[socket.socket] = []
     try:
@@ -1634,16 +1653,41 @@ def _start_remote_unlocked(
             "--product-host-socket-dev", str(product_host_socket_identity["socket_dev"]),
             "--product-host-socket-ino", str(product_host_socket_identity["socket_ino"]),
         ]
+        installed = install_status_unlocked(config)
+        if (
+            installed.get("state") != "INSTALLED"
+            or installed.get("current_bundle_digest") != bundle_digest
+            or not installed.get("history")
+            or type(installed["history"][-1].get("sequence")) is not int
+        ):
+            raise RuntimeError("LIFECYCLE_INSTALL_BINDING_INVALID")
+        install_sequence = installed["history"][-1]["sequence"]
+        lifecycle_gateway, lifecycle_worker = socket.socketpair()
+        sockets.extend((lifecycle_gateway, lifecycle_worker))
         desktop_key_fd = processes.secret_pipe(command_transport_raw); opened.append(desktop_key_fd)
         desktop = processes.spawn(
             "desktop-gateway",
             [node, str(gateway_dir / "server.mjs"), "--mode", "official-agent-local", "--route-table", "desktop",
              "--host", "127.0.0.1", "--port", str(desktop_port), "--state-db", str(desktop_db_path),
-             "--dist-dir", str(web_dir), *socket_args, "--command-key-fd", "11", "--public-origin", public_origin],
+             "--dist-dir", str(web_dir), *socket_args, "--command-key-fd", "11", "--lifecycle-channel-fd", "12", "--public-origin", public_origin],
             gateway_dir, processes.minimal_env(), log_dir / f"desktop-gateway-{run_state_alias}.log",
-            extra_fd_actions=((desktop_key_fd, 11),), close_fds=(desktop_key_fd,),
+            extra_fd_actions=((desktop_key_fd, 11), (lifecycle_gateway.fileno(), 12)),
+            close_fds=(desktop_key_fd, lifecycle_gateway.fileno()),
         )
         children.append(desktop); processes.close_fd(desktop_key_fd); opened.remove(desktop_key_fd)
+        lifecycle_gateway.close(); sockets.remove(lifecycle_gateway)
+        try:
+            lifecycle_process, returned_channel, lifecycle_release_fd, lifecycle_operational_fd = lifecycle_coordinator.spawn_worker(
+                config, gateway=desktop, run_id=run_state_alias,
+                bundle_digest=bundle_digest, install_sequence=install_sequence,
+                channel=lifecycle_worker,
+            )
+        finally:
+            # spawn_worker normally closes this object while duplicating the FD;
+            # the explicit close also covers injected/mocked failure paths.
+            lifecycle_worker.close(); sockets.remove(lifecycle_worker)
+        if returned_channel is not None:
+            raise RuntimeError("LIFECYCLE_CHANNEL_OWNERSHIP_INVALID")
         _wait_gateway_route(desktop_port, "desktop")
 
         join_key_fd = processes.secret_pipe(join_transport_raw); trusted_join_fd = processes.secret_pipe(trusted_ingress_raw)
@@ -1700,6 +1744,7 @@ def _start_remote_unlocked(
             "run_id": run_state_alias, "session_alias": session_alias,
             "workspace_binding_digest": workspace_digest,
             "product_host_socket_identity": product_host_socket_identity, "processes": children,
+            "lifecycle_coordinator": lifecycle_process,
         }
         state["identity"] = _compose_identity(
             config,
@@ -1708,10 +1753,22 @@ def _start_remote_unlocked(
             run_id=state["run_id"],
             processes_state=state["processes"],
             socket_identity=state["product_host_socket_identity"],
+            lifecycle_sidecar=lifecycle_process,
         )
         write_run_state(config, state)
+        _activate_lifecycle_worker(
+            config, lifecycle_release_fd, lifecycle_operational_fd,
+            lifecycle_process,
+        )
+        lifecycle_release_fd = lifecycle_operational_fd = None
         return {**state, "state": "RUNNING"}
     except Exception as primary:
+        # A release failure can occur after the fully validated topology was
+        # published. Never leave a RUNNING record for a coordinator that did
+        # not enter its Gateway-serving phase.
+        state_path(config).unlink(missing_ok=True)
+        if lifecycle_process is not None and processes.ownership(lifecycle_process) == "owned":
+            processes.stop(lifecycle_process)
         _rollback_remote_start(
             primary, children, product_host_socket_path=product_host_socket_path,
             product_host_socket_identity=product_host_socket_identity,
@@ -1719,12 +1776,26 @@ def _start_remote_unlocked(
             relay_v1_paths=(relay_host_v1_db, relay_device_v1_db), run_dir=run_dir,
         )
     finally:
+        processes.close_fd(lifecycle_release_fd)
+        processes.close_fd(lifecycle_operational_fd)
         for descriptor in opened:
             processes.close_fd(descriptor)
         for descriptor in (credential_fd, tls_cert_fd, tls_key_fd):
             processes.close_fd(descriptor)
         for channel in sockets:
             channel.close()
+
+
+def _activate_lifecycle_worker(
+    config: Any, release_fd: int, operational_fd: int,
+    record: dict[str, Any],
+) -> None:
+    try:
+        lifecycle_coordinator.release_worker(release_fd)
+        lifecycle_coordinator.confirm_worker_operational(operational_fd, record)
+    except BaseException:
+        state_path(config).unlink(missing_ok=True)
+        raise
 
 
 def status_foundation(config: Any) -> dict[str, Any]:
@@ -1791,9 +1862,16 @@ def _status_unlocked(config: Any) -> dict[str, Any]:
         run_id=state["run_id"],
         processes_state=state["processes"],
         socket_identity=state["product_host_socket_identity"],
+        lifecycle_sidecar=state.get("lifecycle_coordinator"),
     )
     process_state = [{"name": item["name"], "pid": item["pid"], "alive": processes.alive(item)} for item in state["processes"]]
-    return {**state, "state": "RUNNING" if all(item["alive"] for item in process_state) else "DEGRADED", "processes": process_state}
+    sidecar = state.get("lifecycle_coordinator")
+    sidecar_state = None if sidecar is None else {
+        "name": sidecar["name"], "pid": sidecar["pid"],
+        "alive": processes.alive(sidecar),
+    }
+    healthy = all(item["alive"] for item in process_state) and (sidecar_state is None or sidecar_state["alive"])
+    return {**state, "state": "RUNNING" if healthy else "DEGRADED", "processes": process_state, "lifecycle_coordinator": sidecar_state}
 
 
 def stop_foundation(config: Any) -> dict[str, Any]:
@@ -1808,9 +1886,13 @@ def reset_remote_access(config: Any) -> dict[str, Any]:
         return _reset_remote_access_unlocked(config)
 
 
-def _reset_remote_access_unlocked(config: Any) -> dict[str, Any]:
+def _reset_remote_access_unlocked(
+    config: Any, *, preserve_lifecycle_coordinator: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     home = Path(_get(config, "home")).absolute()
-    _stop_unlocked(config)
+    _stop_unlocked(
+        config, preserve_lifecycle_coordinator=preserve_lifecycle_coordinator,
+    )
     _cleanup_device_registry(_device_registry_path(home))
     return _reset_result()
 
@@ -1827,7 +1909,9 @@ def _reset_result() -> dict[str, Any]:
     }
 
 
-def _stop_unlocked(config: Any) -> dict[str, Any]:
+def _stop_unlocked(
+    config: Any, *, preserve_lifecycle_coordinator: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     state = read_run_state(config)
     if state:
         ownership = [processes.ownership(child) for child in state["processes"]]
@@ -1836,6 +1920,24 @@ def _stop_unlocked(config: Any) -> dict[str, Any]:
         for child in reversed(state["processes"]):
             if processes.ownership(child) == "owned" and not processes.stop(child):
                 raise RuntimeError("PROCESS_STOP_FAILED")
+        sidecar = state.get("lifecycle_coordinator")
+        if sidecar is not None:
+            preserved = (
+                preserve_lifecycle_coordinator is not None
+                and all(
+                    sidecar.get(name) == preserve_lifecycle_coordinator.get(name)
+                    for name in ("pid", "process_group", "identity")
+                )
+            )
+            if preserved:
+                if processes.ownership(sidecar) != "owned":
+                    raise RuntimeError("LIFECYCLE_COORDINATOR_IDENTITY_MISMATCH")
+            else:
+                ownership = processes.ownership(sidecar)
+                if ownership == "mismatch":
+                    raise RuntimeError("LIFECYCLE_COORDINATOR_IDENTITY_MISMATCH")
+                if ownership == "owned" and not processes.stop(sidecar):
+                    raise RuntimeError("LIFECYCLE_COORDINATOR_STOP_FAILED")
         _cleanup_run_artifacts(config, state)
         state_path(config).unlink(missing_ok=True)
     return _stopped()

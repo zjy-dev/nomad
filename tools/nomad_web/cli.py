@@ -23,6 +23,7 @@ from .launcher import (
     uninstall_lifecycle,
 )
 from .materialize import materialize
+from .lifecycle_coordinator import operation_status
 from .release_verify import collect_git_facts, verify_record
 
 
@@ -44,6 +45,7 @@ def run(argv: Sequence[str] | None = None, repo_root: Path | None = None) -> int
             "install", "upgrade", "rollback", "resume-evidence",
             "verify-release", "install-status", "onboarding",
             "diagnostics", "reset-remote-access",
+            "operation-status",
         ),
     )
     parser.add_argument("--output", type=Path)
@@ -63,6 +65,8 @@ def run(argv: Sequence[str] | None = None, repo_root: Path | None = None) -> int
     parser.add_argument("--https-listen")
     parser.add_argument("--tls-cert-fd", type=int)
     parser.add_argument("--tls-key-fd", type=int)
+    parser.add_argument("--operation-id")
+    parser.add_argument("--latest", action="store_true")
     try:
         args = parser.parse_args(arguments)
         config = Config.load(repo_root)
@@ -91,6 +95,18 @@ def run(argv: Sequence[str] | None = None, repo_root: Path | None = None) -> int
             result = reset_remote_access(config)
             _emit(result, args.json)
             return 0
+        if args.command == "operation-status":
+            if (args.operation_id is None) == (not args.latest):
+                raise RuntimeError("LIFECYCLE_OPERATION_ID_REQUIRED")
+            result = operation_status(
+                config, args.operation_id, latest=args.latest,
+            )
+            _emit(result, args.json)
+            if result["state"] == "completed":
+                return 0
+            if result["state"] in {"accepted", "committed", "outcome_unknown"}:
+                return 2
+            return 1
         if args.command == "materialize":
             if args.output is None:
                 raise RuntimeError("MATERIALIZE_OUTPUT_REQUIRED")
@@ -283,9 +299,15 @@ INVALID_NOMAD_WEB_RELAY_PORT INVALID_ONBOARDING_STATE INVALID_RELEASE_GATE_STATU
 INVALID_PROVIDER_CREDENTIAL INVALID_RUN_ALIAS INVALID_STATE INVALID_STATE_SNAPSHOT
 JOIN_GATEWAY_NOT_READY LAUNCHER_FAILURE LISTENER_PROCESS_BINDING_NOT_VERIFIED
 LIFECYCLE_CHANNEL_CLOSED LIFECYCLE_COMMIT_MISMATCH
+LIFECYCLE_COORDINATOR_IDENTITY_MISMATCH LIFECYCLE_COORDINATOR_STOP_FAILED
+LIFECYCLE_COORDINATOR_RELEASE_INVALID
+LIFECYCLE_OPERATION_ID_INVALID LIFECYCLE_OPERATION_ID_REQUIRED
+LIFECYCLE_OPERATION_NOT_FOUND
+LIFECYCLE_GATEWAY_BOOTSTRAP_INVALID LIFECYCLE_CHANNEL_OWNERSHIP_INVALID
 LIFECYCLE_COORDINATOR_IDENTITY_UNAVAILABLE LIFECYCLE_COORDINATOR_START_FAILED
 LIFECYCLE_COORDINATOR_START_TIMEOUT LIFECYCLE_GATEWAY_BINDING_MISMATCH
 LIFECYCLE_HOME_COMMITMENT_INVALID LIFECYCLE_JOURNAL_INVALID
+LIFECYCLE_INSTALL_BINDING_INVALID
 LIFECYCLE_JOURNAL_STATE_INVALID LIFECYCLE_JOURNAL_TOO_LARGE
 LIFECYCLE_JOURNAL_WRITE_FAILED LIFECYCLE_LOCK_ADOPTION_INVALID
 LIFECYCLE_LOCK_ALREADY_ADOPTED LIFECYCLE_LOCK_HOME_MISMATCH
@@ -415,7 +437,7 @@ def _emit(result: dict[str, Any], as_json: bool) -> None:
         )
         print(f"State: {state}")
         print(f"Mode: {result.get('mode', result.get('classification', 'nomad-web'))}")
-        if "error" in result:
+        if result.get("error") is not None:
             print(f"Error: {result['error']}")
         if "code" in result:
             print(f"Code: {result['code']}")
@@ -449,6 +471,14 @@ def _emit(result: dict[str, Any], as_json: bool) -> None:
             print(f"Web: {result.get('web_url', result.get('desktop_url'))}")
         if result.get("logs_dir"):
             print(f"Logs: {result['logs_dir']}")
+        if result.get("operation"):
+            print(f"Operation: {result['operation']}")
+        if result.get("operation_id"):
+            print(f"Operation ID: {result['operation_id']}")
+        if "latest_known" in result:
+            print(f"Latest known: {str(result['latest_known']).lower()}")
+            if result["latest_known"]:
+                print("Note: this is the most recent journaled operation and may not be the interrupted attempt.")
         for field in ("missing_tools", "missing_paths", "occupied_ports", "blocked_on"):
             if result.get(field):
                 print(f"{field}: {', '.join(result[field])}")
