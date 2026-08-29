@@ -194,6 +194,8 @@ def stop(record: Mapping[str, Any], timeout: float = 8.0) -> bool:
     if ownership(record) != "owned":
         return False
     pid = int(record["pid"])
+    if pid == os.getpid() or pid == os.getpgrp():
+        return False
     # Re-measure immediately before signalling. If identity cannot be proved,
     # do not signal an unrelated or PID-reused process.
     if ownership(record) != "owned":

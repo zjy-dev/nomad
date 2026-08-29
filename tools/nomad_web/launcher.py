@@ -1803,10 +1803,19 @@ def stop_foundation(config: Any) -> dict[str, Any]:
 
 def reset_remote_access(config: Any) -> dict[str, Any]:
     with lifecycle_lock(config, create=False) as owned:
-        home = Path(_get(config, "home")).absolute()
-        if owned:
-            _stop_unlocked(config)
-        _cleanup_device_registry(_device_registry_path(home))
+        if not owned:
+            return _reset_result()
+        return _reset_remote_access_unlocked(config)
+
+
+def _reset_remote_access_unlocked(config: Any) -> dict[str, Any]:
+    home = Path(_get(config, "home")).absolute()
+    _stop_unlocked(config)
+    _cleanup_device_registry(_device_registry_path(home))
+    return _reset_result()
+
+
+def _reset_result() -> dict[str, Any]:
     return {
         "schema": "nomad.web-companion.remote-access-reset.v1",
         "state": "STOPPED",
@@ -1851,28 +1860,43 @@ def uninstall_foundation(config: Any) -> dict[str, Any]:
     with lifecycle_lock(config, create=False) as owned:
         if not owned:
             return {"schema": STATE_SCHEMA, "state": "UNINSTALLED", "mode": "foundation-readonly", "real_agent_enabled": False, "blocked_on": BLOCKERS}
-        current = read_run_state(config)
-        home = Path(_get(config, "home")).absolute()
-        if (current is not None and current["mode"] == "remote-local-evidence") or _remote_persistent_state_present(home):
-            raise RuntimeError("REMOTE_UNINSTALL_REVOKE_REQUIRED")
-        _stop_unlocked(config)
-        if home == Path.home().resolve() or home == Path("/"):
-            raise RuntimeError("UNSAFE_UNINSTALL_ROOT")
-        validate_home(config)
-        allowed = {HOME_MARKER, "bin", "run", "logs", "bundles", "install", DEVICE_REGISTRY_DIRNAME}
-        if not {entry.name for entry in home.iterdir()}.issubset(allowed):
-            raise RuntimeError("UNSAFE_NOMAD_WEB_HOME_CONTENTS")
-        _validate_runtime_dirs_if_present(config)
-        root = home.resolve(strict=True)
-        _cleanup_device_registry(_device_registry_path(home))
-        for name in ("run", "logs", "bin", "bundles", "install", HOME_MARKER):
-            _safe_remove_tree(home / name, root=root)
-        home.rmdir()
+        return _uninstall_foundation_unlocked(config)
+
+
+def _uninstall_foundation_unlocked(config: Any) -> dict[str, Any]:
+    current = read_run_state(config)
+    home = Path(_get(config, "home")).absolute()
+    if (current is not None and current["mode"] == "remote-local-evidence") or _remote_persistent_state_present(home):
+        raise RuntimeError("REMOTE_UNINSTALL_REVOKE_REQUIRED")
+    _stop_unlocked(config)
+    if home == Path.home().resolve() or home == Path("/"):
+        raise RuntimeError("UNSAFE_UNINSTALL_ROOT")
+    validate_home(config)
+    allowed = {HOME_MARKER, "bin", "run", "logs", "bundles", "install", DEVICE_REGISTRY_DIRNAME}
+    if not {entry.name for entry in home.iterdir()}.issubset(allowed):
+        raise RuntimeError("UNSAFE_NOMAD_WEB_HOME_CONTENTS")
+    _validate_runtime_dirs_if_present(config)
+    root = home.resolve(strict=True)
+    _cleanup_device_registry(_device_registry_path(home))
+    for name in ("run", "logs", "bin", "bundles", "install", HOME_MARKER):
+        _safe_remove_tree(home / name, root=root)
+    home.rmdir()
     return {"schema": STATE_SCHEMA, "state": "UNINSTALLED", "mode": "foundation-readonly", "real_agent_enabled": False, "blocked_on": BLOCKERS}
 
 
 def uninstall_lifecycle(config: Any) -> dict[str, Any]:
-    uninstall_foundation(config)
+    with lifecycle_lock(config, create=False) as owned:
+        if owned:
+            return _uninstall_lifecycle_unlocked(config)
+    return _uninstall_result()
+
+
+def _uninstall_lifecycle_unlocked(config: Any) -> dict[str, Any]:
+    _uninstall_foundation_unlocked(config)
+    return _uninstall_result()
+
+
+def _uninstall_result() -> dict[str, Any]:
     return {
         "schema": "nomad.web-companion.uninstall-result.v1",
         "state": "UNINSTALLED",
