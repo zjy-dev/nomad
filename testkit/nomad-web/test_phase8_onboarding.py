@@ -140,7 +140,7 @@ class Phase8OnboardingTests(unittest.TestCase):
             [
                 "install", "install-status", "onboarding", "doctor",
                 "start", "status", "stop", "reset-remote-access",
-                "diagnostics", "uninstall",
+                "operation-status", "diagnostics", "uninstall",
             ],
         )
         self.assertEqual(manifest["advanced_support_commands"], ["upgrade", "rollback"])
