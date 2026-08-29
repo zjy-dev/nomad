@@ -31,6 +31,52 @@ type lifecycleTestServer struct {
 	mu           sync.Mutex
 }
 
+type synchronizedOutput struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (o *synchronizedOutput) Write(p []byte) (int, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.buf.Write(p)
+}
+
+func (o *synchronizedOutput) String() string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.buf.String()
+}
+
+type executableWait struct {
+	done chan struct{}
+	mu   sync.Mutex
+	err  error
+}
+
+func waitForExecutable(cmd *exec.Cmd) *executableWait {
+	wait := &executableWait{done: make(chan struct{})}
+	go func() {
+		err := cmd.Wait()
+		wait.mu.Lock()
+		wait.err = err
+		wait.mu.Unlock()
+		close(wait.done)
+	}()
+	return wait
+}
+
+func (w *executableWait) result() (error, bool) {
+	select {
+	case <-w.done:
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		return w.err, true
+	default:
+		return nil, false
+	}
+}
+
 func newLifecycleTestServer(startErr error) *lifecycleTestServer {
 	return &lifecycleTestServer{startErr: startErr, startEntered: make(chan struct{}), stop: make(chan struct{})}
 }
@@ -100,8 +146,10 @@ func TestRunLifecycleCancellationBeforeServersStartIsSafe(t *testing.T) {
 
 func TestExecutableSIGTERMShutsDownCleanly(t *testing.T) {
 	bin := buildRelayExecutable(t)
-	addr := freeLoopbackAddr(t)
-	v2Addr := freeLoopbackAddr(t)
+	addr, v2Addr := distinctLoopbackAddrs(t)
+	if addr == v2Addr {
+		t.Fatalf("v1 and v2 selected the same address %q", addr)
+	}
 	directory := t.TempDir()
 	cmd := exec.Command(bin,
 		"-addr", addr,
@@ -112,28 +160,97 @@ func TestExecutableSIGTERMShutsDownCleanly(t *testing.T) {
 		"-v2-db", filepath.Join(directory, "v2.db"),
 		"-v2-loopback-test-http",
 	)
-	var output bytes.Buffer
+	var output synchronizedOutput
 	cmd.Stdout = &output
 	cmd.Stderr = &output
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	waitForHealth(t, "http://"+addr+"/health")
-	waitForTCP(t, v2Addr)
+	wait := waitForExecutable(cmd)
+	t.Cleanup(func() {
+		if _, exited := wait.result(); exited {
+			return
+		}
+		_ = cmd.Process.Signal(syscall.SIGTERM)
+		select {
+		case <-wait.done:
+			return
+		case <-time.After(2 * time.Second):
+		}
+		_ = cmd.Process.Kill()
+		select {
+		case <-wait.done:
+		case <-time.After(2 * time.Second):
+			t.Errorf("relay cleanup did not reap child; output=%s", output.String())
+		}
+	})
+	waitForHealthOrExit(t, "http://"+addr+"/health", wait, &output, 12*time.Second)
+	waitForTCPOrExit(t, v2Addr, wait, &output, 12*time.Second)
 	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
-		t.Fatal(err)
+		t.Fatalf("signal SIGTERM: %v output=%s", err, output.String())
 	}
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
 	select {
-	case err := <-done:
+	case <-wait.done:
+		err, _ := wait.result()
 		if err != nil {
 			t.Fatalf("SIGTERM exit=%v output=%s", err, output.String())
 		}
-	case <-time.After(3 * time.Second):
+	case <-time.After(12 * time.Second):
 		_ = cmd.Process.Kill()
 		t.Fatalf("relay did not stop after SIGTERM; output=%s", output.String())
 	}
+}
+
+func distinctLoopbackAddrs(t *testing.T) (string, string) {
+	t.Helper()
+	first, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	return first.Addr().String(), second.Addr().String()
+}
+
+func waitForHealthOrExit(t *testing.T, endpoint string, wait *executableWait, output *synchronizedOutput, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	client := &http.Client{Timeout: 250 * time.Millisecond}
+	for time.Now().Before(deadline) {
+		if err, exited := wait.result(); exited {
+			t.Fatalf("relay exited before health became ready: %v output=%s", err, output.String())
+		}
+		resp, err := client.Get(endpoint)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("relay health did not become ready: %s output=%s", endpoint, output.String())
+}
+
+func waitForTCPOrExit(t *testing.T, addr string, wait *executableWait, output *synchronizedOutput, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if err, exited := wait.result(); exited {
+			t.Fatalf("relay exited before listener became ready: %v output=%s", err, output.String())
+		}
+		connection, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
+		if err == nil {
+			connection.Close()
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("relay listener did not become ready: %s output=%s", addr, output.String())
 }
 
 func TestExecutableV2ListenerFailureReturnsAndReleasesPeers(t *testing.T) {
