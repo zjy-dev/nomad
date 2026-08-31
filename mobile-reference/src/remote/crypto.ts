@@ -849,22 +849,29 @@ function bytesToHex(bytes: Uint8Array): string {
 }
 
 function toBase64UrlNoPad(bytes: Uint8Array): string {
-  return Buffer.from(bytes)
-    .toString('base64')
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary)
     .replace(/\+/g, '-')
     .replace(/\//g, '_')
     .replace(/=+$/g, '');
 }
 
 function fromBase64UrlNoPad(value: string, code: string): Uint8Array {
-  if (!BASE64URL_NOPAD.test(value)) {
+  if (!BASE64URL_NOPAD.test(value) || value.length % 4 === 1) {
     throw new RemoteCryptoError(code);
   }
-  const padded = value + '==='.slice((value.length + 3) % 4);
+  const padded = value
+    .replace(/-/g, '+')
+    .replace(/_/g, '/')
+    .padEnd(Math.ceil(value.length / 4) * 4, '=');
   try {
-    return new Uint8Array(
-      Buffer.from(padded.replace(/-/g, '+').replace(/_/g, '/'), 'base64'),
+    const binary = atob(padded);
+    const decoded = Uint8Array.from(
+      binary, (character) => character.charCodeAt(0),
     );
+    if (toBase64UrlNoPad(decoded) !== value) throw new Error('non-canonical');
+    return decoded;
   } catch {
     throw new RemoteCryptoError(code);
   }

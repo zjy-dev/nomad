@@ -407,6 +407,104 @@ describe("PhonePairingScreen", () => {
     }
   });
 
+  it("keeps automatic read-only connect retries alive long enough for a delayed first projection", async () => {
+    vi.useFakeTimers();
+    try {
+      const pairingClient: PhonePairingClientPort = {
+        startFromCurrentLocation: vi.fn(async () => startResult()),
+        confirm: vi.fn(async () => ({
+          comparisonCode: "042913",
+          session: browserSession(),
+        })),
+        cancelPending: vi.fn(),
+        abortPending: vi.fn(async () => {}),
+      };
+      const vault: PhoneVaultPort = {
+        restorePairedDevice: vi.fn(async () => browserSession()),
+      };
+      const reconnectingSnapshot = remoteRuntimeSnapshot(null);
+      const liveSnapshot = remoteRuntimeSnapshot(remoteView());
+      let polls = 0;
+      const runtime: RuntimeRemoteSessionPort = {
+        getSnapshot: vi.fn(() => reconnectingSnapshot),
+        subscribe: vi.fn(() => () => {}),
+        poll: vi.fn(async () => {
+          polls += 1;
+          return polls >= 5 ? liveSnapshot : reconnectingSnapshot;
+        }),
+        dispatch: vi.fn(async () => liveSnapshot),
+        retryPending: vi.fn(async () => liveSnapshot),
+      };
+
+      const output = await render(
+        <PhonePairingScreen
+          pairingClient={pairingClient}
+          vault={vault}
+          remoteSessionFactory={vi.fn(async () => runtime)}
+        />,
+      );
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2_300);
+      });
+
+      expect(vi.mocked(runtime.poll).mock.calls.length).toBeGreaterThanOrEqual(
+        5,
+      );
+      expect(runtime.dispatch).not.toHaveBeenCalled();
+      expect(output.textContent).toContain("Remote session connected");
+      expect(output.textContent).not.toContain("Retry connect");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops automatic retries after the bounded window and stays on explicit retry UI without command writes", async () => {
+    vi.useFakeTimers();
+    try {
+      const pairingClient: PhonePairingClientPort = {
+        startFromCurrentLocation: vi.fn(async () => startResult()),
+        confirm: vi.fn(async () => ({
+          comparisonCode: "042913",
+          session: browserSession(),
+        })),
+        cancelPending: vi.fn(),
+        abortPending: vi.fn(async () => {}),
+      };
+      const vault: PhoneVaultPort = {
+        restorePairedDevice: vi.fn(async () => browserSession()),
+      };
+      const reconnectingSnapshot = remoteRuntimeSnapshot(null);
+      const runtime: RuntimeRemoteSessionPort = {
+        getSnapshot: vi.fn(() => reconnectingSnapshot),
+        subscribe: vi.fn(() => () => {}),
+        poll: vi.fn(async () => reconnectingSnapshot),
+        dispatch: vi.fn(async () => reconnectingSnapshot),
+        retryPending: vi.fn(async () => reconnectingSnapshot),
+      };
+
+      const output = await render(
+        <PhonePairingScreen
+          pairingClient={pairingClient}
+          vault={vault}
+          remoteSessionFactory={vi.fn(async () => runtime)}
+        />,
+      );
+
+      await act(async () => {
+        await vi.runAllTimersAsync();
+      });
+
+      expect(runtime.poll).toHaveBeenCalledTimes(10);
+      expect(runtime.dispatch).not.toHaveBeenCalled();
+      expect(output.textContent).toContain("Secure session not connected");
+      expect(output.textContent).toContain("Retry connect");
+      expect(output.textContent).not.toContain("Remote session connected");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("retries the same pending remote request on restore without creating a new semantic command", async () => {
     const retrySnapshot = remoteRuntimeSnapshot(remoteView(), {
       pending_command: {

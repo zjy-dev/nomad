@@ -985,6 +985,175 @@ test("CLI route-table contract requires explicit HTTPS public origin for desktop
   );
 });
 
+test("diagnostic loopback CLI is an explicit desktop-only flag and rejects lifecycle or broader modes", () => {
+  const identity = [
+    "--product-host-socket-parent-dev", "1",
+    "--product-host-socket-parent-ino", "2",
+    "--product-host-socket-dev", "3",
+    "--product-host-socket-ino", "4",
+  ];
+  const diagnostic = [
+    "--diagnostic-loopback",
+    "--mode", "official-agent-local",
+    "--route-table", "desktop",
+    "--host", "127.0.0.1",
+    "--product-host-socket", "/private/tmp/product-host.sock",
+    ...identity,
+    "--command-key-fd", "11",
+    "--public-origin", PUBLIC_ORIGIN,
+    "--state-db", "/tmp/diagnostic-desktop.db",
+  ];
+  const parsed = parseArgs(diagnostic, {});
+  assert.equal(parsed.diagnosticLoopback, true);
+  assert.equal(parsed.lifecycleChannelFd, undefined);
+
+  for (const [label, args, pattern] of [
+    ["accepted lifecycle capability", [...diagnostic, "--lifecycle-channel-fd", "12"], /must not use --lifecycle-channel-fd/],
+    ["join route", diagnostic.map((value) => value === "desktop" ? "join" : value), /requires official-agent-local desktop/],
+    ["foundation mode", diagnostic.map((value) => value === "official-agent-local" ? "foundation-readonly" : value), /requires official-agent-local desktop/],
+    ["localhost alias", diagnostic.map((value) => value === "127.0.0.1" ? "localhost" : value), /requires official-agent-local desktop/],
+    ["non-loopback host", diagnostic.map((value) => value === "127.0.0.1" ? "192.0.2.10" : value), /requires official-agent-local desktop/],
+    ["duplicate flag", ["--diagnostic-loopback", ...diagnostic], /Duplicate --diagnostic-loopback/],
+    ["generic boolean value", ["--diagnostic-loopback", "true", ...diagnostic.slice(1)], /Unsupported or incomplete option: true/],
+  ]) {
+    assert.throws(() => parseArgs(args, {}), pattern, label);
+  }
+});
+
+test("createGateway rejects diagnostic loopback outside its exact route and capability boundary", () => {
+  const base = {
+    mode: "official-agent-local",
+    routeTable: "desktop",
+    host: "127.0.0.1",
+    diagnosticLoopback: true,
+  };
+  for (const [label, override, pattern] of [
+    ["join", { routeTable: "join" }, /requires official-agent-local desktop/],
+    ["foundation", { mode: "foundation-readonly" }, /require official-agent-local mode/],
+    ["localhost", { host: "localhost" }, /requires official-agent-local desktop/],
+    ["non-loopback", { host: "192.0.2.10" }, /requires official-agent-local desktop/],
+    ["lifecycle fd", { lifecycleChannelFd: 12 }, /must not receive lifecycle capabilities/],
+    ["lifecycle bridge", { lifecycleBridge: {} }, /must not receive lifecycle capabilities/],
+    ["lifecycle options", { lifecycleBridgeOptions: {} }, /must not receive lifecycle capabilities/],
+  ]) {
+    assert.throws(() => createGateway({ ...base, ...override }), pattern, label);
+  }
+});
+
+test("diagnostic loopback keeps real desktop pairing and devices but hides lifecycle management", async () => {
+  const host = fakeHost();
+  const port = await freePort();
+  const store = new AlphaStore(
+    join(mkdtempSync(join(tmpdir(), "nomad-desktop-diagnostic-")), "state.sqlite3"),
+  );
+  store.persistProduct(productEnvelope(), { source: "current" });
+  const server = createServer(
+    createGateway({
+      mode: "official-agent-local",
+      routeTable: "desktop",
+      host: "127.0.0.1",
+      port,
+      diagnosticLoopback: true,
+      productHostClient: host,
+      store,
+      desktopCsrfToken: CSRF,
+      publicOrigin: PUBLIC_ORIGIN,
+      distDir: "/missing",
+    }),
+  ).listen(port, "127.0.0.1");
+  await once(server, "listening");
+  const origin = `http://127.0.0.1:${port}`;
+  try {
+    const createRequest = { schema: "nomad.m3e.pairing.create.v1" };
+    const created = await raw(port, "/api/desktop/pairing/create", {
+      method: "POST",
+      headers: desktopHeaders(origin),
+      body: JSON.stringify(createRequest),
+    });
+    assert.equal(created.status, 200);
+    const current = await raw(port, "/api/desktop/devices/current", {
+      method: "POST",
+      headers: desktopHeaders(origin),
+      body: "{}",
+    });
+    assert.equal(current.status, 200);
+    assert.deepEqual(
+      host.calls.filter(([operation]) => ["create", "current"].includes(operation)),
+      [["create", createRequest], ["current"]],
+    );
+
+    for (const path of [
+      "/api/desktop/remote-access/reset",
+      "/api/desktop/remote-access/future-operation",
+      "/api/desktop/install/uninstall",
+      "/api/desktop/lifecycle/status",
+    ]) {
+      const result = await raw(port, path, {
+        method: "POST",
+        headers: desktopHeaders(origin),
+        body: "{}",
+      });
+      assert.equal(result.status, 404, path);
+      assert.deepEqual(JSON.parse(result.text), {
+        error: "DIAGNOSTIC_UNAVAILABLE",
+      });
+    }
+
+    const capability = await raw(port, "/api/commands/capability", {
+      headers: {
+        Host: new URL(origin).host,
+        Origin: origin,
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "cors",
+      },
+    });
+    assert.equal(capability.status, 404);
+    assert.deepEqual(JSON.parse(capability.text), {
+      error: "DIAGNOSTIC_UNAVAILABLE",
+    });
+    const command = await raw(port, "/api/commands", {
+      method: "POST",
+      headers: {
+        Host: new URL(origin).host,
+        Origin: origin,
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "cors",
+        "X-Nomad-CSRF": CSRF,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        schema: "nomad.gateway.command.v1",
+        capability_id: "capability_diagnostic_0001",
+        request_id: "request_diagnostic_0001",
+        nonce: "nonce_diagnostic_0001",
+        command_seq: 1,
+        expected_snapshot_seq: 1,
+        expected_snapshot_digest: productEnvelope().digest,
+        issued_at: "2026-08-28T00:00:00Z",
+        expires_at: "2026-08-28T00:00:30Z",
+        action: "stop",
+        turn_alias: `turn-${"4".repeat(32)}`,
+      }),
+    });
+    assert.equal(command.status, 404);
+    assert.deepEqual(JSON.parse(command.text), {
+      error: "DIAGNOSTIC_UNAVAILABLE",
+    });
+    assert.equal(
+      host.calls.filter(([operation]) => operation === "capability").length,
+      0,
+    );
+    assert.equal(
+      host.calls.filter(([operation]) => operation === "command").length,
+      0,
+    );
+  } finally {
+    server.close();
+    await once(server, "close");
+    store.close();
+  }
+});
+
 test("desktop create fails closed without configured public origin before calling Host", async () => {
   const host = fakeHost();
   const port = await freePort();

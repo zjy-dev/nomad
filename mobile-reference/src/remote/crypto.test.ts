@@ -376,6 +376,42 @@ describe('remote crypto codec', () => {
     });
     expect(rustDecrypted.canonicalPlaintextJson).toBe(vector.canonical_plaintext_json);
   });
+
+  it('decrypts the Rust vector without the Node Buffer global', async () => {
+    const raw = readFileSync(
+      resolve(process.cwd(), '../contracts/vectors/remote-envelope-v2.json'),
+      'utf8',
+    );
+    const vector = parseAndValidateRemoteVector(JSON.parse(raw));
+    const deviceAgreementPkcs8 = fromBase64UrlNoPad(
+      vector.device_agreement_private_key_pkcs8,
+    );
+    const saved = globalThis.Buffer;
+    Reflect.deleteProperty(globalThis, 'Buffer');
+    try {
+      const deviceAgreement = await importAgreementPrivateKeyPkcs8(
+        deviceAgreementPkcs8,
+      );
+      await expect(decryptRemoteFrame({
+        frame: vector.rust_frame,
+        recipientAgreementPrivateKey: deviceAgreement,
+        context: {
+          mailboxId: vector.rust_frame.mailbox_id,
+          epoch: vector.rust_frame.epoch,
+          hostSigningCommitment: vector.host_signing_commitment,
+          hostAgreementCommitment: vector.host_agreement_commitment,
+          deviceSigningCommitment: vector.device_signing_commitment,
+          deviceAgreementCommitment: vector.device_agreement_commitment,
+        },
+        expectedSenderSigningCommitment: vector.host_signing_commitment,
+        expectedSenderAgreementCommitment: vector.host_agreement_commitment,
+      })).resolves.toMatchObject({
+        canonicalPlaintextJson: vector.canonical_plaintext_json,
+      });
+    } finally {
+      globalThis.Buffer = saved;
+    }
+  });
 });
 
 async function createFixture() {

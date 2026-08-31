@@ -43,6 +43,8 @@ enum WireBootstrap {
     V1(WireBootstrapV1),
     #[serde(rename = "nomad.product-host.bootstrap.v2")]
     V2(WireBootstrapV2),
+    #[serde(rename = "nomad.product-host.bootstrap.v3")]
+    V3(WireBootstrapV3),
 }
 
 #[derive(Deserialize)]
@@ -89,6 +91,36 @@ struct WireBootstrapV2 {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct WireBootstrapV3 {
+    run_id: String,
+    origin: String,
+    session_id: String,
+    server_password: String,
+    workspace_binding_digest: String,
+    product_host_socket_path: String,
+    agent_pid: u32,
+    agent_process_group: u32,
+    agent_process_identity: String,
+    product_host_socket_parent_dev: u64,
+    product_host_socket_parent_ino: u64,
+    command_transport_key: String,
+    join_transport_key: String,
+    command_authority_key: String,
+    command_journal_path: String,
+    device_registry_path: String,
+    remote: WireRemoteBootstrap,
+    host_identity_scope: DiagnosticHostIdentityScope,
+    host_identity_root: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+enum DiagnosticHostIdentityScope {
+    #[serde(rename = "diagnostic-ephemeral-local")]
+    DiagnosticEphemeralLocal,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WireRemoteBootstrap {
     schema: String,
     relay_admin_base_url: String,
@@ -120,6 +152,13 @@ pub struct HostBootstrap {
 pub struct DecodedBootstrap {
     pub host: HostBootstrap,
     pub(crate) remote: Option<RemoteHostBootstrap>,
+    identity: HostIdentityBootstrap,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum HostIdentityBootstrap {
+    Keychain,
+    DiagnosticEphemeralLocal(PathBuf),
 }
 
 pub(crate) struct RemoteHostBootstrap {
@@ -176,6 +215,7 @@ fn decode(raw: &[u8]) -> Result<DecodedBootstrap, BootstrapError> {
     match wire {
         WireBootstrap::V1(wire) => decode_v1(wire),
         WireBootstrap::V2(wire) => decode_v2(wire),
+        WireBootstrap::V3(wire) => decode_v3(wire),
     }
 }
 
@@ -224,6 +264,7 @@ fn decode_v1(wire: WireBootstrapV1) -> Result<DecodedBootstrap, BootstrapError> 
             device_registry_path: PathBuf::from(wire.device_registry_path),
         },
         remote: None,
+        identity: HostIdentityBootstrap::Keychain,
     })
 }
 
@@ -280,7 +321,85 @@ fn decode_v2(wire: WireBootstrapV2) -> Result<DecodedBootstrap, BootstrapError> 
             device_registry_path: PathBuf::from(wire.device_registry_path),
         },
         remote: Some(remote),
+        identity: HostIdentityBootstrap::Keychain,
     })
+}
+
+fn decode_v3(wire: WireBootstrapV3) -> Result<DecodedBootstrap, BootstrapError> {
+    if wire.host_identity_scope != DiagnosticHostIdentityScope::DiagnosticEphemeralLocal {
+        return Err(BootstrapError::Invalid);
+    }
+    let identity_root = validate_host_identity_root(&wire.host_identity_root)?;
+    let v2 = WireBootstrapV2 {
+        run_id: wire.run_id,
+        origin: wire.origin,
+        session_id: wire.session_id,
+        server_password: wire.server_password,
+        workspace_binding_digest: wire.workspace_binding_digest,
+        product_host_socket_path: wire.product_host_socket_path,
+        agent_pid: wire.agent_pid,
+        agent_process_group: wire.agent_process_group,
+        agent_process_identity: wire.agent_process_identity,
+        product_host_socket_parent_dev: wire.product_host_socket_parent_dev,
+        product_host_socket_parent_ino: wire.product_host_socket_parent_ino,
+        command_transport_key: wire.command_transport_key,
+        join_transport_key: wire.join_transport_key,
+        command_authority_key: wire.command_authority_key,
+        command_journal_path: wire.command_journal_path,
+        device_registry_path: wire.device_registry_path,
+        remote: wire.remote,
+    };
+    let mut decoded = decode_v2(v2)?;
+    validate_v3_diagnostic_remote(&decoded, &identity_root)?;
+    decoded.identity = HostIdentityBootstrap::DiagnosticEphemeralLocal(identity_root);
+    Ok(decoded)
+}
+
+fn validate_host_identity_root(value: &str) -> Result<PathBuf, BootstrapError> {
+    let path = Path::new(value);
+    if value.is_empty()
+        || value.len() > 1024
+        || !value.is_ascii()
+        || !path.is_absolute()
+        || !path
+            .components()
+            .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(BootstrapError::Invalid);
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|_| BootstrapError::Invalid)?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o777 != 0o700
+        || path.canonicalize().map_err(|_| BootstrapError::Invalid)? != path
+    {
+        return Err(BootstrapError::Invalid);
+    }
+    Ok(path.to_path_buf())
+}
+
+fn validate_v3_diagnostic_remote(
+    decoded: &DecodedBootstrap,
+    identity_root: &Path,
+) -> Result<(), BootstrapError> {
+    let remote = decoded.remote.as_ref().ok_or(BootstrapError::Invalid)?;
+    if !valid_v3_diagnostic_remote_endpoints(
+        &remote.relay_admin_base_url,
+        &remote.relay_host_base_url,
+        &remote.relay_device_public_base_url,
+        remote.allow_loopback_test_http,
+    ) {
+        return Err(BootstrapError::Invalid);
+    }
+    let expected_parent = identity_root.join("remote");
+    if decoded.host.device_registry_path.parent() != Some(expected_parent.as_path())
+        || remote.pairing_store_path.parent() != Some(expected_parent.as_path())
+        || remote.remote_mailbox_state_path.parent() != Some(expected_parent.as_path())
+    {
+        return Err(BootstrapError::Invalid);
+    }
+    Ok(())
 }
 
 fn decode_remote(
@@ -448,6 +567,25 @@ fn valid_remote_origins(
     }) && parse_origin(public_device).is_some_and(|url| url.scheme() == "https")
 }
 
+fn valid_v3_diagnostic_remote_endpoints(
+    admin: &str,
+    host: &str,
+    public_device: &str,
+    allow_loopback_test_http: bool,
+) -> bool {
+    allow_loopback_test_http
+        && valid_exact_loopback_endpoint(admin, "http")
+        && valid_exact_loopback_endpoint(host, "http")
+        && valid_exact_loopback_endpoint(public_device, "https")
+}
+
+fn valid_exact_loopback_endpoint(value: &str, scheme: &str) -> bool {
+    let Some(port) = value.strip_prefix(&format!("{scheme}://127.0.0.1:")) else {
+        return false;
+    };
+    !port.is_empty() && port.parse::<u16>().is_ok_and(|port| port >= 1024)
+}
+
 fn parse_origin(value: &str) -> Option<Url> {
     if value.is_empty() || value.len() > 2048 || !value.is_ascii() {
         return None;
@@ -541,7 +679,8 @@ fn run_product_host_with_admin_fd(fd: RawFd, admin_bearer_fd: RawFd) -> Result<(
             (host, None)
         }
         Some(remote) => {
-            let runtime = prepare_remote_runtime(&decoded.host, remote, admin_bearer_fd)?;
+            let runtime =
+                prepare_remote_runtime(&decoded.host, remote, decoded.identity, admin_bearer_fd)?;
             let remote_lifecycle = crate::remote_command_ingress::RemoteIngressLifecycle::new();
             let dependencies = crate::product_stock_projector::RemoteProductHostDependencies {
                 pairing: Arc::clone(&runtime.pairing),
@@ -606,15 +745,35 @@ struct PreparedRemoteRuntime {
 fn prepare_remote_runtime(
     host: &HostBootstrap,
     remote: RemoteHostBootstrap,
+    identity_scope: HostIdentityBootstrap,
     admin_bearer_fd: RawFd,
 ) -> Result<PreparedRemoteRuntime, BootstrapError> {
-    use crate::host_device_identity::load_or_create_host_device_identity;
+    use crate::host_device_identity::{
+        load_or_create_ephemeral_local_host_device_identity, load_or_create_host_device_identity,
+    };
 
     let admin_bearer = consume_admin_bearer(admin_bearer_fd)?;
-    let identity =
-        Arc::new(load_or_create_host_device_identity().map_err(|_| BootstrapError::Invalid)?);
+    let identity = Arc::new(
+        load_identity_for_bootstrap(
+            identity_scope,
+            load_or_create_host_device_identity,
+            load_or_create_ephemeral_local_host_device_identity,
+        )
+        .map_err(|_| BootstrapError::Invalid)?,
+    );
     let endpoint_keys = identity.endpoint_keys();
     build_remote_runtime_with_endpoint(host, remote, admin_bearer, identity, Some(endpoint_keys))
+}
+
+fn load_identity_for_bootstrap<T, E>(
+    scope: HostIdentityBootstrap,
+    keychain: impl FnOnce() -> Result<T, E>,
+    local: impl FnOnce(&Path) -> Result<T, E>,
+) -> Result<T, E> {
+    match scope {
+        HostIdentityBootstrap::Keychain => keychain(),
+        HostIdentityBootstrap::DiagnosticEphemeralLocal(root) => local(&root),
+    }
 }
 
 #[cfg(test)]
@@ -1005,6 +1164,49 @@ mod tests {
         });
         (directory, value)
     }
+    fn valid_v3_value() -> (TempDir, serde_json::Value) {
+        let (directory, mut value) = valid_v2_value();
+        let identity_root = directory.path().join("diagnostic-identity");
+        let remote_directory = identity_root.join("remote");
+        fs::create_dir(&identity_root).unwrap();
+        fs::create_dir(&remote_directory).unwrap();
+        fs::set_permissions(&identity_root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&remote_directory, fs::Permissions::from_mode(0o700)).unwrap();
+        value["schema"] = "nomad.product-host.bootstrap.v3".into();
+        value["host_identity_scope"] = "diagnostic-ephemeral-local".into();
+        value["device_registry_path"] = remote_directory
+            .canonicalize()
+            .unwrap()
+            .join(DEVICE_REGISTRY_BASENAME)
+            .to_string_lossy()
+            .into_owned()
+            .into();
+        value["remote"]["relay_admin_base_url"] = "http://127.0.0.1:4201".into();
+        value["remote"]["relay_host_base_url"] = "http://127.0.0.1:4202".into();
+        value["remote"]["relay_device_public_base_url"] = "https://127.0.0.1:4203".into();
+        value["remote"]["allow_loopback_test_http"] = true.into();
+        value["remote"]["pairing_store_path"] = remote_directory
+            .canonicalize()
+            .unwrap()
+            .join(PAIRING_STORE_BASENAME)
+            .to_string_lossy()
+            .into_owned()
+            .into();
+        value["remote"]["remote_mailbox_state_path"] = remote_directory
+            .canonicalize()
+            .unwrap()
+            .join(REMOTE_MAILBOX_STATE_BASENAME)
+            .to_string_lossy()
+            .into_owned()
+            .into();
+        value["host_identity_root"] = identity_root
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+            .into();
+        (directory, value)
+    }
     fn receive(bytes: &[u8]) -> Result<DecodedBootstrap, BootstrapError> {
         let (mut parent, child) = UnixStream::pair().unwrap();
         parent.write_all(bytes).unwrap();
@@ -1043,6 +1245,245 @@ mod tests {
         assert_eq!(remote.relay_host_base_url, "http://[::1]:4202");
         assert_eq!(remote.relay_device_public_base_url, "https://pair.example");
         assert!(remote.allow_loopback_test_http);
+    }
+
+    #[test]
+    fn v2_is_keychain_only_and_rejects_diagnostic_identity_fields() {
+        for (key, value) in [
+            (
+                "host_identity_scope",
+                serde_json::json!("diagnostic-ephemeral-local"),
+            ),
+            (
+                "host_identity_root",
+                serde_json::json!("/private/tmp/identity"),
+            ),
+        ] {
+            let (_directory, mut wire) = valid_v2_value();
+            wire[key] = value;
+            assert_eq!(
+                receive(&frame(&serde_json::to_vec(&wire).unwrap())).unwrap_err(),
+                BootstrapError::Invalid,
+                "accepted v2 identity field {key}"
+            );
+        }
+
+        let (_directory, value) = valid_v2_value();
+        let decoded = receive(&frame(&serde_json::to_vec(&value).unwrap())).unwrap();
+        assert_eq!(decoded.identity, HostIdentityBootstrap::Keychain);
+    }
+
+    #[test]
+    fn v3_requires_exact_diagnostic_local_scope_and_safe_root() {
+        let (_directory, value) = valid_v3_value();
+        let decoded = receive(&frame(&serde_json::to_vec(&value).unwrap())).unwrap();
+        assert_eq!(
+            decoded.identity,
+            HostIdentityBootstrap::DiagnosticEphemeralLocal(PathBuf::from(
+                value["host_identity_root"].as_str().unwrap()
+            ))
+        );
+
+        for field in ["host_identity_scope", "host_identity_root"] {
+            let (_directory, mut value) = valid_v3_value();
+            value.as_object_mut().unwrap().remove(field);
+            assert_eq!(
+                receive(&frame(&serde_json::to_vec(&value).unwrap())).unwrap_err(),
+                BootstrapError::Invalid,
+                "accepted missing v3 field {field}"
+            );
+        }
+        for invalid in ["keychain", "local-ephemeral", "diagnostic_local"] {
+            let (_directory, mut value) = valid_v3_value();
+            value["host_identity_scope"] = invalid.into();
+            assert_eq!(
+                receive(&frame(&serde_json::to_vec(&value).unwrap())).unwrap_err(),
+                BootstrapError::Invalid,
+                "accepted v3 scope {invalid}"
+            );
+        }
+        for invalid in ["relative", "/private/tmp/../tmp/identity"] {
+            let (_directory, mut value) = valid_v3_value();
+            value["host_identity_root"] = invalid.into();
+            assert_eq!(
+                receive(&frame(&serde_json::to_vec(&value).unwrap())).unwrap_err(),
+                BootstrapError::Invalid,
+                "accepted unsafe v3 root {invalid}"
+            );
+        }
+        let (directory, mut value) = valid_v3_value();
+        let unsafe_root = directory.path().join("unsafe-root");
+        fs::create_dir(&unsafe_root).unwrap();
+        fs::set_permissions(&unsafe_root, fs::Permissions::from_mode(0o755)).unwrap();
+        value["host_identity_root"] = unsafe_root.to_string_lossy().into_owned().into();
+        assert_eq!(
+            receive(&frame(&serde_json::to_vec(&value).unwrap())).unwrap_err(),
+            BootstrapError::Invalid
+        );
+    }
+
+    #[test]
+    fn v3_accepts_only_exact_diagnostic_loopback_endpoints_and_remote_parent() {
+        let (_directory, value) = valid_v3_value();
+        let decoded = receive(&frame(&serde_json::to_vec(&value).unwrap())).unwrap();
+        let remote = decoded.remote.unwrap();
+        let identity_root = PathBuf::from(value["host_identity_root"].as_str().unwrap());
+        let expected_parent = identity_root.join("remote");
+        assert_eq!(
+            decoded.host.device_registry_path.parent(),
+            Some(expected_parent.as_path())
+        );
+        assert_eq!(
+            remote.pairing_store_path.parent(),
+            Some(expected_parent.as_path())
+        );
+        assert_eq!(
+            remote.remote_mailbox_state_path.parent(),
+            Some(expected_parent.as_path())
+        );
+        assert_eq!(remote.relay_admin_base_url, "http://127.0.0.1:4201");
+        assert_eq!(remote.relay_host_base_url, "http://127.0.0.1:4202");
+        assert_eq!(
+            remote.relay_device_public_base_url,
+            "https://127.0.0.1:4203"
+        );
+        assert!(remote.allow_loopback_test_http);
+    }
+
+    #[test]
+    fn v3_rejects_non_exact_diagnostic_endpoints_and_storage_parent() {
+        let endpoint_cases = [
+            (
+                "relay_admin_base_url",
+                serde_json::json!("https://127.0.0.1:4201"),
+            ),
+            (
+                "relay_admin_base_url",
+                serde_json::json!("http://[::1]:4201"),
+            ),
+            (
+                "relay_admin_base_url",
+                serde_json::json!("http://127.0.0.1:4201/"),
+            ),
+            (
+                "relay_host_base_url",
+                serde_json::json!("https://127.0.0.1:4202"),
+            ),
+            (
+                "relay_host_base_url",
+                serde_json::json!("http://localhost:4202"),
+            ),
+            (
+                "relay_device_public_base_url",
+                serde_json::json!("http://127.0.0.1:4203"),
+            ),
+            (
+                "relay_device_public_base_url",
+                serde_json::json!("https://pair.example"),
+            ),
+            (
+                "relay_device_public_base_url",
+                serde_json::json!("https://127.0.0.1:4203/"),
+            ),
+        ];
+        for (key, invalid) in endpoint_cases {
+            let (_directory, mut value) = valid_v3_value();
+            value["remote"][key] = invalid;
+            assert_eq!(
+                receive(&frame(&serde_json::to_vec(&value).unwrap())).unwrap_err(),
+                BootstrapError::Invalid,
+                "accepted v3 remote {key}"
+            );
+        }
+
+        let (_directory, mut value) = valid_v3_value();
+        value["remote"]["allow_loopback_test_http"] = false.into();
+        assert_eq!(
+            receive(&frame(&serde_json::to_vec(&value).unwrap())).unwrap_err(),
+            BootstrapError::Invalid
+        );
+
+        let (directory, mut value) = valid_v3_value();
+        let identity_root = PathBuf::from(value["host_identity_root"].as_str().unwrap());
+        let other_parent = directory.path().join("other-remote");
+        fs::create_dir(&other_parent).unwrap();
+        fs::set_permissions(&other_parent, fs::Permissions::from_mode(0o700)).unwrap();
+        value["device_registry_path"] = other_parent
+            .canonicalize()
+            .unwrap()
+            .join(DEVICE_REGISTRY_BASENAME)
+            .to_string_lossy()
+            .into_owned()
+            .into();
+        assert_eq!(
+            receive(&frame(&serde_json::to_vec(&value).unwrap())).unwrap_err(),
+            BootstrapError::Invalid,
+            "accepted device registry outside {:?}",
+            identity_root.join("remote")
+        );
+
+        let (_directory, mut value) = valid_v3_value();
+        let identity_root = PathBuf::from(value["host_identity_root"].as_str().unwrap());
+        value["remote"]["pairing_store_path"] = identity_root
+            .canonicalize()
+            .unwrap()
+            .join(PAIRING_STORE_BASENAME)
+            .to_string_lossy()
+            .into_owned()
+            .into();
+        assert_eq!(
+            receive(&frame(&serde_json::to_vec(&value).unwrap())).unwrap_err(),
+            BootstrapError::Invalid
+        );
+
+        let (_directory, mut value) = valid_v3_value();
+        let identity_root = PathBuf::from(value["host_identity_root"].as_str().unwrap());
+        value["remote"]["remote_mailbox_state_path"] = identity_root
+            .canonicalize()
+            .unwrap()
+            .join(REMOTE_MAILBOX_STATE_BASENAME)
+            .to_string_lossy()
+            .into_owned()
+            .into();
+        assert_eq!(
+            receive(&frame(&serde_json::to_vec(&value).unwrap())).unwrap_err(),
+            BootstrapError::Invalid
+        );
+    }
+
+    #[test]
+    fn identity_scope_dispatch_never_falls_back_across_backends() {
+        let keychain_calls = std::cell::Cell::new(0_u8);
+        let local_calls = std::cell::Cell::new(0_u8);
+        let selected = load_identity_for_bootstrap(
+            HostIdentityBootstrap::Keychain,
+            || {
+                keychain_calls.set(keychain_calls.get() + 1);
+                Ok::<_, ()>("keychain")
+            },
+            |_| {
+                local_calls.set(local_calls.get() + 1);
+                Ok::<_, ()>("local")
+            },
+        )
+        .unwrap();
+        assert_eq!(selected, "keychain");
+        assert_eq!((keychain_calls.get(), local_calls.get()), (1, 0));
+
+        keychain_calls.set(0);
+        let selected = load_identity_for_bootstrap(
+            HostIdentityBootstrap::DiagnosticEphemeralLocal(PathBuf::from("/unused")),
+            || {
+                keychain_calls.set(keychain_calls.get() + 1);
+                Ok::<_, &str>("keychain")
+            },
+            |_| {
+                local_calls.set(local_calls.get() + 1);
+                Err::<&str, &str>("corrupt")
+            },
+        );
+        assert_eq!(selected, Err("corrupt"));
+        assert_eq!((keychain_calls.get(), local_calls.get()), (0, 1));
     }
 
     #[test]
@@ -1461,7 +1902,7 @@ mod tests {
         let registry_path = decoded.host.device_registry_path.clone();
         let socket_path = decoded.host.product_host_socket_path.clone();
         assert!(matches!(
-            prepare_remote_runtime(&decoded.host, remote, -1),
+            prepare_remote_runtime(&decoded.host, remote, HostIdentityBootstrap::Keychain, -1,),
             Err(BootstrapError::Invalid)
         ));
         assert!(!pairing_path.exists());

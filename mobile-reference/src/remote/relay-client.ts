@@ -435,15 +435,30 @@ function exactObject(value: unknown, keys: string[]): Record<string, unknown> {
 }
 
 function decodeBase64Url(value: unknown, field: string): Uint8Array {
-  if (typeof value !== 'string' || value.length === 0 || !BASE64URL_NOPAD.test(value)) {
+  if (
+    typeof value !== 'string'
+    || value.length === 0
+    || value.length % 4 === 1
+    || !BASE64URL_NOPAD.test(value)
+  ) {
     throw new DeviceRelayClientError('INVALID_FRAME', `Relay ${field} encoding is invalid.`);
   }
-  const padded = value + '==='.slice((value.length + 3) % 4);
+  const padded = value
+    .replace(/-/g, '+')
+    .replace(/_/g, '/')
+    .padEnd(Math.ceil(value.length / 4) * 4, '=');
   try {
+    const binary = atob(padded);
     const decoded = Uint8Array.from(
-      Buffer.from(padded.replace(/-/g, '+').replace(/_/g, '/'), 'base64'),
+      binary, (character) => character.charCodeAt(0),
     );
-    if (Buffer.from(decoded).toString('base64url') !== value) {
+    let canonical = '';
+    for (const byte of decoded) canonical += String.fromCharCode(byte);
+    canonical = btoa(canonical)
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/g, '');
+    if (canonical !== value) {
       throw new Error('non-canonical');
     }
     return decoded;

@@ -353,15 +353,15 @@ func TestSignalReadyClosesDescriptorAfterExactFrame(t *testing.T) {
 
 func TestConfigurationRejectsWildcardLoopbackAndSecretAlternatives(t *testing.T) {
 	for _, addr := range []string{"", "0.0.0.0:8443", "[::]:8443", "127.0.0.1:8443", "localhost:8443", "192.0.2.10:443", "https://192.0.2.10:8443"} {
-		if err := validateListen(addr); err == nil {
+		if err := validateListen(addr, false); err == nil {
 			t.Fatalf("accepted listen %q", addr)
 		}
 	}
-	if err := validateListen("192.0.2.10:8443"); err != nil {
+	if err := validateListen("192.0.2.10:8443", false); err != nil {
 		t.Fatalf("valid explicit listen: %v", err)
 	}
 	for _, raw := range []string{"http://pair.example:8443", "https://pair.example", "https://user@pair.example:8443", "https://pair.example:8443/path", "https://pair.example:8443?x=1"} {
-		if _, err := parsePublicOrigin(raw); err == nil {
+		if _, err := parsePublicOrigin(raw, false); err == nil {
 			t.Fatalf("accepted public origin %q", raw)
 		}
 	}
@@ -375,6 +375,57 @@ func TestConfigurationRejectsWildcardLoopbackAndSecretAlternatives(t *testing.T)
 		if _, err := parseConfig(append(append([]string{}, base...), secretOption, "secret")); err == nil {
 			t.Fatalf("accepted forbidden secret option %s", secretOption)
 		}
+	}
+}
+
+func TestDiagnosticLoopbackFlagRequiresExactLoopbackAndPresenceOnly(t *testing.T) {
+	for _, args := range [][]string{
+		{"--diagnostic-loopback", "--diagnostic-loopback"},
+		{"--diagnostic-loopback=true"},
+		{"--diagnostic-loopback=false"},
+	} {
+		if _, _, err := parseDiagnosticLoopbackFlag(args); err == nil {
+			t.Fatalf("accepted diagnostic loopback args %q", args)
+		}
+	}
+
+	base := []string{"--listen", "127.0.0.1:8443", "--public-origin", "https://127.0.0.1:8443", "--join-upstream", "http://127.0.0.1:9001", "--device-relay-upstream", "http://127.0.0.1:9002", "--tls-cert-fd", "10", "--tls-key-fd", "11", "--trusted-join-token-fd", "12", "--ready-fd", "13"}
+	if _, err := parseConfig(base); err == nil {
+		t.Fatal("accepted loopback config without diagnostic flag")
+	}
+
+	accepted, filtered, err := parseDiagnosticLoopbackFlag(append([]string{"--diagnostic-loopback"}, base...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !accepted {
+		t.Fatal("diagnostic loopback flag not detected")
+	}
+	if len(filtered) != len(base) {
+		t.Fatalf("filtered args len=%d want=%d", len(filtered), len(base))
+	}
+
+	for _, listen := range []string{"127.0.0.2:8443", "0.0.0.0:8443", "[::1]:8443", "localhost:8443"} {
+		if err := validateListen(listen, true); err == nil {
+			t.Fatalf("accepted diagnostic listen %q", listen)
+		}
+	}
+	if err := validateListen("127.0.0.1:8443", true); err != nil {
+		t.Fatalf("valid diagnostic listen: %v", err)
+	}
+
+	for _, origin := range []string{"https://localhost:8443", "https://127.0.0.2:8443", "https://127.0.0.1", "http://127.0.0.1:8443"} {
+		if _, err := parsePublicOrigin(origin, true); err == nil {
+			t.Fatalf("accepted diagnostic public origin %q", origin)
+		}
+	}
+	if _, err := parsePublicOrigin("https://127.0.0.1:8443", true); err != nil {
+		t.Fatalf("valid diagnostic public origin: %v", err)
+	}
+
+	mismatch := append([]string{"--diagnostic-loopback"}, []string{"--listen", "127.0.0.1:8443", "--public-origin", "https://127.0.0.1:9443", "--join-upstream", "http://127.0.0.1:9001", "--device-relay-upstream", "http://127.0.0.1:9002", "--tls-cert-fd", "10", "--tls-key-fd", "11", "--trusted-join-token-fd", "12", "--ready-fd", "13"}...)
+	if _, err := parseConfig(mismatch); err == nil {
+		t.Fatal("accepted diagnostic public origin with mismatched port")
 	}
 }
 

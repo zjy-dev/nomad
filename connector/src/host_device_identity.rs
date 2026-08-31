@@ -503,11 +503,23 @@ pub(crate) fn load_or_create_host_device_identity_with_scope(
     }
 }
 
+/// Loads the diagnostic Host identity from the caller-selected local root.
+///
+/// This entry point deliberately does not consult the environment or Keychain:
+/// the bootstrap decoder owns the scope decision and passes the validated root
+/// explicitly, so a diagnostic launch cannot silently fall back across scopes.
+pub(crate) fn load_or_create_ephemeral_local_host_device_identity(
+    root: &Path,
+) -> Result<HostDeviceIdentity, HostDeviceIdentityError> {
+    validate_local_identity_root(root)?;
+    let store = LocalFileSecretStore::from_home(root)?;
+    load_or_create_with_store(&store, KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+}
+
 fn load_or_create_local_host_device_identity() -> Result<HostDeviceIdentity, HostDeviceIdentityError>
 {
     let root = local_installed_identity_root_from_env()?;
-    let store = LocalFileSecretStore::from_home(root.as_path())?;
-    load_or_create_with_store(&store, KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+    load_or_create_ephemeral_local_host_device_identity(root.as_path())
 }
 
 fn load_or_create_keychain_host_device_identity(
@@ -636,10 +648,20 @@ fn local_installed_identity_root_from_env() -> Result<PathBuf, HostDeviceIdentit
     let raw = std::env::var_os(LOCAL_IDENTITY_ROOT_ENV)
         .ok_or(HostDeviceIdentityError::BackendUnavailable)?;
     let root = PathBuf::from(raw);
-    if !root.is_absolute() || has_symlinked_component(&root)? {
+    validate_local_identity_root(&root)?;
+    Ok(root)
+}
+
+fn validate_local_identity_root(root: &Path) -> Result<(), HostDeviceIdentityError> {
+    if !root.is_absolute()
+        || !root
+            .components()
+            .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
+        || has_symlinked_component(root)?
+    {
         return Err(HostDeviceIdentityError::BackendUnavailable);
     }
-    Ok(root)
+    validate_owned_home_dir(root)
 }
 
 fn has_symlinked_component(path: &Path) -> Result<bool, HostDeviceIdentityError> {
@@ -1106,6 +1128,38 @@ mod tests {
             HostDeviceIdentityError::Corrupt | HostDeviceIdentityError::Invariant
         ));
         assert_eq!(fs::read(&path).unwrap(), br#"{"version":"nope"}"#);
+    }
+
+    #[test]
+    fn explicit_ephemeral_local_root_reopens_without_environment_or_rotation() {
+        let root = TempDir::new().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let canonical_root = root.path().canonicalize().unwrap();
+
+        let first = load_or_create_ephemeral_local_host_device_identity(&canonical_root).unwrap();
+        let identity_path = canonical_root.join("private").join(LOCAL_FILE_BASENAME);
+        let original = fs::read(&identity_path).unwrap();
+        let second = load_or_create_ephemeral_local_host_device_identity(&canonical_root).unwrap();
+
+        assert_eq!(first.signing_public_sec1(), second.signing_public_sec1());
+        assert_eq!(original, fs::read(identity_path).unwrap());
+    }
+
+    #[test]
+    fn explicit_ephemeral_local_corruption_fails_without_rotation() {
+        let root = TempDir::new().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let canonical_root = root.path().canonicalize().unwrap();
+        let store = LocalFileSecretStore::from_home(&canonical_root).unwrap();
+        fs::write(&store.path, br#"{"version":"corrupt"}"#).unwrap();
+        fs::set_permissions(&store.path, fs::Permissions::from_mode(0o600)).unwrap();
+        let original = fs::read(&store.path).unwrap();
+
+        assert!(matches!(
+            load_or_create_ephemeral_local_host_device_identity(&canonical_root),
+            Err(HostDeviceIdentityError::Corrupt | HostDeviceIdentityError::Invariant)
+        ));
+        assert_eq!(original, fs::read(&store.path).unwrap());
     }
 
     #[test]

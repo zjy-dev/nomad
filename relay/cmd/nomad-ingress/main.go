@@ -151,6 +151,11 @@ func run(ctx context.Context, args []string) error {
 }
 
 func parseConfig(args []string) (config, error) {
+	diagnosticLoopback, filteredArgs, err := parseDiagnosticLoopbackFlag(args)
+	if err != nil {
+		return config{}, err
+	}
+
 	flags := flag.NewFlagSet("nomad-https-ingress", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	listen := flags.String("listen", "", "specific LAN IP and unprivileged port")
@@ -161,16 +166,16 @@ func parseConfig(args []string) (config, error) {
 	tlsKeyFD := flags.Int("tls-key-fd", -1, "inherited TLS private-key descriptor")
 	trustedFD := flags.Int("trusted-join-token-fd", -1, "inherited trusted-ingress token descriptor")
 	ready := flags.Int("ready-fd", -1, "inherited ready descriptor")
-	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
+	if err := flags.Parse(filteredArgs); err != nil || flags.NArg() != 0 {
 		return config{}, errors.New("invalid ingress arguments")
 	}
 	if *tlsCertFD != certFD || *tlsKeyFD != keyFD || *trustedFD != trustedJoinFD || *ready != readyFD {
 		return config{}, errors.New("ingress requires TLS certificate FD 10, TLS key FD 11, trusted token FD 12, and ready FD 13")
 	}
-	if err := validateListen(*listen); err != nil {
+	if err := validateListen(*listen, diagnosticLoopback); err != nil {
 		return config{}, err
 	}
-	public, err := parsePublicOrigin(*publicOrigin)
+	public, err := parsePublicOrigin(*publicOrigin, diagnosticLoopback)
 	if err != nil {
 		return config{}, err
 	}
@@ -223,20 +228,50 @@ func parseConfig(args []string) (config, error) {
 	return config{*listen, public, join, device, certificate, trustedToken, readyFile}, nil
 }
 
-func validateListen(value string) error {
+func parseDiagnosticLoopbackFlag(args []string) (bool, []string, error) {
+	const name = "--diagnostic-loopback"
+
+	filtered := make([]string, 0, len(args))
+	enabled := false
+	for _, arg := range args {
+		switch {
+		case arg == name:
+			if enabled {
+				return false, nil, errors.New("--diagnostic-loopback may only be provided once")
+			}
+			enabled = true
+		case strings.HasPrefix(arg, name+"="):
+			return false, nil, errors.New("--diagnostic-loopback does not take a value")
+		default:
+			filtered = append(filtered, arg)
+		}
+	}
+	return enabled, filtered, nil
+}
+
+func validateListen(value string, diagnosticLoopback bool) error {
 	host, portText, err := net.SplitHostPort(value)
 	if err != nil {
 		return errors.New("--listen must be one specific LAN IP and port")
 	}
 	ip := net.ParseIP(host)
 	port, portErr := strconv.Atoi(portText)
-	if ip == nil || !ip.IsGlobalUnicast() || ip.IsLoopback() || portErr != nil || port < 1024 || port > 65535 {
+	if ip == nil || portErr != nil || port < 1024 || port > 65535 {
+		return errors.New("--listen must be one specific non-loopback LAN IP and unprivileged port")
+	}
+	if diagnosticLoopback {
+		if host != "127.0.0.1" {
+			return errors.New("--diagnostic-loopback requires --listen 127.0.0.1 with an unprivileged port")
+		}
+		return nil
+	}
+	if !ip.IsGlobalUnicast() || ip.IsLoopback() {
 		return errors.New("--listen must be one specific non-loopback LAN IP and unprivileged port")
 	}
 	return nil
 }
 
-func parsePublicOrigin(value string) (*url.URL, error) {
+func parsePublicOrigin(value string, diagnosticLoopback bool) (*url.URL, error) {
 	u, err := url.Parse(value)
 	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.Port() == "" || u.User != nil || u.Path != "" || u.RawPath != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
 		return nil, errors.New("--public-origin must be an exact HTTPS origin with an explicit port")
@@ -247,6 +282,9 @@ func parsePublicOrigin(value string) (*url.URL, error) {
 	}
 	if canonicalHost := net.JoinHostPort(strings.ToLower(u.Hostname()), u.Port()); u.Host != canonicalHost {
 		return nil, errors.New("--public-origin authority is not canonical")
+	}
+	if diagnosticLoopback && u.Host != net.JoinHostPort("127.0.0.1", u.Port()) {
+		return nil, errors.New("--diagnostic-loopback requires --public-origin https://127.0.0.1 with the --listen port")
 	}
 	return u, nil
 }

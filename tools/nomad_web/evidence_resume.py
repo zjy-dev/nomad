@@ -439,6 +439,12 @@ def _validate_bundle_binding(
 def _validate_common_evidence(
     evidence: Mapping[str, Any], manifest: Mapping[str, Any], source_binding: Mapping[str, str]
 ) -> None:
+    if (
+        evidence.get("mode") == "remote-loopback-diagnostic"
+        or evidence.get("diagnostic_only") is True
+        or evidence.get("accepted_eligible") is False
+    ):
+        raise EvidenceResumeError("DIAGNOSTIC_EVIDENCE_FORBIDDEN")
     if evidence.get("schema") != EVIDENCE_SCHEMA:
         raise EvidenceResumeError("EVIDENCE_SCHEMA_INVALID")
     if (

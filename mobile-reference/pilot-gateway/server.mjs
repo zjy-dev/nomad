@@ -64,6 +64,25 @@ export function createGateway(options) {
     throw new Error("Unsupported Gateway route table");
   if (routeTable !== "legacy" && mode !== "official-agent-local")
     throw new Error("Pairing route tables require official-agent-local mode");
+  const diagnosticLoopback = options.diagnosticLoopback === true;
+  if (
+    diagnosticLoopback &&
+    (mode !== "official-agent-local" ||
+      routeTable !== "desktop" ||
+      options.host !== "127.0.0.1")
+  )
+    throw new Error(
+      "Diagnostic loopback requires official-agent-local desktop on 127.0.0.1",
+    );
+  if (
+    diagnosticLoopback &&
+    (options.lifecycleChannelFd !== undefined ||
+      options.lifecycleBridge !== undefined ||
+      options.lifecycleBridgeOptions !== undefined)
+  )
+    throw new Error(
+      "Diagnostic loopback must not receive lifecycle capabilities",
+    );
   const commandKey =
     mode === "official-agent-local" && !options.productHostClient
       ? (options.commandKey ?? readCommandKeyFromFd(options.commandKeyFd))
@@ -117,7 +136,7 @@ export function createGateway(options) {
         }))
       : null;
   const lifecycleBridge =
-    routeTable === "desktop"
+    routeTable === "desktop" && !diagnosticLoopback
       ? lazyLifecycleBridge(options)
       : null;
   let ingestFlight = null;
@@ -158,6 +177,7 @@ export function createGateway(options) {
             desktopOrigin,
             desktopCsrf,
             desktopPublicOrigin,
+            diagnosticLoopback,
           )
         )
           return;
@@ -181,6 +201,8 @@ export function createGateway(options) {
       if (url.pathname === "/api/commands/capability") {
         if (mode !== "official-agent-local")
           return json(response, 404, { error: "NOT_FOUND" });
+        if (diagnosticLoopback)
+          return json(response, 404, { error: "DIAGNOSTIC_UNAVAILABLE" });
         if (!commandSecurity)
           throw new CommandSecurityError("COMMAND_GATEWAY_UNAVAILABLE", 503);
         if (request.method !== "GET")
@@ -217,6 +239,8 @@ export function createGateway(options) {
       if (url.pathname === "/api/commands") {
         if (mode !== "official-agent-local")
           return json(response, 404, { error: "NOT_FOUND" });
+        if (diagnosticLoopback)
+          return json(response, 404, { error: "DIAGNOSTIC_UNAVAILABLE" });
         if (!commandSecurity)
           throw new CommandSecurityError("COMMAND_GATEWAY_UNAVAILABLE", 503);
         if (request.method !== "POST")
@@ -314,10 +338,20 @@ async function handleDesktopRoute(
   origin,
   csrf,
   publicOrigin,
+  diagnosticLoopback,
 ) {
   if (!url.pathname.startsWith("/api/desktop/")) return false;
   if (url.search !== "") {
     json(response, 404, { error: "NOT_FOUND" });
+    return true;
+  }
+  if (
+    diagnosticLoopback &&
+    (url.pathname.startsWith("/api/desktop/remote-access/") ||
+      url.pathname === "/api/desktop/install/uninstall" ||
+      url.pathname === "/api/desktop/lifecycle/status")
+  ) {
+    json(response, 404, { error: "DIAGNOSTIC_UNAVAILABLE" });
     return true;
   }
   const postRoutes = new Map([
@@ -1115,6 +1149,7 @@ export function parseArgs(args, env = process.env) {
     publicOrigin: undefined,
     trustedIngressFd: undefined,
     lifecycleChannelFd: undefined,
+    diagnosticLoopback: false,
   };
   const allowed = new Set([
     "mode",
@@ -1134,12 +1169,20 @@ export function parseArgs(args, env = process.env) {
     "trusted-ingress-fd",
     "lifecycle-channel-fd",
   ]);
-  for (let index = 0; index < args.length; index += 2) {
+  for (let index = 0; index < args.length; ) {
+    if (args[index] === "--diagnostic-loopback") {
+      if (out.diagnosticLoopback)
+        throw new Error("Duplicate --diagnostic-loopback");
+      out.diagnosticLoopback = true;
+      index += 1;
+      continue;
+    }
     const name = args[index]?.replace(/^--/, "");
     if (!allowed.has(name) || args[index + 1] === undefined)
       throw new Error(`Unsupported or incomplete option: ${args[index] ?? ""}`);
     out[name.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] =
       args[index + 1];
+    index += 2;
   }
   out.port = Number(out.port);
   if (!Number.isInteger(out.port) || out.port < 0 || out.port > 65535)
@@ -1148,6 +1191,19 @@ export function parseArgs(args, env = process.env) {
     throw new Error("Invalid --mode");
   if (!["legacy", "desktop", "join"].includes(out.routeTable))
     throw new Error("Invalid --route-table");
+  if (
+    out.diagnosticLoopback &&
+    (out.mode !== "official-agent-local" ||
+      out.routeTable !== "desktop" ||
+      out.host !== "127.0.0.1")
+  )
+    throw new Error(
+      "--diagnostic-loopback requires official-agent-local desktop on 127.0.0.1",
+    );
+  if (out.diagnosticLoopback && out.lifecycleChannelFd !== undefined)
+    throw new Error(
+      "--diagnostic-loopback must not use --lifecycle-channel-fd",
+    );
   if (out.mode === "official-agent-local") {
     if (!out.productHostSocket)
       throw new Error("Missing --product-host-socket");
@@ -1174,9 +1230,9 @@ export function parseArgs(args, env = process.env) {
       if (!out.publicOrigin) throw new Error("Missing --public-origin");
     } else if (out.routeTable === "desktop") {
       if (!out.publicOrigin) throw new Error("Missing --public-origin");
-      if (out.lifecycleChannelFd !== "12")
+      if (!out.diagnosticLoopback && out.lifecycleChannelFd !== "12")
         throw new Error("Missing or invalid --lifecycle-channel-fd");
-      out.lifecycleChannelFd = 12;
+      if (!out.diagnosticLoopback) out.lifecycleChannelFd = 12;
       if (out.trustedIngressFd !== undefined)
         throw new Error("Trusted ingress capability requires join route table");
     } else if (out.publicOrigin || out.trustedIngressFd !== undefined || out.lifecycleChannelFd !== undefined)

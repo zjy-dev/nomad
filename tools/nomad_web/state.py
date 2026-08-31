@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import re
 import stat
+import urllib.parse
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -15,6 +17,7 @@ from typing import Any
 MAX_STATE_BYTES = 64 * 1024
 STATE_SCHEMA = "nomad.web-companion.state.v1"
 REMOTE_STATE_SCHEMA = "nomad.web-companion.state.v2"
+DIAGNOSTIC_STATE_SCHEMA = "nomad.web-companion.diagnostic-state.v1"
 HOME_SCHEMA = "nomad.web-companion.home.v1"
 HOME_MARKER = ".nomad-web-home.json"
 RUN_KEYS = {
@@ -43,6 +46,10 @@ REMOTE_RUN_KEYS = {
     "lifecycle_coordinator",
     "session_alias", "workspace_binding_digest",
     "product_host_socket_identity", "identity",
+}
+DIAGNOSTIC_REMOTE_RUN_KEYS = REMOTE_RUN_KEYS | {
+    "diagnostic_only", "accepted_eligible", "identity_scope",
+    "tls_scope", "external_gates",
 }
 
 
@@ -305,7 +312,7 @@ def write_run_state(config: Any, value: dict[str, Any]) -> None:
 def validate_run_state(config: Any, value: Any) -> None:
     if not isinstance(value, dict):
         raise RuntimeError("INVALID_STATE")
-    if value.get("schema") == REMOTE_STATE_SCHEMA:
+    if value.get("schema") in {REMOTE_STATE_SCHEMA, DIAGNOSTIC_STATE_SCHEMA}:
         _validate_remote_run_state(config, value)
         return
     if set(value) != RUN_KEYS:
@@ -378,16 +385,68 @@ def _config_port(config: Any, name: str) -> int:
         raise RuntimeError("INVALID_STATE") from error
 
 
+def _is_literal_diagnostic_origin(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        return value == f"https://127.0.0.1:{parsed.port}"
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_accepted_public_origin(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        if (
+            parsed.scheme != "https" or parsed.hostname is None or parsed.port is None
+            or parsed.hostname.lower() == "localhost" or parsed.username is not None
+            or parsed.password is not None or parsed.path or parsed.query or parsed.fragment
+        ):
+            return False
+    except (TypeError, ValueError):
+        return False
+    try:
+        address = ipaddress.ip_address(parsed.hostname)
+    except ValueError:
+        return True
+    mapped = address.ipv4_mapped if isinstance(address, ipaddress.IPv6Address) else None
+    return not (
+        address.is_loopback or address.is_unspecified or address.is_multicast
+        or (mapped is not None and mapped.is_loopback)
+    )
+
+
 def _validate_remote_run_state(config: Any, value: dict[str, Any]) -> None:
-    if set(value) != REMOTE_RUN_KEYS:
+    diagnostic = value.get("schema") == DIAGNOSTIC_STATE_SCHEMA
+    expected_keys = DIAGNOSTIC_REMOTE_RUN_KEYS if diagnostic else REMOTE_RUN_KEYS
+    if set(value) != expected_keys:
         raise RuntimeError("INVALID_STATE")
+    if diagnostic:
+        gates = value.get("external_gates")
+        if (
+            value.get("mode") != "remote-loopback-diagnostic"
+            or value.get("diagnostic_only") is not True
+            or value.get("accepted_eligible") is not False
+            or value.get("identity_scope") != "diagnostic-ephemeral-local"
+            or value.get("tls_scope") != "self-signed-spki-diagnostic"
+            or value.get("network_scope") != "loopback_diagnostic"
+            or value.get("production_external") is not False
+            or not isinstance(gates, list)
+            or [item.get("gate") for item in gates if isinstance(item, dict)]
+                != ["external_topology", "provider_e3", "physical_phone", "writes"]
+            or any(set(item) != {"gate", "status"} or item["status"] != "NOT_RUN" for item in gates)
+        ):
+            raise RuntimeError("INVALID_STATE")
     if (
-        value["mode"] != "remote-local-evidence"
+        value["mode"] != ("remote-loopback-diagnostic" if diagnostic else "remote-local-evidence")
         or value["real_agent_enabled"] is not True
         or value["remote_enabled"] is not True
         or value["pairing_ready"] is not True
         or value["remote_mailbox_ready"] is not True
-        or value["network_scope"] != "lan_direct"
+        or value["network_scope"] != ("loopback_diagnostic" if diagnostic else "lan_direct")
         or value["production_external"] is not False
         or not isinstance(value["bundle_digest"], str)
         or re.fullmatch(r"[0-9a-f]{64}", value["bundle_digest"]) is None
@@ -411,7 +470,7 @@ def _validate_remote_run_state(config: Any, value: dict[str, Any]) -> None:
         raise RuntimeError("INVALID_STATE")
     if (
         not isinstance(value["pairing_public_origin"], str)
-        or not value["pairing_public_origin"].startswith("https://")
+        or (_is_literal_diagnostic_origin(value["pairing_public_origin"]) is not True if diagnostic else not _is_accepted_public_origin(value["pairing_public_origin"]))
         or value["agent_origin"] != f"http://127.0.0.1:{_config_port(config, 'agent_port')}"
         or value["agent_version"] != "1.18.16"
         or Path(value["logs_dir"]).resolve(strict=False) != (Path(config.home) / "logs").resolve(strict=False)
@@ -445,6 +504,13 @@ def _validate_remote_run_state(config: Any, value: dict[str, Any]) -> None:
         if not Path(item["log"]).resolve(strict=False).is_relative_to(home / "logs"):
             raise RuntimeError("INVALID_STATE")
     sidecar = value["lifecycle_coordinator"]
+    if diagnostic and sidecar is None:
+        _validate_identity(
+            value["identity"], mode=value["mode"],
+            bundle_digest=value["bundle_digest"], run_id=value["run_id"],
+            socket_identity=value["product_host_socket_identity"],
+        )
+        return
     if (
         not isinstance(sidecar, dict)
         or set(sidecar) != PROCESS_KEYS - {"log"}
@@ -526,7 +592,7 @@ def _validate_identity(
         raise RuntimeError("INVALID_STATE")
     if mode == "foundation-readonly" and host["availability"] != "NOT_RUN":
         raise RuntimeError("INVALID_STATE")
-    if mode != "foundation-readonly" and host["availability"] == "NOT_RUN":
+    if mode not in {"foundation-readonly", "remote-loopback-diagnostic"} and host["availability"] == "NOT_RUN":
         raise RuntimeError("INVALID_STATE")
 
     paired = value["paired_device"]
@@ -542,6 +608,11 @@ def _validate_identity(
     if mode == "foundation-readonly" and paired["availability"] != "NOT_RUN":
         raise RuntimeError("INVALID_STATE")
     if mode == "remote-local-evidence" and paired["availability"] == "NOT_RUN":
+        raise RuntimeError("INVALID_STATE")
+    if mode == "remote-loopback-diagnostic" and any(
+        item["availability"] != "NOT_RUN"
+        for item in (installed, running, host, paired)
+    ):
         raise RuntimeError("INVALID_STATE")
 
 

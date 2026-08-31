@@ -957,10 +957,7 @@ impl ProductRemoteCommandAuthority {
         let CurrentActiveDevice::Active(device) = current else {
             return Err(CommandProtocolError::Stale);
         };
-        if device.device_alias != binding.device_alias
-            || device.pairing_epoch != binding.pairing_epoch
-            || device.signing_commitment != binding.device_signing_commitment
-            || device.agreement_commitment != binding.device_agreement_commitment
+        if !binding.matches_authority_device(&device)
             || expected.is_some_and(|expected| !same_remote_binding(expected, &binding))
         {
             return Err(CommandProtocolError::Stale);

@@ -22,6 +22,7 @@ from typing import Any
 
 
 SCHEMA = "nomad.m3e.desktop-browser-evidence.v1"
+LOOPBACK_DIAGNOSTIC_SCHEMA = "nomad.installed-loopback.browser-diagnostic.v1"
 EXPECTED_CHROME = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
 
 
@@ -55,6 +56,45 @@ def _runner_source_digest() -> str:
     if isinstance(injected, str) and re.fullmatch(r"[0-9a-f]{64}", injected):
         return injected
     return _sha256(Path(__file__))
+
+
+def _result_schema(installed_loopback_phone_emulation: bool) -> str:
+    return (
+        LOOPBACK_DIAGNOSTIC_SCHEMA
+        if installed_loopback_phone_emulation else SCHEMA
+    )
+
+
+def _page_modes(installed_loopback_phone_emulation: bool) -> list[str]:
+    return (
+        ["desktop", "phone-emulation"]
+        if installed_loopback_phone_emulation else ["desktop", "desktop"]
+    )
+
+
+def _browser_mode_evidence(installed_loopback_phone_emulation: bool) -> dict[str, Any]:
+    if not installed_loopback_phone_emulation:
+        return {}
+    return {"page_modes": _page_modes(True)}
+
+
+def _is_write_command_post(url: str, method: str) -> bool:
+    from urllib.parse import urlsplit
+
+    return method == "POST" and urlsplit(url).path == "/api/commands"
+
+
+def _diagnostic_write_command_evidence(
+    installed_loopback_phone_emulation: bool, count: int,
+) -> dict[str, int]:
+    if not installed_loopback_phone_emulation:
+        return {}
+    if count != 0:
+        raise BrowserEvidenceError(
+            "diagnostic_write_command_observed",
+            {"write_command_post_count": count},
+        )
+    return {"write_command_post_count": 0}
 
 
 def _wait_text(page: Any, text: str, timeout: int) -> None:
@@ -245,7 +285,9 @@ def _sample_command_capability(page: Any) -> dict[str, Any]:
     }
 
 
-def run(args: argparse.Namespace) -> dict[str, Any]:
+def run(
+    args: argparse.Namespace, *, _installed_loopback_phone_emulation: bool = False,
+) -> dict[str, Any]:
     stage = "browser_preflight"
     if not args.chrome.is_file():
         raise BrowserEvidenceError("desktop_chrome_missing")
@@ -260,6 +302,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise BrowserEvidenceError("diagnostic_spki_invalid") from error
         if len(decoded_spki) != 32:
             raise BrowserEvidenceError("diagnostic_spki_invalid")
+    if _installed_loopback_phone_emulation and args.diagnostic_spki_sha256 is None:
+        raise BrowserEvidenceError("installed_loopback_phone_emulation_requires_spki")
     args.profile.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(args.profile, 0o700)
 
@@ -272,6 +316,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     navigation_fact: dict[str, Any] = {}
     relay_facts: dict[str, dict[str, Any]] = {}
     network_failure_codes: dict[str, int] = {}
+    write_command_post_count = 0
     with sync_playwright() as playwright:
         # Do not add ignore_https_errors here or to a page/context. A successful
         # public navigation therefore proves normal Chrome certificate checks.
@@ -293,6 +338,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         try:
             desktop = context.pages[0] if context.pages else context.new_page()
             phone = context.new_page()
+            if _installed_loopback_phone_emulation:
+                # This private, non-CLI path is only reachable from the
+                # installed-loopback diagnostic runner after the SPKI gate
+                # above. The CDP session is target-scoped, leaving the first
+                # page as a desktop viewport.
+                phone_session = context.new_cdp_session(phone)
+                phone_session.send(
+                    "Emulation.setDeviceMetricsOverride",
+                    {
+                        "width": 390, "height": 844,
+                        "deviceScaleFactor": 3, "mobile": True,
+                        "screenOrientation": {"type": "portraitPrimary", "angle": 0},
+                    },
+                )
+                phone_session.send(
+                    "Emulation.setTouchEmulationEnabled",
+                    {"enabled": True, "maxTouchPoints": 5},
+                )
 
             def count_console(message: Any) -> None:
                 nonlocal console_errors
@@ -300,6 +363,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     console_errors += 1
 
             def count_request(request: Any) -> None:
+                nonlocal write_command_post_count
+                if (
+                    _installed_loopback_phone_emulation
+                    and _is_write_command_post(request.url, request.method)
+                ):
+                    write_command_post_count += 1
                 category = _relay_request_category(request.url, request.method)
                 if category is not None:
                     fact = relay_facts.setdefault(category, {"requests": 0, "responses": {}, "failures": {}})
@@ -451,19 +520,32 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             # E6-D is not allowed to manufacture Agent pending state. Presence
             # is recorded, but write actions remain NOT_RUN in this canary run.
 
-            stage = "revoke"
+            stage = "revoke_open"
             desktop.get_by_role("button", name="Revoke phone").click()
+            stage = "revoke_confirm"
             desktop.get_by_role("button", name="Revoke now").click()
-            _wait_text(desktop, "No phone paired yet", args.timeout_ms)
+            stage = "revoke_desktop_state"
+            desktop.wait_for_function(
+                """() => !document.querySelector('[data-testid=\"paired-device-card\"]')
+                  && Array.from(document.querySelectorAll('[role=\"status\"]')).some(
+                    (node) => (node.textContent || '').includes(
+                      'Phone access was removed immediately.'))""",
+                timeout=args.timeout_ms,
+            )
+            stage = "revoke_navigation"
             current_url = phone.url
             networkidle["revoke"] = _navigate_dynamic(phone, current_url, args.timeout_ms)
+            stage = "revoke_phone_state"
             phone.get_by_role("heading", name="Phone access removed").wait_for(
                 state="visible", timeout=args.timeout_ms
             )
 
             browser = context.browser
+            diagnostic_write_evidence = _diagnostic_write_command_evidence(
+                _installed_loopback_phone_emulation, write_command_post_count,
+            )
             return {
-                "schema": SCHEMA,
+                "schema": _result_schema(_installed_loopback_phone_emulation),
                 "runner_raw_sha256": _runner_source_digest(),
                 "status": "DIAGNOSTIC_COMPLETE" if args.diagnostic_spki_sha256 else "PASS",
                 "browser": {
@@ -472,6 +554,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "executable_sha256": _sha256(args.chrome),
                     "headless": True,
                     "isolated_profile": True,
+                    **_browser_mode_evidence(_installed_loopback_phone_emulation),
                 },
                 "https": {
                     "normal_verification": args.diagnostic_spki_sha256 is None,
@@ -501,6 +584,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     },
                 },
                 "content_free": True,
+                **diagnostic_write_evidence,
             }
         except BrowserEvidenceError as error:
             if error.diagnostics:

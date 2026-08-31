@@ -20,7 +20,7 @@ from .install_lifecycle import (
 from .launcher import (
     HostIdentityError, authorize_host_identity, reset_remote_access,
     restart_foundation, run_foundation, start_foundation, status_foundation,
-    stop_foundation, uninstall_lifecycle,
+    start_remote_loopback_diagnostic, stop_foundation, uninstall_lifecycle,
 )
 from .materialize import materialize
 from .lifecycle_coordinator import operation_status
@@ -45,7 +45,7 @@ def run(argv: Sequence[str] | None = None, repo_root: Path | None = None) -> int
             "install", "upgrade", "rollback", "resume-evidence",
             "verify-release", "install-status", "onboarding",
             "diagnostics", "reset-remote-access",
-            "operation-status",
+            "operation-status", "start-loopback-diagnostic",
         ),
     )
     parser.add_argument("--output", type=Path)
@@ -197,6 +197,35 @@ def run(argv: Sequence[str] | None = None, repo_root: Path | None = None) -> int
                             pass
             _emit(result, args.json)
             return 0
+        if args.command == "start-loopback-diagnostic":
+            if (
+                config.bundle_root is None
+                or args.provider is None
+                or not args.credential_stdin
+                or args.workspace is None
+                or args.public_origin is None
+                or args.https_listen is None
+                or args.tls_cert_fd is None
+                or args.tls_key_fd is None
+                or args.remote_local_evidence
+            ):
+                raise RuntimeError("DIAGNOSTIC_START_INPUTS_INCOMPLETE")
+            descriptor = os.dup(0)
+            try:
+                result = start_remote_loopback_diagnostic(
+                    config, Path(config.bundle_root), args.workspace, args.provider,
+                    descriptor, args.public_origin, args.https_listen,
+                    args.tls_cert_fd, args.tls_key_fd,
+                )
+                descriptor = None
+            finally:
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+            _emit(result, args.json)
+            return 0
         if args.command in ("start", "restart"):
             remote_inputs = (args.public_origin, args.https_listen, args.tls_cert_fd, args.tls_key_fd)
             if any(value is not None for value in remote_inputs) and not args.remote_local_evidence:
@@ -273,6 +302,9 @@ CONFIG_AGENT_PORT_MISSING CONFIG_GATEWAY_PORT_MISSING CONFIG_HOME_MISSING
 CONFIG_RELAY_PORT_MISSING CONFIG_REPO_ROOT_MISSING DEGRADED_RECONCILE_FAILED
 DEVICE_REGISTRY_DIRECTORY_NOT_EMPTY DEVICE_REGISTRY_MISSING
 DESKTOP_GATEWAY_NOT_READY
+DIAGNOSTIC_START_INPUTS_INCOMPLETE DIAGNOSTIC_BUNDLE_BINDING_MISMATCH
+DIAGNOSTIC_PUBLIC_ORIGIN_NOT_LOOPBACK DIAGNOSTIC_IDENTITY_ROOT_EXISTS
+DIAGNOSTIC_CLEANUP_INCOMPLETE
 DIAGNOSTICS_BUNDLE_METADATA_INVALID DIAGNOSTICS_CANONICAL_RECONSTRUCTION_MISMATCH
 DIAGNOSTICS_CLASSIFICATION_INVALID DIAGNOSTICS_CROSS_BINDING_INVALID
 DIAGNOSTICS_INPUT_STATE_INVALID DIAGNOSTICS_INSTALL_STATE_INVALID
@@ -370,6 +402,8 @@ RELAY_ROLE_TIMEOUT RELAY_V1_HEALTH_SCHEMA_INVALID RELAY_V1_STATE_MISSING
 RELEASE_RECORD_INVALID RELEASE_RECORD_REQUIRED REMOTE_HTTPS_LISTEN_INVALID
 REMOTE_HTTPS_LISTEN_IN_USE REMOTE_KEY_COLLISION REMOTE_MODE_REQUIRED
 REMOTE_PORT_INVALID REMOTE_PUBLIC_ORIGIN_INVALID REMOTE_START_INPUTS_INCOMPLETE
+REMOTE_POLICY_INVALID
+UNSAFE_DIAGNOSTIC_IDENTITY_ROOT UNSAFE_DIAGNOSTIC_LOG_PATH
 REMOTE_TLS_CERT_FD_INVALID REMOTE_TLS_CERT_INVALID REMOTE_TLS_KEY_FD_INVALID
 REMOTE_UNINSTALL_REVOKE_REQUIRED RESET_CONFIRMATION_REQUIRED
 RESUME_EVIDENCE_INPUTS_REQUIRED RESUME_LINEAGE_MISMATCH RESUME_OUTPUT_INVALID

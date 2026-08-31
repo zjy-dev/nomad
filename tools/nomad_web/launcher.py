@@ -21,6 +21,7 @@ import time
 import urllib.error
 import urllib.request
 import urllib.parse
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +32,7 @@ from .bundle import NODE_RUNTIME, verify_bundle
 from .config import HOST_IDENTITY_ROOT_ENV, ensure_host_identity_root, host_identity_root
 from .install_lifecycle import status_unlocked as install_status_unlocked
 from .install_lifecycle import select_bundle_for_start
-from .state import HOME_MARKER, REMOTE_STATE_SCHEMA, STATE_SCHEMA, initialize_home, lifecycle_lock, read_run_state, state_path, validate_home, validate_runtime_dirs, write_run_state
+from .state import DIAGNOSTIC_STATE_SCHEMA, HOME_MARKER, REMOTE_STATE_SCHEMA, STATE_SCHEMA, initialize_home, lifecycle_lock, read_run_state, state_path, validate_home, validate_runtime_dirs, write_run_state
 
 TOKEN_ENV = "NOMAD_ALPHA_RELAY_TOKEN"
 BLOCKERS = ["B1_PROVIDER_CREDENTIAL", "PRODUCTION_DEVICE_IDENTITY"]
@@ -89,6 +90,54 @@ class HostIdentityError(RuntimeError):
 
 HOST_IDENTITY_SCOPE_KEYCHAIN = "keychain"
 HOST_IDENTITY_SCOPE_LOCAL_INSTALLED = "local-installed"
+DIAGNOSTIC_IDENTITY_DIR_PREFIX = "diagnostic-host-identity-"
+DIAGNOSTIC_EXTERNAL_GATES = (
+    "external_topology", "provider_e3", "physical_phone", "writes",
+)
+
+
+@dataclass(frozen=True)
+class _RemoteLaunchPolicy:
+    mode: str
+    loopback_only: bool
+    identity_scope: str
+    diagnostic_only: bool
+    accepted_eligible: bool
+    network_scope: str
+
+
+_ACCEPTED_REMOTE_POLICY = _RemoteLaunchPolicy(
+    mode="remote-local-evidence",
+    loopback_only=False,
+    identity_scope=HOST_IDENTITY_SCOPE_KEYCHAIN,
+    diagnostic_only=False,
+    accepted_eligible=True,
+    network_scope="lan_direct",
+)
+_LOOPBACK_DIAGNOSTIC_POLICY = _RemoteLaunchPolicy(
+    mode="remote-loopback-diagnostic",
+    loopback_only=True,
+    identity_scope=HOST_IDENTITY_SCOPE_LOCAL_INSTALLED,
+    diagnostic_only=True,
+    accepted_eligible=False,
+    network_scope="loopback_diagnostic",
+)
+
+
+def _desktop_gateway_policy_argv(policy: _RemoteLaunchPolicy) -> list[str]:
+    if policy is _LOOPBACK_DIAGNOSTIC_POLICY:
+        return ["--diagnostic-loopback"]
+    if policy is _ACCEPTED_REMOTE_POLICY:
+        return ["--lifecycle-channel-fd", "12"]
+    raise RuntimeError("REMOTE_POLICY_INVALID")
+
+
+def _ingress_policy_argv(policy: _RemoteLaunchPolicy) -> list[str]:
+    if policy is _LOOPBACK_DIAGNOSTIC_POLICY:
+        return ["--diagnostic-loopback"]
+    if policy is _ACCEPTED_REMOTE_POLICY:
+        return []
+    raise RuntimeError("REMOTE_POLICY_INVALID")
 
 
 def _get(config: Any, name: str) -> Any:
@@ -323,6 +372,22 @@ def _compose_identity(
     lifecycle_sidecar: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     home = Path(_get(config, "home")).resolve()
+    if mode == "remote-loopback-diagnostic":
+        return {
+            "installed": {
+                "availability": "NOT_RUN", "bundle_digest": None,
+                "install_sequence": None, "install_identity": None,
+            },
+            "running": {
+                "availability": "NOT_RUN", "bundle_digest": None,
+                "run_id": None, "process_commitment": None,
+                "socket_commitment": None, "run_identity": None,
+            },
+            "host_public_commitment": {
+                "availability": "NOT_RUN", "commitment": None,
+            },
+            "paired_device": _paired_device_not_run(),
+        }
     return {
         "installed": _installed_identity(config),
         "running": _running_identity(
@@ -486,7 +551,27 @@ def _validate_public_origin(origin: str) -> str:
     return origin
 
 
-def _validate_https_listen(value: str, public_origin: str) -> str:
+def _reject_loopback_public_origin(origin: str) -> str:
+    parsed = urllib.parse.urlsplit(origin)
+    hostname = parsed.hostname
+    if hostname is None or hostname.lower() == "localhost":
+        raise RuntimeError("REMOTE_PUBLIC_ORIGIN_INVALID")
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return origin
+    mapped = address.ipv4_mapped if isinstance(address, ipaddress.IPv6Address) else None
+    if (
+        address.is_loopback or address.is_unspecified or address.is_multicast
+        or (mapped is not None and mapped.is_loopback)
+    ):
+        raise RuntimeError("REMOTE_PUBLIC_ORIGIN_INVALID")
+    return origin
+
+
+def _validate_https_listen(
+    value: str, public_origin: str, *, loopback_only: bool = False,
+) -> str:
     try:
         parsed = urllib.parse.urlsplit(f"//{value}")
         host, port = parsed.hostname, parsed.port
@@ -495,9 +580,21 @@ def _validate_https_listen(value: str, public_origin: str) -> str:
     except (AttributeError, TypeError, ValueError) as error:
         raise RuntimeError("REMOTE_HTTPS_LISTEN_INVALID") from error
     canonical = f"[{address.compressed}]:{port}" if address.version == 6 else f"{address.compressed}:{port}"
-    if value != canonical or address.is_unspecified or address.is_loopback or address.is_multicast or not 1024 <= port <= 65535 or port != public_port:
+    permitted_address = address == ipaddress.ip_address("127.0.0.1") if loopback_only else not address.is_loopback
+    if value != canonical or address.is_unspecified or not permitted_address or address.is_multicast or not 1024 <= port <= 65535 or port != public_port:
         raise RuntimeError("REMOTE_HTTPS_LISTEN_INVALID")
     return value
+
+
+def _validate_diagnostic_public_origin(origin: str) -> str:
+    origin = _validate_public_origin(origin)
+    parsed = urllib.parse.urlsplit(origin)
+    if parsed.hostname != "127.0.0.1":
+        raise RuntimeError("DIAGNOSTIC_PUBLIC_ORIGIN_NOT_LOOPBACK")
+    canonical = f"https://127.0.0.1:{parsed.port}"
+    if origin != canonical:
+        raise RuntimeError("DIAGNOSTIC_PUBLIC_ORIGIN_NOT_LOOPBACK")
+    return origin
 
 
 def _listen_address_free(value: str) -> bool:
@@ -528,11 +625,19 @@ def _validate_remote_inputs(
     config: Any, *, public_origin: str | None, https_listen: str | None,
     tls_cert_fd: int | None, tls_key_fd: int | None,
     check_availability: bool = True,
+    policy: _RemoteLaunchPolicy = _ACCEPTED_REMOTE_POLICY,
 ) -> tuple[str, str, list[int]]:
+    if policy not in (_ACCEPTED_REMOTE_POLICY, _LOOPBACK_DIAGNOSTIC_POLICY):
+        raise RuntimeError("REMOTE_POLICY_INVALID")
     if public_origin is None or https_listen is None or tls_cert_fd is None or tls_key_fd is None:
         raise RuntimeError("REMOTE_START_INPUTS_INCOMPLETE")
-    public_origin = _validate_public_origin(public_origin)
-    https_listen = _validate_https_listen(https_listen, public_origin)
+    public_origin = (
+        _validate_diagnostic_public_origin(public_origin)
+        if policy.loopback_only else _reject_loopback_public_origin(_validate_public_origin(public_origin))
+    )
+    https_listen = _validate_https_listen(
+        https_listen, public_origin, loopback_only=policy.loopback_only,
+    )
     _validate_operator_fd(tls_cert_fd, "REMOTE_TLS_CERT_FD_INVALID")
     _validate_operator_fd(tls_key_fd, "REMOTE_TLS_KEY_FD_INVALID")
     _tls_probe_context(tls_cert_fd)
@@ -829,19 +934,55 @@ def _validate_device_registry_artifacts(path: Path, *, require_main: bool) -> No
 
 
 def _prepare_device_registry_path(home: Path) -> Path:
-    directory = _device_registry_dir(home)
+    return _prepare_device_registry_path_in_directory(_device_registry_dir(home))
+
+
+def _prepare_device_registry_path_in_directory(directory: Path) -> Path:
     try:
         os.mkdir(directory, 0o700)
     except FileExistsError:
         pass
     _validate_canonical_private_dir(directory, "UNSAFE_DEVICE_REGISTRY_DIRECTORY")
-    path = _device_registry_path(home)
+    path = directory / DEVICE_REGISTRY_BASENAME
     _validate_device_registry_artifacts(path, require_main=False)
     return path
 
 
+def _prepare_diagnostic_identity_root(run_dir: Path, run_state_alias: str) -> Path:
+    if re.fullmatch(r"[0-9a-f]{64}", run_state_alias) is None:
+        raise RuntimeError("INVALID_RUN_ALIAS")
+    canonical_run = _validate_canonical_private_dir(
+        run_dir, "UNSAFE_DIAGNOSTIC_IDENTITY_ROOT",
+    )
+    root = run_dir / f"{DIAGNOSTIC_IDENTITY_DIR_PREFIX}{run_state_alias}"
+    if os.path.lexists(root):
+        raise RuntimeError("DIAGNOSTIC_IDENTITY_ROOT_EXISTS")
+    try:
+        os.mkdir(root, 0o700)
+        os.chmod(root, 0o700)
+        canonical = _validate_canonical_private_dir(
+            root, "UNSAFE_DIAGNOSTIC_IDENTITY_ROOT",
+        )
+        if canonical.parent != canonical_run:
+            raise RuntimeError("UNSAFE_DIAGNOSTIC_IDENTITY_ROOT")
+        child = root / "remote"
+        os.mkdir(child, 0o700)
+        os.chmod(child, 0o700)
+        _validate_canonical_private_dir(
+            child, "UNSAFE_DIAGNOSTIC_IDENTITY_ROOT",
+        )
+        return root
+    except Exception:
+        if os.path.lexists(root):
+            _safe_remove_tree(root, root=canonical_run)
+        raise
+
+
 def _persistent_remote_paths(home: Path) -> dict[str, Path]:
-    directory = _device_registry_dir(home)
+    return _persistent_remote_paths_in_directory(_device_registry_dir(home))
+
+
+def _persistent_remote_paths_in_directory(directory: Path) -> dict[str, Path]:
     _validate_canonical_private_dir(directory, "UNSAFE_REMOTE_STATE_DIRECTORY")
     paths = {
         "pairing_store_path": directory / PAIRING_STORE_BASENAME,
@@ -1116,7 +1257,10 @@ def _socket_identity(socket_path: Path, parent: dict[str, int]) -> dict[str, int
     return {**parent, "socket_dev": leaf.st_dev, "socket_ino": leaf.st_ino, "socket_uid": leaf.st_uid, "socket_mode": stat.S_IMODE(leaf.st_mode)}
 
 
-def _cleanup_product_host_socket(socket_path: Path | None, expected: dict[str, int] | None = None) -> None:
+def _cleanup_product_host_socket(
+    socket_path: Path | None, expected: dict[str, int] | None = None, *,
+    allow_unconfirmed_diagnostic_leaf: bool = False,
+) -> None:
     if socket_path is None:
         return
     directory = socket_path.parent
@@ -1135,14 +1279,26 @@ def _cleanup_product_host_socket(socket_path: Path | None, expected: dict[str, i
         actual = {"socket_dev": leaf.st_dev, "socket_ino": leaf.st_ino, "socket_uid": leaf.st_uid, "socket_mode": stat.S_IMODE(leaf.st_mode)}
         if not stat.S_ISSOCK(leaf.st_mode) or stat.S_ISLNK(leaf.st_mode) or leaf.st_uid != os.geteuid() or stat.S_IMODE(leaf.st_mode) != 0o600:
             raise RuntimeError("UNSAFE_PRODUCT_HOST_SOCKET")
-        # A Host that failed before the authenticated ready frame may have
-        # created a valid socket, but the launcher never received its inode
-        # capability. Preserve it; the next run uses a distinct run-scoped path.
+        # Accepted startup preserves a socket whose authenticated ready-frame
+        # capability was never received. Diagnostic rollback may remove that
+        # exact run-scoped socket only after every child has been reaped and
+        # the pre-created parent capability still matches.
         if expected is None or not all(name in expected for name in actual):
-            return
-        if any(actual[name] != expected[name] for name in actual):
-            raise RuntimeError("UNSAFE_PRODUCT_HOST_SOCKET")
-        socket_path.unlink()
+            if (
+                not allow_unconfirmed_diagnostic_leaf
+                or expected is None
+                or socket_path.name != "product-host.sock"
+                or re.fullmatch(
+                    r"nomad-web-[0-9a-f]{16}-[0-9a-f]{16}",
+                    directory.name,
+                ) is None
+            ):
+                return
+            socket_path.unlink()
+        else:
+            if any(actual[name] != expected[name] for name in actual):
+                raise RuntimeError("UNSAFE_PRODUCT_HOST_SOCKET")
+            socket_path.unlink()
     try:
         directory.rmdir()
     except OSError as error:
@@ -1218,28 +1374,71 @@ def _rollback_remote_start(
     product_host_socket_path: Path | None, product_host_socket_identity: dict[str, int] | None,
     desktop_db_path: Path | None, command_journal_path: Path | None,
     relay_v1_paths: tuple[Path, Path], run_dir: Path,
+    diagnostic_identity_root: Path | None = None,
+    diagnostic_agent_runtime: Path | None = None,
+    diagnostic_logs: tuple[Path, ...] = (),
+    logs_dir: Path | None = None,
 ) -> None:
     cleanup_failed = False
     for child in reversed(children):
         try:
-            if not processes.stop(child):
+            if (
+                not processes.stop(child)
+                and processes.ownership(child) != "absent"
+            ):
                 cleanup_failed = True
-        except Exception:
+        except BaseException:
             cleanup_failed = True
+    all_children_absent = all(
+        processes.ownership(child) == "absent" for child in children
+    )
     cleanup_steps = [
-        lambda: _cleanup_product_host_socket(product_host_socket_path, product_host_socket_identity),
+        lambda: _cleanup_product_host_socket(
+            product_host_socket_path, product_host_socket_identity,
+            allow_unconfirmed_diagnostic_leaf=(
+                diagnostic_identity_root is not None and all_children_absent
+            ),
+        ),
         lambda: _cleanup_gateway_db(desktop_db_path, run_dir),
         lambda: _cleanup_command_journal(command_journal_path, run_dir),
         *(lambda path=path: _cleanup_gateway_db(path, run_dir) for path in relay_v1_paths),
+        lambda: _safe_remove_tree(
+            diagnostic_identity_root, root=run_dir.resolve(strict=True),
+        ) if diagnostic_identity_root is not None else None,
+        lambda: _safe_remove_tree(
+            diagnostic_agent_runtime, root=run_dir.resolve(strict=True),
+        ) if diagnostic_agent_runtime is not None else None,
+        lambda: _cleanup_diagnostic_logs(diagnostic_logs, logs_dir),
     ]
     for cleanup in cleanup_steps:
         try:
             cleanup()
-        except Exception:
+        except BaseException:
             cleanup_failed = True
     if cleanup_failed:
         raise RuntimeError(f"{_safe_error_code(primary)};ROLLBACK_CLEANUP_FAILED") from primary
     raise primary
+
+
+def _cleanup_diagnostic_logs(paths: tuple[Path, ...], logs_dir: Path | None) -> None:
+    if not paths:
+        return
+    if logs_dir is None:
+        raise RuntimeError("UNSAFE_DIAGNOSTIC_LOG_PATH")
+    canonical_logs = _validate_canonical_private_dir(
+        logs_dir, "UNSAFE_DIAGNOSTIC_LOG_PATH",
+    )
+    for path in paths:
+        if path.is_symlink() or path.parent.resolve(strict=True) != canonical_logs:
+            raise RuntimeError("UNSAFE_DIAGNOSTIC_LOG_PATH")
+        if not os.path.lexists(path):
+            continue
+        canonical_path = path.resolve(strict=True)
+        _validate_private_regular_file(
+            canonical_path, canonical_logs, mode=0o600,
+            error_code="UNSAFE_DIAGNOSTIC_LOG_PATH",
+        )
+        canonical_path.unlink()
 
 
 def _cleanup_device_registry(path: Path | None) -> None:
@@ -1316,13 +1515,27 @@ def _safe_remove_tree(
     path.unlink()
 
 
-def _bootstrap_host(channel: socket.socket, *, run_id: str, origin: str, session_id: str, password: str, workspace_digest: str, product_host_socket_path: Path, device_registry_path: Path, agent_pid: int, agent_process_group: int, agent_process_identity: str, command_transport_key: str, command_authority_key: str, command_journal_path: Path, join_transport_key: str | None = None, remote: dict[str, Any] | None = None) -> dict[str, int]:
+def _bootstrap_host(channel: socket.socket, *, run_id: str, origin: str, session_id: str, password: str, workspace_digest: str, product_host_socket_path: Path, device_registry_path: Path, agent_pid: int, agent_process_group: int, agent_process_identity: str, command_transport_key: str, command_authority_key: str, command_journal_path: Path, join_transport_key: str | None = None, remote: dict[str, Any] | None = None, host_identity_scope: str | None = None, host_identity_root: Path | None = None) -> dict[str, int]:
     parent = _socket_parent_identity(product_host_socket_path)
     value = {"schema":"nomad.product-host.bootstrap.v2" if remote is not None else "nomad.product-host.bootstrap.v1","run_id":run_id,"origin":origin,"session_id":session_id,"server_password":password,"workspace_binding_digest":workspace_digest,"product_host_socket_path":str(product_host_socket_path),"device_registry_path":str(device_registry_path),"agent_pid":agent_pid,"agent_process_group":agent_process_group,"agent_process_identity":agent_process_identity,"product_host_socket_parent_dev":parent["parent_dev"],"product_host_socket_parent_ino":parent["parent_ino"],"command_transport_key":command_transport_key,"command_authority_key":command_authority_key,"command_journal_path":str(command_journal_path)}
     if remote is not None:
         if join_transport_key is None:
             raise RuntimeError("HOST_BOOTSTRAP_INVALID")
         value.update({"join_transport_key": join_transport_key, "remote": remote})
+    diagnostic_identity = host_identity_scope is not None or host_identity_root is not None
+    if diagnostic_identity:
+        if (
+            remote is None
+            or host_identity_scope != "diagnostic-ephemeral-local"
+            or host_identity_root is None
+            or not host_identity_root.is_absolute()
+        ):
+            raise RuntimeError("HOST_BOOTSTRAP_INVALID")
+        value["schema"] = "nomad.product-host.bootstrap.v3"
+        value.update({
+            "host_identity_scope": host_identity_scope,
+            "host_identity_root": str(host_identity_root),
+        })
     raw = json.dumps(value, sort_keys=True, separators=(",",":")).encode()
     if not 0 < len(raw) <= 16 * 1024: raise RuntimeError("HOST_BOOTSTRAP_INVALID")
     try:
@@ -1472,6 +1685,40 @@ def start_remote_local_evidence(
                 tls_cert_fd=int(tls_cert_fd), tls_key_fd=int(tls_key_fd),
             )
     except Exception:
+        for descriptor in owned_fds:
+            processes.close_fd(descriptor)
+        raise
+
+
+def start_remote_loopback_diagnostic(
+    config: Any, bundle: Path, workspace: Path, provider_name: str,
+    credential_fd: int, public_origin: str, https_listen: str,
+    tls_cert_fd: int, tls_key_fd: int,
+) -> dict[str, Any]:
+    """Start the real seven-process topology under diagnostic-only policy.
+
+    The bundled Agent is started only as a runtime canary. This API performs no
+    prompt dispatch and therefore makes no Provider call. Its state is never
+    eligible to satisfy ``remote-local-evidence`` acceptance.
+    """
+    owned_fds = [credential_fd, tls_cert_fd, tls_key_fd]
+    try:
+        _preflight_remote_agent(provider_name, credential_fd, workspace)
+        public_origin, https_listen, _ = _validate_remote_inputs(
+            config, public_origin=public_origin, https_listen=https_listen,
+            tls_cert_fd=tls_cert_fd, tls_key_fd=tls_key_fd,
+            policy=_LOOPBACK_DIAGNOSTIC_POLICY,
+        )
+        initialize_home(config)
+        with lifecycle_lock(config, create=True):
+            return _start_remote_unlocked(
+                config, provider_name=provider_name, credential_fd=credential_fd,
+                workspace=workspace, public_origin=public_origin,
+                https_listen=https_listen, tls_cert_fd=tls_cert_fd,
+                tls_key_fd=tls_key_fd, policy=_LOOPBACK_DIAGNOSTIC_POLICY,
+                required_bundle=Path(bundle),
+            )
+    except BaseException:
         for descriptor in owned_fds:
             processes.close_fd(descriptor)
         raise
@@ -1741,23 +1988,36 @@ def _start_unlocked(
 def _start_remote_unlocked(
     config: Any, *, provider_name: str, credential_fd: int, workspace: Path,
     public_origin: str, https_listen: str, tls_cert_fd: int, tls_key_fd: int,
+    policy: _RemoteLaunchPolicy = _ACCEPTED_REMOTE_POLICY,
+    required_bundle: Path | None = None,
 ) -> dict[str, Any]:
-    bundle = select_bundle_for_start(config, getattr(config, "bundle_root", None))
+    if policy not in (_ACCEPTED_REMOTE_POLICY, _LOOPBACK_DIAGNOSTIC_POLICY):
+        raise RuntimeError("REMOTE_POLICY_INVALID")
+    selected_hint = required_bundle if required_bundle is not None else getattr(config, "bundle_root", None)
+    bundle = select_bundle_for_start(config, selected_hint)
     if bundle is None:
         raise RuntimeError("PREBUILT_BUNDLE_REQUIRED")
+    if required_bundle is not None and bundle.resolve(strict=True) != required_bundle.resolve(strict=True):
+        raise RuntimeError("DIAGNOSTIC_BUNDLE_BINDING_MISMATCH")
     bundle_digest = _selected_bundle_digest(config, bundle)
     existing = read_run_state(config)
     if existing:
         if existing["bundle_digest"] != bundle_digest:
             raise RuntimeError("RUNNING_BUNDLE_BINDING_MISMATCH")
         ownership = [processes.ownership(item) for item in existing["processes"]]
-        sidecar_ownership = processes.ownership(existing["lifecycle_coordinator"])
+        existing_sidecar = existing.get("lifecycle_coordinator")
+        sidecar_ownership = (
+            processes.ownership(existing_sidecar)
+            if existing_sidecar is not None else "gone"
+        )
         if "mismatch" in ownership or sidecar_ownership == "mismatch":
             raise RuntimeError("PROCESS_IDENTITY_MISMATCH")
-        if all(item == "owned" for item in ownership) and sidecar_ownership == "owned":
+        expected_sidecar = not policy.diagnostic_only
+        sidecar_healthy = sidecar_ownership == "owned" if expected_sidecar else existing_sidecar is None
+        if all(item == "owned" for item in ownership) and sidecar_healthy:
             for descriptor in (credential_fd, tls_cert_fd, tls_key_fd):
                 processes.close_fd(descriptor)
-            if existing["mode"] != "remote-local-evidence" or existing["pairing_public_origin"] != public_origin:
+            if existing["mode"] != policy.mode or existing["pairing_public_origin"] != public_origin:
                 raise RuntimeError("MODE_CHANGE_REQUIRES_STOP")
             _assert_identity_match(
                 config,
@@ -1767,13 +2027,13 @@ def _start_remote_unlocked(
                 run_id=existing["run_id"],
                 processes_state=existing["processes"],
                 socket_identity=existing["product_host_socket_identity"],
-                lifecycle_sidecar=existing["lifecycle_coordinator"],
+                lifecycle_sidecar=existing_sidecar,
             )
             return _status_unlocked(config)
         for child, ownership_state in reversed(list(zip(existing["processes"], ownership))):
             if ownership_state == "owned" and not processes.stop(child):
                 raise RuntimeError("DEGRADED_RECONCILE_FAILED")
-        if sidecar_ownership == "owned" and not processes.stop(existing["lifecycle_coordinator"]):
+        if existing_sidecar is not None and sidecar_ownership == "owned" and not processes.stop(existing_sidecar):
             raise RuntimeError("DEGRADED_RECONCILE_FAILED")
         _cleanup_run_artifacts(config, existing)
         state_path(config).unlink(missing_ok=True)
@@ -1801,11 +2061,10 @@ def _start_remote_unlocked(
     host_binary = bundle / "bin" / "nomad-product-host"
     ingress_binary = bundle / "bin" / "nomad-ingress"
     gateway_dir, web_dir = bundle / "gateway", bundle / "web"
-    _require_host_identity_ready(
-        host_binary,
-        scope=HOST_IDENTITY_SCOPE_KEYCHAIN,
-        identity_root=None,
-    )
+    if policy is _ACCEPTED_REMOTE_POLICY:
+        _require_host_identity_ready(
+            host_binary, scope=HOST_IDENTITY_SCOPE_KEYCHAIN, identity_root=None,
+        )
     node = _bundled_node(bundle)
 
     relay_host_v1_port = _remote_port(config, "relay_port")
@@ -1817,14 +2076,23 @@ def _start_remote_unlocked(
     join_port = _remote_port(config, "join_gateway_port")
     run_id = secrets.token_hex(32)
     run_state_alias = hashlib.sha256(f"state:{run_id}".encode()).hexdigest()
-    device_registry_path = _prepare_device_registry_path(home)
-    persistent = _persistent_remote_paths(home)
-    command_journal_path = _prepare_command_journal(_make_command_journal_path(run_dir, run_state_alias), run_dir)
-    product_host_socket_path = _prepare_product_host_socket(home, run_state_alias)
-    product_host_socket_identity: dict[str, int] | None = _socket_parent_identity(product_host_socket_path)
+    diagnostic_identity_root = None
+    command_journal_path: Path | None = None
+    product_host_socket_path: Path | None = None
+    product_host_socket_identity: dict[str, int] | None = None
     desktop_db_path = run_dir / f"desktop-gateway-{run_state_alias}.sqlite3"
     relay_host_v1_db = run_dir / "relay-host-v1.sqlite3"
     relay_device_v1_db = run_dir / "relay-device-v1.sqlite3"
+    diagnostic_agent_runtime = (
+        run_dir / f"agent-runtime-{run_state_alias}" if policy.diagnostic_only else None
+    )
+    diagnostic_logs = tuple(
+        log_dir / f"{name}-{run_state_alias}.log"
+        for name in (
+            "relay-host", "relay-device", "agent", "product-host",
+            "desktop-gateway", "join-gateway", "https-ingress",
+        )
+    ) if policy.diagnostic_only else ()
     children: list[dict[str, Any]] = []
     lifecycle_process: dict[str, Any] | None = None
     lifecycle_release_fd: int | None = None
@@ -1832,27 +2100,53 @@ def _start_remote_unlocked(
     opened: list[int] = []
     sockets: list[socket.socket] = []
     try:
+        diagnostic_identity_root = (
+            _prepare_diagnostic_identity_root(run_dir, run_state_alias)
+            if policy.diagnostic_only else None
+        )
+        if policy is _LOOPBACK_DIAGNOSTIC_POLICY:
+            _require_host_identity_ready(
+                host_binary, scope=HOST_IDENTITY_SCOPE_LOCAL_INSTALLED,
+                identity_root=diagnostic_identity_root,
+            )
+        if diagnostic_identity_root is not None:
+            remote_state_dir = diagnostic_identity_root / "remote"
+            device_registry_path = _prepare_device_registry_path_in_directory(
+                remote_state_dir,
+            )
+            persistent = _persistent_remote_paths_in_directory(remote_state_dir)
+        else:
+            device_registry_path = _prepare_device_registry_path(home)
+            persistent = _persistent_remote_paths(home)
+        command_journal_path = _prepare_command_journal(
+            _make_command_journal_path(run_dir, run_state_alias), run_dir,
+        )
+        product_host_socket_path = _prepare_product_host_socket(home, run_state_alias)
+        product_host_socket_identity = _socket_parent_identity(product_host_socket_path)
         _prepare_run_sqlite(relay_host_v1_db, run_dir)
         _prepare_run_sqlite(relay_device_v1_db, run_dir)
         tls_probe_context = _tls_probe_context(tls_cert_fd)
-    except Exception as primary:
+        command_transport_raw = secrets.token_bytes(32)
+        join_transport_raw = secrets.token_bytes(32)
+        command_authority_raw = secrets.token_bytes(32)
+        relay_admin_raw = secrets.token_urlsafe(32).encode("ascii")
+        trusted_ingress_raw = secrets.token_bytes(32)
+        if len({command_transport_raw, join_transport_raw, command_authority_raw}) != 3:
+            raise RuntimeError("REMOTE_KEY_COLLISION")
+        command_transport_key = base64.b64encode(command_transport_raw).decode("ascii")
+        join_transport_key = base64.b64encode(join_transport_raw).decode("ascii")
+        command_authority_key = base64.b64encode(command_authority_raw).decode("ascii")
+    except BaseException as primary:
         _rollback_remote_start(
             primary, children, product_host_socket_path=product_host_socket_path,
             product_host_socket_identity=product_host_socket_identity,
             desktop_db_path=desktop_db_path, command_journal_path=command_journal_path,
             relay_v1_paths=(relay_host_v1_db, relay_device_v1_db), run_dir=run_dir,
+            diagnostic_identity_root=diagnostic_identity_root,
+            diagnostic_agent_runtime=diagnostic_agent_runtime,
+            diagnostic_logs=diagnostic_logs, logs_dir=log_dir,
         )
 
-    command_transport_raw = secrets.token_bytes(32)
-    join_transport_raw = secrets.token_bytes(32)
-    command_authority_raw = secrets.token_bytes(32)
-    relay_admin_raw = secrets.token_urlsafe(32).encode("ascii")
-    trusted_ingress_raw = secrets.token_bytes(32)
-    if len({command_transport_raw, join_transport_raw, command_authority_raw}) != 3:
-        raise RuntimeError("REMOTE_KEY_COLLISION")
-    command_transport_key = base64.b64encode(command_transport_raw).decode("ascii")
-    join_transport_key = base64.b64encode(join_transport_raw).decode("ascii")
-    command_authority_key = base64.b64encode(command_authority_raw).decode("ascii")
     try:
         relay_admin_relay_fd = processes.secret_pipe(relay_admin_raw); opened.append(relay_admin_relay_fd)
         relay_host = processes.spawn(
@@ -1916,6 +2210,8 @@ def _start_remote_unlocked(
             agent_process_group=int(agent["process_group"]), agent_process_identity=str(agent["identity"]),
             command_transport_key=command_transport_key, join_transport_key=join_transport_key,
             command_authority_key=command_authority_key, command_journal_path=command_journal_path, remote=remote,
+            host_identity_scope=("diagnostic-ephemeral-local" if policy.diagnostic_only else None),
+            host_identity_root=diagnostic_identity_root,
         )
         password = ""; bootstrap_parent.close(); sockets.remove(bootstrap_parent)
 
@@ -1926,41 +2222,55 @@ def _start_remote_unlocked(
             "--product-host-socket-dev", str(product_host_socket_identity["socket_dev"]),
             "--product-host-socket-ino", str(product_host_socket_identity["socket_ino"]),
         ]
-        installed = install_status_unlocked(config)
-        if (
-            installed.get("state") != "INSTALLED"
-            or installed.get("current_bundle_digest") != bundle_digest
-            or not installed.get("history")
-            or type(installed["history"][-1].get("sequence")) is not int
-        ):
-            raise RuntimeError("LIFECYCLE_INSTALL_BINDING_INVALID")
-        install_sequence = installed["history"][-1]["sequence"]
-        lifecycle_gateway, lifecycle_worker = socket.socketpair()
-        sockets.extend((lifecycle_gateway, lifecycle_worker))
-        desktop_key_fd = processes.secret_pipe(command_transport_raw); opened.append(desktop_key_fd)
+        lifecycle_gateway = lifecycle_worker = None
+        desktop_args = [
+            node, str(gateway_dir / "server.mjs"), "--mode", "official-agent-local",
+            "--route-table", "desktop", "--host", "127.0.0.1",
+            "--port", str(desktop_port), "--state-db", str(desktop_db_path),
+            "--dist-dir", str(web_dir), *socket_args, "--command-key-fd", "11",
+            "--public-origin", public_origin,
+            *_desktop_gateway_policy_argv(policy),
+        ]
+        desktop_fd_actions: tuple[tuple[int, int], ...]
+        desktop_close_fds: tuple[int, ...]
+        desktop_key_fd = processes.secret_pipe(command_transport_raw)
+        if policy.diagnostic_only:
+            desktop_fd_actions = ((desktop_key_fd, 11),)
+            desktop_close_fds = (desktop_key_fd,)
+        else:
+            installed = install_status_unlocked(config)
+            if (
+                installed.get("state") != "INSTALLED"
+                or installed.get("current_bundle_digest") != bundle_digest
+                or not installed.get("history")
+                or type(installed["history"][-1].get("sequence")) is not int
+            ):
+                raise RuntimeError("LIFECYCLE_INSTALL_BINDING_INVALID")
+            install_sequence = installed["history"][-1]["sequence"]
+            lifecycle_gateway, lifecycle_worker = socket.socketpair()
+            sockets.extend((lifecycle_gateway, lifecycle_worker))
+            desktop_fd_actions = ((desktop_key_fd, 11), (lifecycle_gateway.fileno(), 12))
+            desktop_close_fds = (desktop_key_fd, lifecycle_gateway.fileno())
+        opened.append(desktop_key_fd)
         desktop = processes.spawn(
             "desktop-gateway",
-            [node, str(gateway_dir / "server.mjs"), "--mode", "official-agent-local", "--route-table", "desktop",
-             "--host", "127.0.0.1", "--port", str(desktop_port), "--state-db", str(desktop_db_path),
-             "--dist-dir", str(web_dir), *socket_args, "--command-key-fd", "11", "--lifecycle-channel-fd", "12", "--public-origin", public_origin],
+            desktop_args,
             gateway_dir, processes.minimal_env(), log_dir / f"desktop-gateway-{run_state_alias}.log",
-            extra_fd_actions=((desktop_key_fd, 11), (lifecycle_gateway.fileno(), 12)),
-            close_fds=(desktop_key_fd, lifecycle_gateway.fileno()),
+            extra_fd_actions=desktop_fd_actions, close_fds=desktop_close_fds,
         )
         children.append(desktop); processes.close_fd(desktop_key_fd); opened.remove(desktop_key_fd)
-        lifecycle_gateway.close(); sockets.remove(lifecycle_gateway)
-        try:
-            lifecycle_process, returned_channel, lifecycle_release_fd, lifecycle_operational_fd = lifecycle_coordinator.spawn_worker(
-                config, gateway=desktop, run_id=run_state_alias,
-                bundle_digest=bundle_digest, install_sequence=install_sequence,
-                channel=lifecycle_worker,
-            )
-        finally:
-            # spawn_worker normally closes this object while duplicating the FD;
-            # the explicit close also covers injected/mocked failure paths.
-            lifecycle_worker.close(); sockets.remove(lifecycle_worker)
-        if returned_channel is not None:
-            raise RuntimeError("LIFECYCLE_CHANNEL_OWNERSHIP_INVALID")
+        if not policy.diagnostic_only:
+            lifecycle_gateway.close(); sockets.remove(lifecycle_gateway)
+            try:
+                lifecycle_process, returned_channel, lifecycle_release_fd, lifecycle_operational_fd = lifecycle_coordinator.spawn_worker(
+                    config, gateway=desktop, run_id=run_state_alias,
+                    bundle_digest=bundle_digest, install_sequence=install_sequence,
+                    channel=lifecycle_worker,
+                )
+            finally:
+                lifecycle_worker.close(); sockets.remove(lifecycle_worker)
+            if returned_channel is not None:
+                raise RuntimeError("LIFECYCLE_CHANNEL_OWNERSHIP_INVALID")
         _wait_gateway_route(desktop_port, "desktop")
 
         join_key_fd = processes.secret_pipe(join_transport_raw); trusted_join_fd = processes.secret_pipe(trusted_ingress_raw)
@@ -1986,7 +2296,8 @@ def _start_remote_unlocked(
              "--join-upstream", f"http://127.0.0.1:{join_port}",
              "--device-relay-upstream", f"http://127.0.0.1:{relay_device_v2_port}",
              "--tls-cert-fd", "10", "--tls-key-fd", "11",
-             "--trusted-join-token-fd", "12", "--ready-fd", "13"],
+             "--trusted-join-token-fd", "12", "--ready-fd", "13",
+             *_ingress_policy_argv(policy)],
             bundle, processes.minimal_env(), log_dir / f"https-ingress-{run_state_alias}.log",
             extra_fd_actions=((tls_cert_fd, 10), (tls_key_fd, 11), (trusted_ingress_fd, 12), (ready_child.fileno(), 13)),
             close_fds=(tls_cert_fd, tls_key_fd, trusted_ingress_fd, ready_child.fileno()),
@@ -2002,12 +2313,14 @@ def _start_remote_unlocked(
         session_alias = "sess-" + hashlib.sha256(f"session:{session_id}".encode()).hexdigest()[:32]
 
         state = {
-            "schema": REMOTE_STATE_SCHEMA, "mode": "remote-local-evidence",
+            "schema": (DIAGNOSTIC_STATE_SCHEMA if policy.diagnostic_only else REMOTE_STATE_SCHEMA),
+            "mode": policy.mode,
             "real_agent_enabled": True, "remote_enabled": True,
             "bundle_digest": bundle_digest,
             "blocked_on": ["PRODUCTION_EXTERNAL_TOPOLOGY", "PHYSICAL_PHONE_EVIDENCE", "PROVIDER_E3_EVIDENCE"],
             "desktop_url": f"http://127.0.0.1:{desktop_port}/", "pairing_public_origin": public_origin,
-            "pairing_ready": True, "remote_mailbox_ready": True, "network_scope": "lan_direct",
+            "pairing_ready": True, "remote_mailbox_ready": True,
+            "network_scope": policy.network_scope,
             "production_external": False, "agent_origin": f"http://127.0.0.1:{_remote_port(config, 'agent_port')}",
             "agent_version": "1.18.16", "logs_dir": str(log_dir),
             "relay_port": relay_host_v1_port, "relay_device_v1_port": relay_device_v1_port,
@@ -2019,6 +2332,17 @@ def _start_remote_unlocked(
             "product_host_socket_identity": product_host_socket_identity, "processes": children,
             "lifecycle_coordinator": lifecycle_process,
         }
+        if policy.diagnostic_only:
+            state.update({
+                "diagnostic_only": True,
+                "accepted_eligible": False,
+                "identity_scope": "diagnostic-ephemeral-local",
+                "tls_scope": "self-signed-spki-diagnostic",
+                "external_gates": [
+                    {"gate": gate, "status": "NOT_RUN"}
+                    for gate in DIAGNOSTIC_EXTERNAL_GATES
+                ],
+            })
         state["identity"] = _compose_identity(
             config,
             mode=state["mode"],
@@ -2029,13 +2353,14 @@ def _start_remote_unlocked(
             lifecycle_sidecar=lifecycle_process,
         )
         write_run_state(config, state)
-        _activate_lifecycle_worker(
-            config, lifecycle_release_fd, lifecycle_operational_fd,
-            lifecycle_process,
-        )
-        lifecycle_release_fd = lifecycle_operational_fd = None
+        if not policy.diagnostic_only:
+            _activate_lifecycle_worker(
+                config, lifecycle_release_fd, lifecycle_operational_fd,
+                lifecycle_process,
+            )
+            lifecycle_release_fd = lifecycle_operational_fd = None
         return {**state, "state": "RUNNING"}
-    except Exception as primary:
+    except BaseException as primary:
         # A release failure can occur after the fully validated topology was
         # published. Never leave a RUNNING record for a coordinator that did
         # not enter its Gateway-serving phase.
@@ -2047,6 +2372,9 @@ def _start_remote_unlocked(
             product_host_socket_identity=product_host_socket_identity,
             desktop_db_path=desktop_db_path, command_journal_path=command_journal_path,
             relay_v1_paths=(relay_host_v1_db, relay_device_v1_db), run_dir=run_dir,
+            diagnostic_identity_root=diagnostic_identity_root,
+            diagnostic_agent_runtime=diagnostic_agent_runtime,
+            diagnostic_logs=diagnostic_logs, logs_dir=log_dir,
         )
     finally:
         processes.close_fd(lifecycle_release_fd)
@@ -2186,7 +2514,19 @@ def _stop_unlocked(
     config: Any, *, preserve_lifecycle_coordinator: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     state = read_run_state(config)
+    diagnostic_ports: list[int] = []
     if state:
+        if state["mode"] == "remote-loopback-diagnostic":
+            diagnostic_ports = [
+                int(state[name]) for name in (
+                    "relay_port", "relay_device_v1_port", "relay_host_v2_port",
+                    "relay_device_v2_port", "relay_admin_port", "gateway_port",
+                    "join_gateway_port", "agent_port",
+                )
+            ]
+            diagnostic_ports.append(
+                int(urllib.parse.urlsplit(state["pairing_public_origin"]).port)
+            )
         ownership = [processes.ownership(child) for child in state["processes"]]
         if "mismatch" in ownership:
             raise RuntimeError("PROCESS_IDENTITY_MISMATCH")
@@ -2212,23 +2552,62 @@ def _stop_unlocked(
                 if ownership == "owned" and not processes.stop(sidecar):
                     raise RuntimeError("LIFECYCLE_COORDINATOR_STOP_FAILED")
         _cleanup_run_artifacts(config, state)
+        if diagnostic_ports:
+            _verify_diagnostic_artifacts_removed(config, state)
+            _wait_ports_free(diagnostic_ports)
         state_path(config).unlink(missing_ok=True)
+        if diagnostic_ports and os.path.lexists(state_path(config)):
+            raise RuntimeError("DIAGNOSTIC_CLEANUP_INCOMPLETE")
     return _stopped()
 
 
 def _cleanup_run_artifacts(config: Any, state: dict[str, Any]) -> None:
     home = Path(_get(config, "home")).resolve()
     run_dir = home / "run"
-    if state["mode"] in ("official-agent-local", "remote-local-evidence"):
+    if state["mode"] in ("official-agent-local", "remote-local-evidence", "remote-loopback-diagnostic"):
         _cleanup_product_host_socket(_product_host_socket_path(home, state["run_id"]), state["product_host_socket_identity"])
         _cleanup_command_journal(_make_command_journal_path(run_dir, state["run_id"]), run_dir)
-        database = run_dir / (f"desktop-gateway-{state['run_id']}.sqlite3" if state["mode"] == "remote-local-evidence" else f"gateway-{state['run_id']}.sqlite3")
-        if state["mode"] == "remote-local-evidence":
+        remote_mode = state["mode"] in {"remote-local-evidence", "remote-loopback-diagnostic"}
+        database = run_dir / (f"desktop-gateway-{state['run_id']}.sqlite3" if remote_mode else f"gateway-{state['run_id']}.sqlite3")
+        if remote_mode:
             for relay_db in (run_dir / "relay-host-v1.sqlite3", run_dir / "relay-device-v1.sqlite3"):
                 _cleanup_gateway_db(relay_db, run_dir)
+        if state["mode"] == "remote-loopback-diagnostic":
+            _safe_remove_tree(
+                run_dir / f"agent-runtime-{state['run_id']}",
+                root=run_dir.resolve(strict=True),
+            )
+            logs_root = home / "logs"
+            for child in state["processes"]:
+                log = Path(child["log"])
+                if log.parent.resolve(strict=True) != logs_root.resolve(strict=True):
+                    raise RuntimeError("UNSAFE_DIAGNOSTIC_LOG_PATH")
+                _safe_remove_tree(log, root=logs_root.resolve(strict=True))
+            _safe_remove_tree(
+                run_dir / f"{DIAGNOSTIC_IDENTITY_DIR_PREFIX}{state['run_id']}",
+                root=run_dir.resolve(strict=True),
+            )
     else:
         database = run_dir / "gateway.sqlite3"
     _cleanup_gateway_db(database, run_dir)
+
+
+def _verify_diagnostic_artifacts_removed(config: Any, state: dict[str, Any]) -> None:
+    home = Path(_get(config, "home")).resolve()
+    run_dir = home / "run"
+    logs_root = home / "logs"
+    paths = [
+        run_dir / f"agent-runtime-{state['run_id']}",
+        run_dir / f"{DIAGNOSTIC_IDENTITY_DIR_PREFIX}{state['run_id']}",
+        run_dir / f"desktop-gateway-{state['run_id']}.sqlite3",
+        run_dir / "relay-host-v1.sqlite3",
+        run_dir / "relay-device-v1.sqlite3",
+        _make_command_journal_path(run_dir, state["run_id"]),
+        _product_host_socket_path(home, state["run_id"]),
+        *(Path(child["log"]) for child in state["processes"]),
+    ]
+    if any(os.path.lexists(path) for path in paths):
+        raise RuntimeError("DIAGNOSTIC_CLEANUP_INCOMPLETE")
 
 
 def uninstall_foundation(config: Any) -> dict[str, Any]:

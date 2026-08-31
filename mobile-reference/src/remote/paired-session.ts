@@ -798,7 +798,10 @@ async function buildCodec(
           expectedSenderSigningCommitment: context.hostSigningCommitment,
           expectedSenderAgreementCommitment: context.hostAgreementCommitment,
         });
-        return parseRemoteApplicationEnvelope(decrypted.canonicalPlaintextJson, frame);
+        return await parseRemoteApplicationEnvelope(
+          decrypted.canonicalPlaintextJson,
+          frame,
+        );
       } catch (error) {
         if (isKeyOperationFailure(error)) codec.keyLost = true;
         throw error;

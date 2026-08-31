@@ -980,6 +980,17 @@ pub(crate) struct ActiveRemoteBinding {
     pub(crate) device_agreement_public_sec1: [u8; 65],
 }
 
+impl ActiveRemoteBinding {
+    pub(crate) fn matches_authority_device(&self, device: &AuthenticatedDeviceFact) -> bool {
+        self.device_alias == device.device_alias
+            && self.pairing_epoch == device.pairing_epoch
+            && authority_public_key_digest(&self.device_signing_public_sec1)
+                == device.signing_commitment
+            && authority_public_key_digest(&self.device_agreement_public_sec1)
+                == device.agreement_commitment
+    }
+}
+
 impl fmt::Debug for ActiveRemoteBinding {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1797,10 +1808,7 @@ impl PairingCoordinator {
         match (binding, self.authority.current_active()?) {
             (None, _) => Ok(None),
             (Some(binding), CurrentActiveDevice::Active(device))
-                if binding.device_alias == device.device_alias
-                    && binding.pairing_epoch == device.pairing_epoch
-                    && binding.device_signing_commitment == device.signing_commitment
-                    && binding.device_agreement_commitment == device.agreement_commitment =>
+                if binding.matches_authority_device(&device) =>
             {
                 Ok(Some(binding))
             }
@@ -2315,8 +2323,8 @@ fn active_from_session(
         host_bearer: pending.host_bearer.clone(),
         host_signing_commitment: identity.signing_commitment(),
         host_agreement_commitment: identity.agreement_commitment(),
-        device_signing_commitment: pending.device.signing_commitment,
-        device_agreement_commitment: pending.device.agreement_commitment,
+        device_signing_commitment: sha256(&pending.device_signing_public_sec1),
+        device_agreement_commitment: sha256(&pending.device_agreement_public_sec1),
         device_signing_public_sec1: pending.device_signing_public_sec1,
         device_agreement_public_sec1: pending.device_agreement_public_sec1,
     })
@@ -3116,6 +3124,14 @@ mod tests {
                 fixture.now,
             )
             .unwrap();
+        assert_eq!(
+            first.device_signing_commitment,
+            sha256(&signing_public(&fixture.device_signing)),
+        );
+        assert_eq!(
+            first.device_agreement_commitment,
+            sha256(&agreement_public(&fixture.device_agreement)),
+        );
         let retry = fixture
             .coordinator
             .complete_join(

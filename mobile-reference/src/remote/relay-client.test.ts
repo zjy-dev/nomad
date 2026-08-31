@@ -54,6 +54,27 @@ describe('DeviceRelayClient', () => {
     await expect(client.readHostFrames(first.mailbox_id, 2)).resolves.toEqual([first, second]);
   });
 
+  it('decodes frames in a real browser runtime without Node Buffer', async () => {
+    const first = makeFrame({ direction: 'host_to_device', sequence: 1 });
+    const response = {
+      status: 200,
+      headers: new Headers({ 'content-type': 'application/json' }),
+      text: async () => JSON.stringify([first]),
+    } as Response;
+    const saved = globalThis.Buffer;
+    Reflect.deleteProperty(globalThis, 'Buffer');
+    try {
+      const client = new DeviceRelayClient({
+        baseUrl: 'https://relay.example.test',
+        bearerToken: 'device-secret-token',
+        fetchImpl: vi.fn<typeof fetch>(async () => response),
+      });
+      await expect(client.readHostFrames(first.mailbox_id, 0)).resolves.toEqual([first]);
+    } finally {
+      globalThis.Buffer = saved;
+    }
+  });
+
   it('acks host_to_device with exact body and no extra fields', async () => {
     const fetchImpl = vi.fn<typeof fetch>(async (input, init) => {
       expect(String(input)).toBe('https://relay.example.test/v2/mailboxes/mbx-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/acks');

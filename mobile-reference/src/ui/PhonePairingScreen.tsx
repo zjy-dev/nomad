@@ -62,10 +62,24 @@ type PhoneViewState =
 
 const MAX_BROWSER_TIMEOUT_MS = 60_000;
 const CONNECT_RETRY_DELAYS_MS = [150, 300, 600] as const;
+const AUTO_CONNECT_RETRY_DELAYS_MS = [
+  ...CONNECT_RETRY_DELAYS_MS,
+  1_200,
+  1_800,
+  2_500,
+  3_500,
+  5_000,
+  5_000,
+] as const;
 const REMOTE_CONNECTING_MESSAGE = "Checking the secure remote session…";
 const REMOTE_NOT_CONNECTED_MESSAGE = "Secure session not connected";
 const REMOTE_RETRY_MESSAGE =
   "Secure session not connected. Retry connect to check again.";
+
+interface ConnectRuntimeOptions {
+  isActive: () => boolean;
+  retryDelaysMs: readonly number[];
+}
 
 export function PhonePairingScreen({
   pairingClient,
@@ -80,12 +94,14 @@ export function PhonePairingScreen({
   const runtimeClientRef = useRef<RemoteSessionPort | null>(null);
   const runtimeSessionRef = useRef<BrowserVaultSession | null>(null);
   const runtimeUnsubscribeRef = useRef<(() => void) | null>(null);
+  const connectAttemptRef = useRef(0);
 
   useEffect(() => {
     let active = true;
     void initialize();
     return () => {
       active = false;
+      cancelConnectAttempt();
       clearRuntimeBinding();
     };
 
@@ -127,6 +143,19 @@ export function PhonePairingScreen({
     }
   }, [pairingClient, remoteSessionFactory, vault]);
 
+  function beginConnectAttempt(): number {
+    connectAttemptRef.current += 1;
+    return connectAttemptRef.current;
+  }
+
+  function cancelConnectAttempt() {
+    connectAttemptRef.current += 1;
+  }
+
+  function isConnectAttemptActive(attemptId: number): boolean {
+    return connectAttemptRef.current === attemptId;
+  }
+
   async function attachRemoteSession(
     session: BrowserVaultSession,
     active = true,
@@ -147,7 +176,11 @@ export function PhonePairingScreen({
       const runtime = await remoteSessionFactory(session);
       if (!active) return;
       bindRuntime(session, runtime);
-      await connectRuntime(session, runtime, active);
+      const attemptId = beginConnectAttempt();
+      await connectRuntime(session, runtime, {
+        isActive: () => active && isConnectAttemptActive(attemptId),
+        retryDelaysMs: AUTO_CONNECT_RETRY_DELAYS_MS,
+      });
     } catch (reason) {
       if (!active) return;
       const remoteState = mapRemoteFailure(reason, session);
@@ -240,8 +273,9 @@ export function PhonePairingScreen({
   async function connectRuntime(
     session: BrowserVaultSession,
     runtime: RuntimeRemoteSessionPort,
-    active = true,
+    options: ConnectRuntimeOptions,
   ) {
+    if (!options.isActive()) return;
     const initial = runtime.getSnapshot();
     if (
       initial.pending_command !== null &&
@@ -250,7 +284,7 @@ export function PhonePairingScreen({
       try {
         await recoverPendingRemoteCommand(runtime);
       } catch (reason) {
-        if (!active) return;
+        if (!options.isActive()) return;
         if (
           !(reason instanceof RemoteSessionError) ||
           reason.code !== "REMOTE_COMMAND_PENDING"
@@ -266,12 +300,12 @@ export function PhonePairingScreen({
     }
     for (
       let attempt = 0;
-      attempt <= CONNECT_RETRY_DELAYS_MS.length;
+      attempt <= options.retryDelaysMs.length;
       attempt += 1
     ) {
       try {
         const snapshot = await runtime.poll();
-        if (!active) return;
+        if (!options.isActive()) return;
         if (snapshot.connection === "revoked") {
           clearRuntimeBinding();
           setState({
@@ -304,7 +338,7 @@ export function PhonePairingScreen({
           return;
         }
       } catch (reason) {
-        if (!active) return;
+        if (!options.isActive()) return;
         const remoteState = mapRemoteFailure(reason, session);
         if (remoteState) {
           clearRuntimeBinding();
@@ -312,11 +346,12 @@ export function PhonePairingScreen({
           return;
         }
       }
-      if (attempt < CONNECT_RETRY_DELAYS_MS.length) {
-        await delay(CONNECT_RETRY_DELAYS_MS[attempt]);
-        if (!active) return;
+      if (attempt < options.retryDelaysMs.length) {
+        await delay(options.retryDelaysMs[attempt]);
+        if (!options.isActive()) return;
       }
     }
+    if (!options.isActive()) return;
     setState({
       kind: "paired",
       session,
@@ -338,10 +373,16 @@ export function PhonePairingScreen({
       session,
       message: REMOTE_CONNECTING_MESSAGE,
     });
+    const attemptId = beginConnectAttempt();
     try {
-      await connectRuntime(session, runtime);
+      await connectRuntime(session, runtime, {
+        isActive: () => isConnectAttemptActive(attemptId),
+        retryDelaysMs: CONNECT_RETRY_DELAYS_MS,
+      });
     } finally {
-      setBusy(null);
+      if (isConnectAttemptActive(attemptId)) {
+        setBusy(null);
+      }
     }
   }
 
